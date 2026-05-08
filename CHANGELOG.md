@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-05-08
+
+### Changed — Agent-Agnostic Architecture
+
+- **Removed** all Hermes-specific hardcodes from compact/detect pipeline
+- **Added** auto-detection of agent memory file path (Hermes/Claude/Cursor/Cline/Generic)
+- **Added** configurable entry separator (`LAYERED_MEMORY_AGENT_MEMORY_SEPARATOR` env var)
+- `detect_memory_bloat()` and `compact_memory()` now auto-detect agent memory via config
+- `inject_knowledge` hint is now agent-agnostic English (was Chinese + Hermes-specific)
+- `init_framework` returns unified rules (removed Hermes vs generic split)
+- `_parse_entries()` accepts `separator` parameter (default `§` for backward compat)
+
+### Configuration
+
+- `LAYERED_MEMORY_AGENT_MEMORY_PATH`: explicit agent memory file path
+- `LAYERED_MEMORY_AGENT_MEMORY_SEPARATOR`: entry separator (default: `§`)
+- Auto-detect order: explicit → Hermes → Claude Code → Cursor → Cline → Generic
+
 ## [1.0.0] - 2026-05-08
 
 ### Added

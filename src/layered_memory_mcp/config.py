@@ -143,6 +143,12 @@ class MemoryConfig:
             else _env_float("LAYERED_MEMORY_COMPACT_CAPACITY_WARNING_THRESHOLD", 0.9)
         )
 
+        # v1.0: Agent memory adapter — auto-detect or explicit
+        _amp = os.environ.get("LAYERED_MEMORY_AGENT_MEMORY_PATH")
+        self.agent_memory_path: Path | None = Path(_amp) if _amp else None
+        _ams = os.environ.get("LAYERED_MEMORY_AGENT_MEMORY_SEPARATOR")
+        self.agent_memory_separator: str = _ams if _ams else "§"
+
         # Resolve namespace-aware knowledge directories
         if self.namespace != "shared":
             self._knowledge_root = self.knowledge_dir  # base knowledge/
@@ -169,6 +175,50 @@ class MemoryConfig:
         if self._shared_knowledge_dir and self._shared_knowledge_dir != self.knowledge_dir:
             dirs.append(self._shared_knowledge_dir)
         return dirs
+
+    def detect_agent_memory_path(self) -> Path | None:
+        """Auto-detect the agent's memory file path.
+
+        Priority:
+          1. Explicitly configured agent_memory_path
+          2. Hermes Agent: ~/.hermes/memories/MEMORY.md
+          3. Claude Code: ~/.claude/CLAUDE.md
+          4. Cursor: ./.cursorrules
+          5. Cline: ~/.cline/rules
+          6. Generic fallback: <home>/agent-memory.md
+
+        Returns Path if found or configured, None if nothing exists.
+        """
+        # 1. Explicit config
+        if self.agent_memory_path:
+            return self.agent_memory_path
+
+        # 2-6. Auto-detect by existence
+        candidates = [
+            Path.home() / ".hermes" / "memories" / "MEMORY.md",     # Hermes
+            Path.home() / ".claude" / "CLAUDE.md",                   # Claude Code
+            Path.cwd() / ".cursorrules",                              # Cursor
+            Path.home() / ".cline" / "rules",                         # Cline
+            self.home / "agent-memory.md",                            # Generic fallback
+        ]
+        for p in candidates:
+            if p.exists():
+                return p
+
+        return None
+
+    def detect_agent_memory_separator(self, memory_path: Path | None = None) -> str:
+        """Auto-detect the entry separator used in the agent's memory file.
+
+        Hermes uses '§', most others use blank-line separators.
+        Falls back to the configured separator.
+        """
+        path = memory_path or self.detect_agent_memory_path()
+        if path and path.exists():
+            name = path.name.lower()
+            if "memory" in name and path.parent.name == "memories":
+                return "§"  # Hermes convention
+        return self.agent_memory_separator
 
     # ------------------------------------------------------------------
     # Domain-rule helpers

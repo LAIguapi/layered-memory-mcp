@@ -1,7 +1,12 @@
 """
 Memory Compactor — Detect and migrate non-index entries in agent memory.
 
-Hermes Agent stores memory in ~/.hermes/memories/MEMORY.md with `§` separators.
+Agent memory file formats vary by platform:
+  - Hermes: ~/.hermes/memories/MEMORY.md, entries separated by '§'
+  - Claude Code: ~/.claude/CLAUDE.md, entries separated by blank lines
+  - Cursor: ./.cursorrules
+  - Generic: any text file
+
 The L0 index layer should only contain short pointer entries like:
     [L0索引] domain: summary → knowledge/file.md
 
@@ -17,9 +22,6 @@ from .injector import inject_knowledge as _inject_knowledge
 
 logger = logging.getLogger("layered_memory_mcp.compactor")
 
-# Hermes memory entry separator
-_HERMES_SEPARATOR = "§"
-
 # Patterns for identifying L0 index entries
 _L0_INDEX_PATTERN = re.compile(r"^\[L0索引\]\s*")
 # Also consider structured tag entries as "acceptable" (e.g. [思维框架·强制])
@@ -28,9 +30,6 @@ _STRUCT_TAG_PATTERN = re.compile(r"^\[.+[·\-].+\]\s*")
 # Max chars for a "valid" memory entry (index pointers are short)
 # Anything longer is likely detailed knowledge that belongs in L1
 MAX_INDEX_ENTRY_LENGTH = 120
-
-# Default Hermes memory file path
-_DEFAULT_HERMES_MEMORY_PATH = Path.home() / ".hermes" / "memories" / "MEMORY.md"
 
 # Default memory capacity in chars (for capacity warning).
 # Users can override via MEMORY_MAX_CHARS env var.
@@ -46,6 +45,39 @@ _FALLBACK_DOMAIN_RULES: list[tuple[str, list[str]]] = [
              "code review", "TDD", "architecture", "pattern"]),
     ("docs", ["readme", "documentation", "guide", "tutorial", "how-to"]),
 ]
+
+
+def _resolve_memory_path(
+    memory_path: str | Path | None = None,
+    config=None,
+) -> Path | None:
+    """Resolve the agent memory file path.
+
+    Priority:
+      1. Explicit memory_path argument
+      2. config.detect_agent_memory_path() (auto-detect)
+      3. None (caller handles missing file)
+    """
+    if memory_path:
+        return Path(memory_path)
+    if config is not None:
+        return config.detect_agent_memory_path()
+    return None
+
+
+def _resolve_separator(
+    memory_path: Path | None = None,
+    config=None,
+) -> str:
+    """Resolve the entry separator for the agent memory file.
+
+    Priority:
+      1. config.detect_agent_memory_separator() (auto-detect)
+      2. Fallback to '\n\n' (blank-line separator — universal)
+    """
+    if config is not None:
+        return config.detect_agent_memory_separator(memory_path)
+    return "\n\n"
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +144,10 @@ def detect_memory_bloat(
     config=None,
     max_chars: int | None = None,
 ) -> dict:
-    """Scan a Hermes MEMORY.md file for non-index (bloat) entries.
+    """Scan agent memory file for non-index (bloat) entries.
+
+    Supports any agent's memory file. Auto-detects path and separator
+    from config if not explicitly provided.
 
     Returns a report with:
       - total_entries: total number of entries in the file
@@ -122,7 +157,7 @@ def detect_memory_bloat(
       - suggestions: which domain each bloat entry should migrate to
       - warnings: capacity warnings when usage exceeds thresholds
     """
-    path = Path(memory_path) if memory_path else _DEFAULT_HERMES_MEMORY_PATH
+    path = _resolve_memory_path(memory_path, config)
 
     if not path.exists():
         return {
@@ -136,7 +171,8 @@ def detect_memory_bloat(
     except Exception as e:
         return {"success": False, "error": str(e), "path": str(path)}
 
-    entries = _parse_entries(raw)
+    separator = _resolve_separator(path, config)
+    entries = _parse_entries(raw, separator=separator)
 
     index_entries = []
     bloat_entries = []
@@ -218,6 +254,9 @@ def compact_memory(
 ) -> dict:
     """Migrate bloat entries from agent memory to L1 knowledge files.
 
+    Supports any agent's memory file. Auto-detects path and separator
+    from config if not explicitly provided.
+
     For each non-index entry:
       1. Determine the best L1 domain/section
       2. Write the content to L1 via inject_knowledge
@@ -226,17 +265,18 @@ def compact_memory(
     Returns a report of migrated entries and the cleaned memory content.
     The agent should then write the cleaned content back to its memory.
     """
-    path = Path(memory_path) if memory_path else _DEFAULT_HERMES_MEMORY_PATH
+    path = _resolve_memory_path(memory_path, config)
 
-    if not path.exists():
-        return {"success": False, "error": f"Memory file not found: {path}"}
+    if not path or not path.exists():
+        return {"success": False, "error": f"Memory file not found: {path or '(auto-detect failed)'}"}
 
     try:
         raw = path.read_text(encoding="utf-8")
     except Exception as e:
         return {"success": False, "error": str(e)}
 
-    entries = _parse_entries(raw)
+    separator = _resolve_separator(path, config)
+    entries = _parse_entries(raw, separator=separator)
 
     # Load domain rules from config
     domain_rules = _get_domain_rules(config)
@@ -295,7 +335,7 @@ def compact_memory(
                 kept.append(entry)
 
     # Build cleaned memory content
-    cleaned_content = "\n§\n".join(kept)
+    cleaned_content = f"\n{separator}\n".join(kept)
     if kept:
         cleaned_content += "\n"
 
@@ -333,17 +373,19 @@ def compact_memory(
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _parse_entries(raw: str) -> list[str]:
-    """Parse Hermes MEMORY.md into individual entries.
+def _parse_entries(raw: str, separator: str = "§") -> list[str]:
+    """Parse agent memory file into individual entries.
 
-    Entries are separated by `§` on its own line.
+    Args:
+        raw: The full text content of the memory file.
+        separator: Entry separator. Hermes uses '§', most others use '\\n\\n'.
     """
     # Split by separator and clean up
-    parts = raw.split(f"\n{_HERMES_SEPARATOR}\n")
+    parts = raw.split(f"\n{separator}\n")
     entries = []
     for part in parts:
         cleaned = part.strip()
-        if cleaned and cleaned != _HERMES_SEPARATOR:
+        if cleaned and cleaned != separator:
             entries.append(cleaned)
     return entries
 

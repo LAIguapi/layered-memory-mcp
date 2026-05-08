@@ -148,8 +148,9 @@ def inject_knowledge(
         # P0: L0 pointer — agent should write this to its memory layer
         "l0_pointer": l0_pointer,
         "hint": (
-            "请将 l0_pointer 写入 agent memory 层以完成双写。"
-            "示例: memory add \"{l0_pointer}\""
+            "Write the l0_pointer to your agent's persistent memory store "
+            "to complete the dual-write. Example: add this to your memory: "
+            f'"{l0_pointer}"'
         ),
     }
 
@@ -160,10 +161,10 @@ def inject_knowledge(
             f"recommended {MAX_RECOMMENDED_SIZE} bytes. Consider splitting."
         )
 
-    # v0.8.1: Check agent memory usage and warn if too full
+    # Auto-check agent memory usage
     try:
         from .memory_compactor import detect_memory_bloat
-        bloat = detect_memory_bloat()
+        bloat = detect_memory_bloat(config=config)
         if bloat.get("success") and bloat.get("total_entries", 0) > 0:
             bloat_pct = bloat["stats"]["bloat_percentage"]
             total_chars = bloat["stats"]["total_chars"]

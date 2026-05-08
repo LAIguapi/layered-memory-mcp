@@ -999,7 +999,7 @@ async def init_framework() -> str:
         files = _scan_all(config)
         total = len(files)
 
-        rules_hermes = (
+        rules = (
             "## Memory Management Rules (Layered Memory MCP)\n\n"
             "1. **L0 is for pointers only**. Each entry should be ~1 line pointing to an L1 file. "
             "No full content, no procedures, no diagnostics.\n"
@@ -1007,17 +1007,9 @@ async def init_framework() -> str:
             "3. **Run compact_memory when warned**. If inject_knowledge returns a memory_bloat_warning, "
             "call compact_memory(dry_run=True) to inspect, then compact_memory(dry_run=False) to clean.\n"
             "4. **Expand capacity if >90% repeatedly**. If compact doesn't free enough space, "
-            "increase your agent's memory limit (e.g., Hermes: config.yaml memory.max_chars).\n"
+            "increase your agent's memory/storage limit.\n"
             "5. **User preferences → user profile. Procedural knowledge → skills. "
             "Only durable factual knowledge → L1 with L0 pointer.\n"
-        )
-        rules_generic = (
-            "## Memory Management Rules (Layered Memory MCP)\n\n"
-            "1. **Call get_l0_index() at session start** to load pointers into your context.\n"
-            "2. **Use inject_knowledge for all writes** — it handles dedup, sections, and index sync.\n"
-            "3. **Run compact_memory when warned** to keep your memory layer clean.\n"
-            "4. **Expand capacity if >90% repeatedly** — adjust your agent's memory/storage limits.\n"
-            "5. **Keep L0 entries short** — one line per domain, pointing to L1 detail files.\n"
         )
 
         if total == 0:
@@ -1043,14 +1035,14 @@ async def init_framework() -> str:
                 "success": True,
                 "first_run": True,
                 "action": "created getting-started.md",
-                "rules": rules_generic,
+                "rules": rules,
             }
 
         return {
             "success": True,
             "first_run": False,
             "l1_files_found": total,
-            "rules": rules_hermes if config.l0_format == "hermes" else rules_generic,
+            "rules": rules,
         }
 
     result = await asyncio.to_thread(_init)
