@@ -1,0 +1,55 @@
+[project]
+name = "layered-memory-mcp"
+version = "1.0.0"
+description = "Layered Memory MCP Server — Extend AI agent memory beyond token limits with a 4-tier knowledge architecture"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    { name = "LAIguapi" },
+]
+keywords = ["mcp", "memory", "ai-agent", "knowledge-management", "layered-memory"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "fastmcp>=2.0.0",
+    "filelock>=3.0,<4.0",
+]
+
+[project.scripts]
+layered-memory-mcp = "layered_memory_mcp.server:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+]
+
+[project.urls]
+Homepage = "https://github.com/LAIguapi/layered-memory-mcp"
+Repository = "https://github.com/LAIguapi/layered-memory-mcp"
+Bug-Tracker = "https://github.com/LAIguapi/layered-memory-mcp/issues"
+PyPI = "https://pypi.org/project/layered-memory-mcp/"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/layered_memory_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]

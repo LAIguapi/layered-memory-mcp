@@ -1,0 +1,43 @@
+# Domain Rules Configuration for Memory Compactor
+# ================================================
+#
+# This file maps domain names to keyword lists used by the memory compactor
+# to automatically categorize bloat entries and migrate them to the correct
+# L1 knowledge file.
+#
+# Format:
+#   domain_name:
+#     - "keyword1"
+#     - "keyword2"
+#     - "regex_pattern"
+#
+# Place this file anywhere and set the path via:
+#   - MemoryConfig(compact_domain_rules_file="/path/to/this/file.yaml")
+#   - Environment variable: LAYERED_MEMORY_COMPACT_DOMAIN_RULES_FILE
+#
+# If no file is configured, the compactor uses generic English fallback rules.
+#
+# Example (customize for your own use case):
+
+# infra:
+#   - "WSL"
+#   - "proxy"
+#   - "server"
+#   - "docker"
+#   - "kubernetes"
+#   - "nginx"
+#   - "ssh"
+#
+# dev:
+#   - "principle"
+#   - "testing"
+#   - "TDD"
+#   - "design"
+#   - "refactor"
+#   - "code review"
+#
+# docs:
+#   - "readme"
+#   - "documentation"
+#   - "guide"
+#   - "tutorial"

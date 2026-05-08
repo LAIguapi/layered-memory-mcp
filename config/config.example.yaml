@@ -1,0 +1,113 @@
+# =============================================================================
+# Layered Memory MCP — Domain Compact Rules (Example)
+# =============================================================================
+#
+# This file defines domain migration rules used by the compact operation.
+# Each top-level key is a **target domain** (i.e. a knowledge file without
+# the .md extension).  The value is a list of keywords; when the compact
+# engine encounters content matching those keywords it can suggest migrating
+# that content into the corresponding domain file.
+#
+# Usage
+# -----
+# 1. Copy this file:  cp config.example.yaml ~/.layered-memory/compact-rules.yaml
+# 2. Edit it to match your own domains and keywords.
+# 3. Point the server to it via:
+#      - Constructor:  MemoryConfig(compact_domain_rules_file="/path/to/compact-rules.yaml")
+#      - Env variable: LAYERED_MEMORY_COMPACT_DOMAIN_RULES_FILE=/path/to/compact-rules.yaml
+#
+# Rules
+# -----
+# - Keys are domain names (will map to <domain>.md in the knowledge directory).
+# - Values are lists of keyword strings.  A string value (no list) is also
+#   accepted for single-keyword domains.
+# - Keywords are matched case-insensitively against knowledge content.
+# =============================================================================
+
+# --- Artificial Intelligence & Machine Learning ---
+ai:
+  - artificial intelligence
+  - machine learning
+  - deep learning
+  - neural network
+  - LLM
+  - GPT
+  - transformer
+  - NLP
+  - computer vision
+  - reinforcement learning
+
+# --- DevOps & CI/CD ---
+devops:
+  - CI/CD
+  - Jenkins
+  - GitHub Actions
+  - GitLab CI
+  - Docker
+  - Kubernetes
+  - Terraform
+  - Ansible
+  - deployment pipeline
+
+# --- Documentation ---
+docs:
+  - README
+  - documentation
+  - API reference
+  - user guide
+  - changelog
+  - migration guide
+
+# --- Security ---
+security:
+  - vulnerability
+  - CVE
+  - authentication
+  - authorization
+  - encryption
+  - OWASP
+  - penetration testing
+  - security audit
+
+# --- Infrastructure & Networking ---
+infrastructure:
+  - DNS
+  - load balancer
+  - CDN
+  - VPN
+  - firewall
+  - reverse proxy
+  - networking
+  - cloud computing
+
+# --- Databases ---
+database:
+  - SQL
+  - PostgreSQL
+  - MySQL
+  - MongoDB
+  - Redis
+  - database migration
+  - indexing
+  - query optimization
+
+# --- Frontend Development ---
+frontend:
+  - React
+  - Vue
+  - Angular
+  - CSS
+  - HTML
+  - TypeScript
+  - webpack
+  - responsive design
+
+# --- Backend Development ---
+backend:
+  - REST API
+  - GraphQL
+  - microservice
+  - middleware
+  - rate limiting
+  - caching
+  - message queue
