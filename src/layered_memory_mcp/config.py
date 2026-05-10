@@ -143,6 +143,25 @@ class MemoryConfig:
             else _env_float("LAYERED_MEMORY_COMPACT_CAPACITY_WARNING_THRESHOLD", 0.9)
         )
 
+        # v1.2: L0 index entry tag — configurable for i18n (default: "[L0]")
+        _tag = os.environ.get("LAYERED_MEMORY_L0_TAG", "[L0]")
+        if not (_tag.startswith("[") and _tag.endswith("]")):
+            raise ValueError(
+                f"Invalid l0_tag: {_tag!r}. Must start with '[' and end with ']'."
+            )
+        self.l0_tag: str = _tag
+
+        # v1.2: Range validation for threshold parameters (must be 0.0–1.0)
+        for _name, _val in [
+            ("compact_bloat_threshold", self.compact_bloat_threshold),
+            ("compact_capacity_warning_threshold", self.compact_capacity_warning_threshold),
+            ("dedup_threshold", self.dedup_threshold),
+        ]:
+            if not (0.0 <= _val <= 1.0):
+                raise ValueError(
+                    f"{_name} must be between 0.0 and 1.0, got {_val}"
+                )
+
         # v1.0: Agent memory adapter — auto-detect or explicit
         _amp = os.environ.get("LAYERED_MEMORY_AGENT_MEMORY_PATH")
         self.agent_memory_path: Path | None = Path(_amp) if _amp else None
@@ -216,7 +235,7 @@ class MemoryConfig:
         path = memory_path or self.detect_agent_memory_path()
         if path and path.exists():
             name = path.name.lower()
-            if "memory" in name and path.parent.name == "memories":
+            if "memory" in name:
                 return "§"  # Hermes convention
         return self.agent_memory_separator
 

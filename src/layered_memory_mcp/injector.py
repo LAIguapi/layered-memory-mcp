@@ -14,9 +14,14 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
+from typing import TYPE_CHECKING
+
 from filelock import FileLock
 
 from .recall import find_similar_knowledge, invalidate_scan_cache, knowledge_health, scan_knowledge_files
+
+if TYPE_CHECKING:
+    from .config import MemoryConfig
 
 logger = logging.getLogger("layered_memory_mcp.injector")
 
@@ -29,7 +34,7 @@ MAX_RECOMMENDED_SIZE = 4096
 
 
 def inject_knowledge(
-    config,  # MemoryConfig
+    config: "MemoryConfig",
     domain: str,
     section: str,
     content: str,
@@ -133,7 +138,8 @@ def inject_knowledge(
     # Generate a ready-to-use L0 pointer for the agent's memory system.
     # This makes the "correct path" the path of least resistance:
     # agent calls inject_knowledge → gets l0_pointer back → copies it to memory add.
-    l0_pointer = f"[L0索引] {domain_clean}: {_summarize_for_l0(content)} → knowledge/{filename}"
+    tag = getattr(config, "l0_tag", "[L0]")
+    l0_pointer = f"{tag} {domain_clean}: {_summarize_for_l0(content)} → knowledge/{filename}"
 
     result = {
         "success": True,

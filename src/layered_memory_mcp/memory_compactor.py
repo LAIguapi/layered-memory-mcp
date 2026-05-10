@@ -8,7 +8,7 @@ Agent memory file formats vary by platform:
   - Generic: any text file
 
 The L0 index layer should only contain short pointer entries like:
-    [L0索引] domain: summary → knowledge/file.md
+    [L0] domain: summary → knowledge/file.md
 
 This module detects "bloat" entries (detailed knowledge that should be in L1)
 and provides tools to migrate them to proper L1 knowledge files.
@@ -17,13 +17,31 @@ and provides tools to migrate them to proper L1 knowledge files.
 import logging
 import re
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .injector import inject_knowledge as _inject_knowledge
 
+if TYPE_CHECKING:
+    from .config import MemoryConfig
+
 logger = logging.getLogger("layered_memory_mcp.compactor")
 
-# Patterns for identifying L0 index entries
-_L0_INDEX_PATTERN = re.compile(r"^\[L0索引\]\s*")
+# Default L0 index tag (overridden by config.l0_tag at runtime)
+_DEFAULT_L0_TAG = "[L0]"
+_L0_INDEX_PATTERN = re.compile(r"^\[L0\]\s*")
+
+
+def _get_l0_pattern(config=None) -> re.Pattern:
+    """Get the L0 index tag pattern, using the configured l0_tag.
+
+    Also matches the legacy ``[L0索引]`` tag for backward compatibility
+    with previously-written memory entries.
+    """
+    tag = getattr(config, "l0_tag", None) or _DEFAULT_L0_TAG
+    tag_escaped = re.escape(tag)
+    # Also accept the legacy Chinese tag for backward compat
+    legacy = re.escape("[L0索引]")
+    return re.compile(rf"(?:{tag_escaped}|{legacy})\s*")
 # Also consider structured tag entries as "acceptable" (e.g. [思维框架·强制])
 _STRUCT_TAG_PATTERN = re.compile(r"^\[.+[·\-].+\]\s*")
 
@@ -49,7 +67,7 @@ _FALLBACK_DOMAIN_RULES: list[tuple[str, list[str]]] = [
 
 def _resolve_memory_path(
     memory_path: str | Path | None = None,
-    config=None,
+    config: "MemoryConfig | None" = None,
 ) -> Path | None:
     """Resolve the agent memory file path.
 
@@ -67,16 +85,23 @@ def _resolve_memory_path(
 
 def _resolve_separator(
     memory_path: Path | None = None,
-    config=None,
+    config: "MemoryConfig | None" = None,
 ) -> str:
     """Resolve the entry separator for the agent memory file.
 
     Priority:
       1. config.detect_agent_memory_separator() (auto-detect)
-      2. Fallback to '\n\n' (blank-line separator — universal)
+      2. File-name heuristic: files with 'memory' in the name
+         (case-insensitive) use '§' (Hermes convention)
+      3. Fallback to '\\n\\n' (blank-line separator — universal)
     """
     if config is not None:
         return config.detect_agent_memory_separator(memory_path)
+    # No config — try simple heuristic from filename
+    if memory_path and memory_path.exists():
+        name = memory_path.name.lower()
+        if "memory" in name:
+            return "§"
     return "\n\n"
 
 
@@ -124,7 +149,7 @@ def _load_domain_rules_from_config(config) -> list[tuple[str, list[str]]]:
     return rules if rules else None
 
 
-def _get_domain_rules(config=None) -> list[tuple[str, list[str]]]:
+def _get_domain_rules(config: "MemoryConfig | None" = None) -> list[tuple[str, list[str]]]:
     """Get domain rules, falling back to generic defaults.
 
     Returns a list of (domain, [keywords]) tuples.
@@ -141,7 +166,7 @@ def _get_domain_rules(config=None) -> list[tuple[str, list[str]]]:
 
 def detect_memory_bloat(
     memory_path: str | Path | None = None,
-    config=None,
+    config: "MemoryConfig | None" = None,
     max_chars: int | None = None,
 ) -> dict:
     """Scan agent memory file for non-index (bloat) entries.
@@ -185,7 +210,7 @@ def detect_memory_bloat(
         entry_len = len(entry)
         total_chars += entry_len
 
-        if _is_index_entry(entry):
+        if _is_index_entry(entry, config):
             index_entries.append(entry)
             index_chars += entry_len
         else:
@@ -196,7 +221,7 @@ def detect_memory_bloat(
     domain_rules = _get_domain_rules(config)
     suggestions = []
     for entry in bloat_entries:
-        suggestion = _suggest_migration(entry, domain_rules=domain_rules)
+        suggestion = _suggest_migration(entry, domain_rules=domain_rules, config=config)
         suggestions.append({
             "entry_preview": entry[:80] + ("..." if len(entry) > 80 else ""),
             "entry_length": len(entry),
@@ -248,7 +273,7 @@ def detect_memory_bloat(
 
 
 def compact_memory(
-    config,
+    config: "MemoryConfig",
     memory_path: str | Path | None = None,
     dry_run: bool = False,
 ) -> dict:
@@ -286,12 +311,12 @@ def compact_memory(
     errors = []
 
     for entry in entries:
-        if _is_index_entry(entry):
+        if _is_index_entry(entry, config):
             kept.append(entry)
             continue
 
         # This is a bloat entry — migrate to L1
-        suggestion = _suggest_migration(entry, domain_rules=domain_rules)
+        suggestion = _suggest_migration(entry, domain_rules=domain_rules, config=config)
 
         if dry_run:
             migrated.append({
@@ -357,6 +382,14 @@ def compact_memory(
     }
 
     if not dry_run:
+        # Backup the original agent memory file before overwriting (S2 safety)
+        try:
+            backup_path = path.with_suffix(path.suffix + ".bak")
+            backup_path.write_text(raw, encoding="utf-8")
+            logger.info("Backed up agent memory to %s", backup_path)
+        except Exception as e:
+            logger.warning("Failed to backup agent memory before compact: %s", e)
+
         # Write the cleaned memory back
         try:
             path.write_text(cleaned_content, encoding="utf-8")
@@ -364,7 +397,7 @@ def compact_memory(
         except Exception as e:
             result["file_written"] = False
             result["write_error"] = str(e)
-            result["hint"] = "cleaned_memory 字段包含了清理后的内容，请手动写入"
+            result["hint"] = "cleaned_memory field contains the cleaned content; write it manually"
 
     return result
 
@@ -390,20 +423,20 @@ def _parse_entries(raw: str, separator: str = "§") -> list[str]:
     return entries
 
 
-def _is_index_entry(entry: str) -> bool:
+def _is_index_entry(entry: str, config=None) -> bool:
     """Determine if an entry is a proper L0 index pointer.
 
     Valid L0 entries:
-      - Start with [L0索引]
+      - Start with the configured L0 tag (default: [L0])
       - Are reasonably short (under MAX_INDEX_ENTRY_LENGTH)
     """
-    if _L0_INDEX_PATTERN.match(entry):
+    if _get_l0_pattern(config).match(entry):
         # Even L0 entries can be bloated if too long
         return len(entry) <= MAX_INDEX_ENTRY_LENGTH
     return False
 
 
-def _suggest_migration(entry: str, domain_rules: list[tuple[str, list[str]]] | None = None) -> dict:
+def _suggest_migration(entry: str, domain_rules: list[tuple[str, list[str]]] | None = None, config=None) -> dict:
     """Suggest which L1 domain and section a bloat entry should migrate to.
 
     Uses keyword matching to determine the best domain.
@@ -413,23 +446,29 @@ def _suggest_migration(entry: str, domain_rules: list[tuple[str, list[str]]] | N
         entry: The memory entry text.
         domain_rules: List of (domain, [keywords]) tuples. If None, uses
             generic fallback rules.
+        config: MemoryConfig instance (for l0_tag).
     """
     if domain_rules is None:
         domain_rules = _FALLBACK_DOMAIN_RULES
 
     entry_lower = entry.lower()
 
-    # Special case: [L0索引] entries already have a domain tag — use it directly
-    # e.g. "[L0索引] infra: WSL代理…" → domain=infra
-    l0_match = re.match(r"^\[L0索引\]\s*([\w\-]+):", entry)
+    # Derive tag content (without brackets) for comparison
+    tag = getattr(config, "l0_tag", None) or _DEFAULT_L0_TAG
+    tag_inner = tag.strip("[]")
+
+    # Special case: L0 tag entries already have a domain tag — use it directly
+    # e.g. "[L0] infra: WSL代理…" → domain=infra
+    l0_match = _get_l0_pattern(config).match(entry)
     if l0_match:
-        l0_domain = l0_match.group(1)
-        # Validate it's a known domain
-        known_domains = {r[0] for r in domain_rules}
-        if l0_domain in known_domains:
-            matched_domain = l0_domain
+        rest = entry[l0_match.end():]
+        domain_match = re.match(r"([\w\-]+):", rest)
+        if domain_match:
+            l0_domain = domain_match.group(1)
+            known_domains = {r[0] for r in domain_rules}
+            matched_domain = l0_domain  # trust it even if unusual
         else:
-            matched_domain = l0_domain  # trust it anyway, but it's unusual
+            matched_domain = None
     else:
         matched_domain = None
 
@@ -451,9 +490,9 @@ def _suggest_migration(entry: str, domain_rules: list[tuple[str, list[str]]] | N
     tag_match = re.match(r"^\[([^\]]+)\]\s*", entry)
     if tag_match:
         raw_tag = tag_match.group(1)
-        # Only use the tag as section if it's NOT [L0索引]
-        if raw_tag.strip() == "L0索引":
-            # Get content after [L0索引] domain: part
+        # Only use the tag as section if it's NOT the L0 tag
+        if raw_tag.strip() == tag_inner:
+            # Get content after L0 tag domain: part
             after_tag = entry[tag_match.end():]
             # Try to extract meaningful content after the "domain: " prefix
             content_part = re.sub(r"^[\w\-]+:\s*", "", after_tag).strip()
@@ -474,15 +513,16 @@ def _suggest_migration(entry: str, domain_rules: list[tuple[str, list[str]]] | N
     if not section:
         section = "migrated"
 
-    # Generate L0 pointer — strip the [L0索引] prefix from summary if present
-    summary = _summarize_brief(entry)
-    # Remove double [L0索引] nesting
-    if summary.startswith("L0索引:"):
-        summary = summary[len("L0索引:"):].strip()
-    if summary.startswith("[L0索引]"):
-        summary = summary[len("[L0索引]"):].strip()
+    # Generate L0 pointer — strip the L0 tag prefix from summary if present
+    summary = _summarize_brief(entry, config=config)
+    # Remove double L0 tag nesting
+    tag_prefix = f"{tag_inner}:"
+    if summary.startswith(tag_prefix):
+        summary = summary[len(tag_prefix):].strip()
+    if summary.startswith(tag + " "):
+        summary = summary[len(tag) + 1:].strip()
 
-    l0_pointer = f"[L0索引] {matched_domain}: {summary} → knowledge/{matched_domain}.md"
+    l0_pointer = f"{tag} {matched_domain}: {summary} → knowledge/{matched_domain}.md"
 
     return {
         "domain": matched_domain,
@@ -491,12 +531,13 @@ def _suggest_migration(entry: str, domain_rules: list[tuple[str, list[str]]] | N
     }
 
 
-def _summarize_brief(entry: str, max_chars: int = 60) -> str:
+def _summarize_brief(entry: str, max_chars: int = 60, config=None) -> str:
     """Create a very brief summary from an entry for the L0 pointer."""
-    # Strip leading [L0索引] prefix — this is metadata, not content
+    tag = getattr(config, "l0_tag", None) or _DEFAULT_L0_TAG
+    # Strip leading L0 tag prefix — this is metadata, not content
     entry_clean = entry
-    if entry_clean.startswith("[L0索引]"):
-        entry_clean = entry_clean[len("[L0索引]"):].strip()
+    if entry_clean.startswith(tag + " "):
+        entry_clean = entry_clean[len(tag) + 1:].strip()
         # Also strip the "domain: " part that follows
         entry_clean = re.sub(r"^[\w\-]+:\s*", "", entry_clean).strip()
         # Return content before "→ knowledge/" or truncated

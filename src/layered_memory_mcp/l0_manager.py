@@ -6,7 +6,7 @@ to L1 knowledge files so the agent knows *what knowledge exists* without
 loading all of it.
 
 Two formats are supported:
-  - "hermes":  [L0索引] domain: summary → knowledge/file.md
+  - "hermes":  [L0] domain: summary → knowledge/file.md
   - "generic": [file.md] Title → keyword1, keyword2
 """
 
@@ -14,15 +14,19 @@ import logging
 import re
 import time
 from pathlib import Path
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from .recall import generate_l0_index, invalidate_scan_cache, scan_knowledge_files
 
+if TYPE_CHECKING:
+    from .config import MemoryConfig
+
 logger = logging.getLogger("layered_memory_mcp.l0_manager")
 
-# Regex patterns for parsing L0 entries
+# Default patterns — dynamically rebuilt when config provides a custom l0_tag
+_DEFAULT_L0_TAG = "[L0]"
 _HERMES_ENTRY_RE = re.compile(
-    r"^\[L0索引\]\s*(?P<domain>[^:：]+)[：:]\s*(?P<summary>.+?)\s*→\s*(?P<path>.+)$"
+    r"^\[L0\]\s*(?P<domain>[^:：]+)[：:]\s*(?P<summary>.+?)\s*→\s*(?P<path>.+)$"
 )
 _GENERIC_ENTRY_RE = re.compile(
     r"^\[(?P<file>[^\]]+)\]\s*(?P<title>.+?)(?:\s*→\s*(?P<keywords>.+))?$"
@@ -30,8 +34,34 @@ _GENERIC_ENTRY_RE = re.compile(
 
 # Safe variant — more permissive for path extraction (used in _extract_referenced_files)
 _HERMES_ENTRY_RE_SAFE = re.compile(
-    r"^\[L0索引\]\s*[^:：]+[：:]\s*.+?\s*→\s*(?P<path>\S+)$"
+    r"^\[L0\]\s*[^:：]+[：:]\s*.+?\s*→\s*(?P<path>\S+)$"
 )
+
+
+def _get_hermes_re(config=None) -> re.Pattern:
+    """Get the hermes-entry regex, using the configured l0_tag.
+
+    Also matches the legacy ``[L0索引]`` tag for backward compatibility.
+    """
+    tag = getattr(config, "l0_tag", None) or _DEFAULT_L0_TAG
+    tag_escaped = re.escape(tag)
+    legacy = re.escape("[L0索引]")
+    return re.compile(
+        rf"(?:{tag_escaped}|{legacy})\s*(?P<domain>[^:：]+)[：:]\s*(?P<summary>.+?)\s*→\s*(?P<path>.+)$"
+    )
+
+
+def _get_hermes_re_safe(config=None) -> re.Pattern:
+    """Get the safe hermes-entry regex (path extraction only).
+
+    Also matches the legacy ``[L0索引]`` tag for backward compatibility.
+    """
+    tag = getattr(config, "l0_tag", None) or _DEFAULT_L0_TAG
+    tag_escaped = re.escape(tag)
+    legacy = re.escape("[L0索引]")
+    return re.compile(
+        rf"(?:{tag_escaped}|{legacy})\s*[^:：]+[：:]\s*.+?\s*→\s*(?P<path>\S+)$"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -39,7 +69,7 @@ _HERMES_ENTRY_RE_SAFE = re.compile(
 # ---------------------------------------------------------------------------
 
 def sync_l0_index(
-    config,  # MemoryConfig — avoid circular import
+    config: "MemoryConfig",
     dry_run: bool = False,
     l0_format: str | None = None,
 ) -> dict:
@@ -67,7 +97,7 @@ def sync_l0_index(
 
     # --- Generate fresh index content ---
     if effective_format == "hermes":
-        new_lines = _generate_hermes_index(kdirs if len(kdirs) > 1 else kdirs[0], l1_files)
+        new_lines = _generate_hermes_index(kdirs if len(kdirs) > 1 else kdirs[0], l1_files, config)
     else:
         new_content_raw = generate_l0_index(kdirs if len(kdirs) > 1 else kdirs[0])
         new_lines = new_content_raw.split("\n") if new_content_raw else []
@@ -79,12 +109,12 @@ def sync_l0_index(
     if l0_file and l0_file.exists():
         try:
             existing_text = l0_file.read_text(encoding="utf-8")
-            existing_entries = _parse_entry_domains(existing_text, effective_format)
+            existing_entries = _parse_entry_domains(existing_text, effective_format, config)
         except Exception as e:
             logger.warning("Failed to read existing L0: %s", e)
 
     # Compute diff
-    new_domains = _parse_entry_domains(new_content, effective_format)
+    new_domains = _parse_entry_domains(new_content, effective_format, config)
     added = new_domains - existing_entries
     removed = existing_entries - new_domains
     unchanged = existing_entries & new_domains
@@ -242,19 +272,20 @@ def manage_entry(
         if not summary:
             return {"success": False, "error": "summary is required for 'add'"}
         fn = filename or f"{domain}.md"
+        tag = getattr(config, "l0_tag", _DEFAULT_L0_TAG)
         if config.l0_format == "hermes":
-            new_line = f"[L0索引] {domain}: {summary} → knowledge/{fn}"
+            new_line = f"{tag} {domain}: {summary} → knowledge/{fn}"
         else:
             new_line = f"[{fn}] {summary}"
         # Check if entry already exists
         for line in lines:
-            if _entry_matches_domain(line, domain, config.l0_format):
+            if _entry_matches_domain(line, domain, config.l0_format, config):
                 return {"success": False, "error": f"Entry for '{domain}' already exists. Use 'replace'."}
         lines.append(new_line)
 
     elif action == "remove":
         original_count = len(lines)
-        lines = [l for l in lines if not _entry_matches_domain(l, domain, config.l0_format)]
+        lines = [l for l in lines if not _entry_matches_domain(l, domain, config.l0_format, config)]
         if len(lines) == original_count:
             return {"success": False, "error": f"No entry found for '{domain}'"}
 
@@ -262,13 +293,14 @@ def manage_entry(
         if not summary:
             return {"success": False, "error": "summary is required for 'replace'"}
         fn = filename or f"{domain}.md"
+        tag = getattr(config, "l0_tag", _DEFAULT_L0_TAG)
         if config.l0_format == "hermes":
-            new_line = f"[L0索引] {domain}: {summary} → knowledge/{fn}"
+            new_line = f"{tag} {domain}: {summary} → knowledge/{fn}"
         else:
             new_line = f"[{fn}] {summary}"
         found = False
         for i, line in enumerate(lines):
-            if _entry_matches_domain(line, domain, config.l0_format):
+            if _entry_matches_domain(line, domain, config.l0_format, config):
                 lines[i] = new_line
                 found = True
                 break
@@ -321,7 +353,7 @@ def check_l0_l1_consistency(config) -> dict:
     if l0_file and l0_file.exists():
         try:
             l0_text = l0_file.read_text(encoding="utf-8")
-            l0_referenced = _extract_referenced_files(l0_text, config.l0_format)
+            l0_referenced = _extract_referenced_files(l0_text, config.l0_format, config)
         except Exception:
             pass
 
@@ -344,12 +376,13 @@ def check_l0_l1_consistency(config) -> dict:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _generate_hermes_index(knowledge_dir: str, l1_files: dict) -> list[str]:
+def _generate_hermes_index(knowledge_dir: str, l1_files: dict, config=None) -> list[str]:
     """Generate L0 index in Hermes format from L1 files.
 
     Uses generate_l0_index() for generic format, then we build hermes-specific
     lines by reading each file's first heading and top keywords.
     """
+    tag = getattr(config, "l0_tag", _DEFAULT_L0_TAG)
     # Reuse the generic generator — it already extracts title + keywords
     generic = generate_l0_index(knowledge_dir)
     if not generic:
@@ -376,20 +409,21 @@ def _generate_hermes_index(knowledge_dir: str, l1_files: dict) -> list[str]:
             summary_parts.append(keywords)
         summary = " — ".join(summary_parts) if summary_parts else domain
 
-        lines.append(f"[L0索引] {domain}: {summary} → knowledge/{filename}")
+        lines.append(f"{tag} {domain}: {summary} → knowledge/{filename}")
 
     return lines
 
 
-def _parse_entry_domains(content: str, fmt: str) -> set[str]:
+def _parse_entry_domains(content: str, fmt: str, config=None) -> set[str]:
     """Extract domain names from L0 index content."""
     domains: set[str] = set()
+    hermes_re = _get_hermes_re(config) if fmt == "hermes" else None
     for line in content.split("\n"):
         line = line.strip()
         if not line or line.startswith("#"):
             continue
         if fmt == "hermes":
-            m = _HERMES_ENTRY_RE.match(line)
+            m = hermes_re.match(line)
             if m:
                 domains.add(m.group("domain").strip())
         else:
@@ -399,25 +433,26 @@ def _parse_entry_domains(content: str, fmt: str) -> set[str]:
     return domains
 
 
-def _entry_matches_domain(line: str, domain: str, fmt: str) -> bool:
+def _entry_matches_domain(line: str, domain: str, fmt: str, config=None) -> bool:
     """Check if an L0 entry line matches the given domain."""
     if fmt == "hermes":
-        m = _HERMES_ENTRY_RE.match(line)
+        m = _get_hermes_re(config).match(line)
         return m is not None and m.group("domain").strip() == domain
     else:
         m = _GENERIC_ENTRY_RE.match(line)
         return m is not None and m.group("file").removesuffix(".md") == domain
 
 
-def _extract_referenced_files(content: str, fmt: str) -> set[str]:
+def _extract_referenced_files(content: str, fmt: str, config=None) -> set[str]:
     """Extract L1 filenames referenced in L0 index."""
     files: set[str] = set()
+    hermes_re_safe = _get_hermes_re_safe(config) if fmt == "hermes" else None
     for line in content.split("\n"):
         line = line.strip()
         if not line or line.startswith("#"):
             continue
         if fmt == "hermes":
-            m = _HERMES_ENTRY_RE_SAFE.match(line)
+            m = hermes_re_safe.match(line)
             if m:
                 path = m.group("path").strip()
                 files.add(Path(path).name)

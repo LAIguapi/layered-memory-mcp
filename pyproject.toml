@@ -1,6 +1,6 @@
 [project]
 name = "layered-memory-mcp"
-version = "1.1.0"
+version = "1.2.0"
 description = "Layered Memory MCP Server — Extend AI agent memory beyond token limits with a 4-tier knowledge architecture"
 readme = "README.md"
 license = "MIT"

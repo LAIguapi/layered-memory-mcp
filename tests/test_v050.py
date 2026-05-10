@@ -52,7 +52,7 @@ class TestL0Manager:
         assert Path(l0_file).exists()
 
         content = l0_file.read_text(encoding="utf-8")
-        assert "[L0索引]" in content
+        assert "[L0]" in content
         assert "infra" in content
         assert "knowledge/infra.md" in content or "→" in content
 
@@ -98,7 +98,7 @@ class TestL0Manager:
         assert r["total_entries"] == 1
 
         content = l0_file.read_text(encoding="utf-8")
-        assert "[L0索引] infra: Proxy and Git config → knowledge/infra.md" in content
+        assert "[L0] infra: Proxy and Git config → knowledge/infra.md" in content
 
         # Add another
         r2 = manage_entry(config, "add", domain="dev", summary="Dev principles", filename="dev-principles.md")

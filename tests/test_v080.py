@@ -47,7 +47,7 @@ class TestL0Pointer:
 
         assert result["success"] is True
         assert "l0_pointer" in result
-        assert result["l0_pointer"].startswith("[L0索引]")
+        assert result["l0_pointer"].startswith("[L0]")
         assert "infra" in result["l0_pointer"]
         assert "knowledge/infra.md" in result["l0_pointer"]
         assert "hint" in result
@@ -289,9 +289,10 @@ class TestMemoryCompaction:
         assert result["migrated_count"] == 1
         assert result["error_count"] == 0
 
-        # The cleaned file should only have index entries
+        # The cleaned file should only have index entries (2 legacy + 1 new format)
         cleaned = memory_file.read_text(encoding="utf-8")
-        assert cleaned.count("[L0索引]") == 3  # 2 original + 1 migrated
+        assert cleaned.count("[L0]") + cleaned.count("[L0索引]") == 3  # 2 original + 1 migrated
+        assert cleaned.count("[L0索引]") == 2  # original entries preserved in old format
 
     def test_compact_memory_no_bloat(self, tmp_path):
         """compact_memory with clean file should report 0 migrations."""
