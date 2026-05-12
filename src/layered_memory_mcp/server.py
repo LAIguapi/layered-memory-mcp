@@ -677,6 +677,96 @@ async def inject_knowledge_tool(
 
 
 @mcp.tool()
+async def batch_inject_knowledge_tool(
+    items: list,
+    mode: str = "upsert",
+    agent_id: str | None = None,
+) -> str:
+    """Batch knowledge injection — inject multiple knowledge entries in one call.
+
+    Use this when you have analyzed session data (or any source) and want to
+    write multiple knowledge entries at once. Much more efficient than calling
+    inject_knowledge_tool multiple times.
+
+    Args:
+        items: List of knowledge entries, each with keys:
+               - domain: Target L1 file (e.g. "infra")
+               - section: Target ## heading (e.g. "WSL 代理")
+               - content: Knowledge content (markdown text)
+        mode: Write mode for ALL items — "upsert" (default), "append", or "merge".
+        agent_id: Optional agent identifier for provenance tracking.
+
+    Returns:
+        JSON with per-item results, total counts, and any errors.
+    """
+    config = _get_config()
+
+    if mode not in ("upsert", "append", "merge"):
+        return json.dumps({"success": False, "error": f"Invalid mode: {mode!r}. Must be 'upsert', 'append', or 'merge'."})
+
+    results = []
+    success_count = 0
+    error_count = 0
+
+    for idx, item in enumerate(items):
+        domain = item.get("domain", "")
+        section = item.get("section", "")
+        content = item.get("content", "")
+
+        if not domain or not content:
+            results.append({
+                "index": idx,
+                "success": False,
+                "error": "Missing required field: 'domain' and 'content' are required",
+                "domain": domain,
+                "section": section,
+            })
+            error_count += 1
+            continue
+
+        try:
+            result = inject_knowledge(
+                config=config,
+                domain=domain,
+                section=section,
+                content=content,
+                mode=mode,
+                agent_id=agent_id,
+            )
+            results.append({
+                "index": idx,
+                "success": result.get("success", False),
+                "domain": domain,
+                "section": section,
+                "action": result.get("action"),
+                "dedup": result.get("dedup"),
+                "l0_synced": result.get("l0_synced"),
+                "error": result.get("error"),
+            })
+            if result.get("success"):
+                success_count += 1
+            else:
+                error_count += 1
+        except Exception as e:
+            results.append({
+                "index": idx,
+                "success": False,
+                "domain": domain,
+                "section": section,
+                "error": str(e),
+            })
+            error_count += 1
+
+    return json.dumps({
+        "success": error_count == 0,
+        "total": len(items),
+        "success_count": success_count,
+        "error_count": error_count,
+        "results": results,
+    }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
 async def sync_l0_index_tool(
     format: str = "hermes",
     dry_run: bool = False,
