@@ -34,6 +34,29 @@ from .session_scanner import find_recent_sessions, extract_session_summary, scan
 from .l0_manager import sync_l0_index, auto_sync_if_enabled, manage_entry, check_l0_l1_consistency
 from .injector import inject_knowledge
 
+# v2.0 imports
+from .models import KnowledgeEntry, KnowledgeType, SourceInfo, SourceType, ReviewItem, ConfidenceScorer
+from .storage import L1Store, VectorStore, ReviewQueue
+from .extractor import SessionReader, KnowledgeExtractor
+
+# ---------------------------------------------------------------------------
+# v2.0 Global state
+# ---------------------------------------------------------------------------
+_v2_stores: dict = {}
+
+def _get_v2_stores():
+    """Get or initialize v2.0 storage layer."""
+    global _v2_stores
+    if not _v2_stores:
+        config = _get_config()
+        knowledge_dir = config.knowledge_dir
+        data_dir = config.home / "data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        _v2_stores["l1"] = L1Store(knowledge_dir)
+        _v2_stores["vector"] = VectorStore(data_dir / "vectors.db")
+        _v2_stores["review"] = ReviewQueue(data_dir / "review_queue.db")
+    return _v2_stores
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -709,6 +732,19 @@ async def batch_inject_knowledge_tool(
     error_count = 0
 
     for idx, item in enumerate(items):
+        if isinstance(item, str):
+            try:
+                item = json.loads(item)
+            except Exception:
+                results.append({
+                    "index": idx,
+                    "success": False,
+                    "error": "Item is a string but not valid JSON",
+                    "domain": "",
+                    "section": "",
+                })
+                error_count += 1
+                continue
         domain = item.get("domain", "")
         section = item.get("section", "")
         content = item.get("content", "")
@@ -916,7 +952,263 @@ async def manage_l0_entry_tool(
 
 
 # ---------------------------------------------------------------------------
-# MCP Tools — L0 Index Access (v0.6.0: agent-agnostic L0 retrieval)
+# MCP Tools — v2.0: Structured Knowledge Extraction
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def extract_session_knowledge(
+    days: int = 3,
+    max_sessions: int = 10,
+    auto_approve_threshold: float = 0.9,
+    max_items_per_session: int = 5,
+) -> str:
+    """Extract structured knowledge from recent sessions using v2.0 extractor.
+
+    Replaces scan_recent_sessions + manual analysis with automated,
+    structured extraction. Reads FULL sessions (no truncation),
+    detects knowledge types, scores confidence, and returns
+    ready-to-inject knowledge entries.
+
+    Args:
+        days: Look back N days (default 3).
+        max_sessions: Maximum sessions to scan (default 10).
+        auto_approve_threshold: Confidence threshold for auto-approval (default 0.9).
+        max_items_per_session: Max knowledge items per session (default 5).
+
+    Returns:
+        JSON with extracted knowledge entries, confidence scores, and review status.
+    """
+    config = _get_config()
+
+    if not config.sessions_dir or not config.sessions_dir.exists():
+        return json.dumps({
+            "success": False,
+            "error": "Sessions directory not configured or not found.",
+        })
+
+    def _extract():
+        reader = SessionReader(str(config.sessions_dir))
+        sessions = reader.read_recent(days=days, max_sessions=max_sessions)
+
+        extractor = KnowledgeExtractor(auto_approve_threshold=auto_approve_threshold)
+        items = extractor.extract_from_sessions(sessions, max_items_per_session=max_items_per_session)
+
+        # Convert to serializable format
+        entries = []
+        for item in items:
+            e = item.entry
+            entries.append({
+                "id": e.id,
+                "domain": e.domain,
+                "section": e.section,
+                "type": e.type.value,
+                "content": e.content,
+                "summary": e.summary,
+                "confidence": e.confidence,
+                "review_status": e.review_status.value,
+                "source": {
+                    "type": e.source.type.value,
+                    "session_id": e.source.session_id,
+                    "extracted_by": e.source.extracted_by,
+                },
+                "tags": e.tags,
+            })
+
+        stats = extractor.get_extraction_stats(items)
+        return {
+            "success": True,
+            "sessions_scanned": len(sessions),
+            "entries": entries,
+            "stats": stats,
+        }
+
+    result = await asyncio.to_thread(_extract)
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def search_semantic(
+    query: str,
+    top_n: int = 5,
+    domain: str | None = None,
+) -> str:
+    """Semantic search for knowledge entries using vector similarity.
+
+    Uses the v2.0 vector store to find conceptually related knowledge,
+    even if keywords don't match exactly.
+
+    Args:
+        query: Search query string.
+        top_n: Number of results to return (default 5).
+        domain: Optional domain filter.
+
+    Returns:
+        JSON with search results and similarity scores.
+    """
+    stores = _get_v2_stores()
+    results = stores["vector"].search(query, top_n=top_n, domain=domain)
+    return json.dumps({
+        "success": True,
+        "query": query,
+        "results": results,
+    }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def get_pending_reviews(
+    limit: int = 50,
+    offset: int = 0,
+) -> str:
+    """Get pending knowledge entries awaiting human review.
+
+    Returns low-confidence extractions that need manual approval
+    before being committed to the main knowledge base.
+
+    Args:
+        limit: Max items to return (default 50).
+        offset: Pagination offset (default 0).
+
+    Returns:
+        JSON with pending review items.
+    """
+    stores = _get_v2_stores()
+    items = stores["review"].list_pending(limit=limit, offset=offset)
+    return json.dumps({
+        "success": True,
+        "pending_count": len(items),
+        "items": [
+            {
+                "id": item["id"],
+                "domain": item["entry"].domain,
+                "section": item["entry"].section,
+                "type": item["entry"].type.value,
+                "summary": item["entry"].summary,
+                "confidence": item["entry"].confidence,
+                "submitted_at": item["submitted_at"],
+            }
+            for item in items
+        ],
+    }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def approve_knowledge(
+    entry_id: str,
+    reviewer: str = "human",
+    note: str = "",
+) -> str:
+    """Approve a pending knowledge entry.
+
+    Moves the entry from pending to approved status.
+
+    Args:
+        entry_id: ID of the knowledge entry to approve.
+        reviewer: Name of the reviewer (default "human").
+        note: Optional review note.
+
+    Returns:
+        JSON with approval result.
+    """
+    stores = _get_v2_stores()
+    result = stores["review"].approve(entry_id, reviewer=reviewer, note=note)
+
+    # Update L1 file status
+    if result.get("success"):
+        for domain in stores["l1"].list_domains():
+            meta, content = stores["l1"].read(domain)
+            if meta and meta.get("id") == entry_id:
+                from .storage.frontmatter import parse_frontmatter, dump_frontmatter
+                entry = KnowledgeEntry.from_markdown(
+                    stores["l1"]._resolve_path(domain).read_text(),
+                    domain=domain,
+                )
+                entry.review_status = __import__("layered_memory_mcp.models", fromlist=["ReviewStatus"]).ReviewStatus.APPROVED
+                entry.reviewed_by = reviewer
+                stores["l1"].write(entry)
+                break
+
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def reject_knowledge(
+    entry_id: str,
+    reviewer: str = "human",
+    note: str = "",
+) -> str:
+    """Reject a pending knowledge entry.
+
+    Marks the entry as rejected and removes it from the review queue.
+
+    Args:
+        entry_id: ID of the knowledge entry to reject.
+        reviewer: Name of the reviewer (default "human").
+        note: Optional rejection reason.
+
+    Returns:
+        JSON with rejection result.
+    """
+    stores = _get_v2_stores()
+    result = stores["review"].reject(entry_id, reviewer=reviewer, note=note)
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def get_knowledge_by_id(
+    entry_id: str,
+) -> str:
+    """Get a knowledge entry by its UUID.
+
+    Args:
+        entry_id: UUID of the knowledge entry.
+
+    Returns:
+        JSON with the knowledge entry, or error if not found.
+    """
+    stores = _get_v2_stores()
+    for domain in stores["l1"].list_domains():
+        meta, content = stores["l1"].read(domain)
+        if meta and meta.get("id") == entry_id:
+            return json.dumps({
+                "success": True,
+                "entry": {
+                    "id": meta.get("id"),
+                    "domain": domain,
+                    "section": meta.get("section"),
+                    "type": meta.get("type"),
+                    "content": content,
+                    "summary": meta.get("summary"),
+                    "confidence": meta.get("confidence"),
+                    "review_status": meta.get("review_status"),
+                    "tags": meta.get("tags", []),
+                },
+            }, ensure_ascii=False, indent=2)
+
+    return json.dumps({
+        "success": False,
+        "error": f"Entry not found: {entry_id}",
+    })
+
+
+@mcp.tool()
+async def get_memory_v2_stats() -> str:
+    """Get v2.0 memory system statistics.
+
+    Returns stats about the vector store, review queue, and L1 storage.
+    """
+    stores = _get_v2_stores()
+    return json.dumps({
+        "success": True,
+        "v2_stats": {
+            "vector_store": stores["vector"].stats(),
+            "review_queue": stores["review"].get_stats(),
+            "l1_domains": stores["l1"].list_domains(),
+        },
+    }, ensure_ascii=False, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# MCP Tools — v0.8.x: Memory Hygiene
 # ---------------------------------------------------------------------------
 
 @mcp.tool()

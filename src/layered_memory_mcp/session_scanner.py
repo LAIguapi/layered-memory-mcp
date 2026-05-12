@@ -159,12 +159,17 @@ def _detect_and_parse_file(filepath: str) -> list[dict]:
 def extract_session_summary(filepath: str, max_messages: int = 50) -> dict:
     """Extract summary from a session file (auto-detects JSON/JSONL format).
 
+    Uses a "head + tail" sampling strategy to capture both opening context
+    and closing conclusions/decisions, which is where knowledge typically
+    accumulates in long sessions.
+
     Returns:
         {
             "path": str,
             "user_messages": [str],
             "assistant_topics": [str],
             "tool_calls": [str],
+            "key_decisions": [str],      # NEW: conclusions, fixes, decisions
             "truncated": bool (optional)
         }
     """
@@ -173,24 +178,55 @@ def extract_session_summary(filepath: str, max_messages: int = 50) -> dict:
         "user_messages": [],
         "assistant_topics": [],
         "tool_calls": [],
+        "key_decisions": [],
     }
 
     messages = _detect_and_parse_file(filepath)
 
+    # Strategy: head + tail sampling for long sessions
     if len(messages) > max_messages:
         result["truncated"] = True
-        messages = messages[:max_messages]
+        head_count = max_messages // 2  # First half: context
+        tail_count = max_messages - head_count  # Second half: conclusions
+        sampled = messages[:head_count] + messages[-tail_count:]
+    else:
+        sampled = messages
 
-    for entry in messages:
+    # Keywords that indicate knowledge-worthy content
+    decision_keywords = [
+        "找到根因", "根因", "根本原因", "修复完成", "已修复", "已解决",
+        "解决方案", "结论", "决策", "决定", "验证通过", "测试通过",
+        "问题确认", "确认", "最终", "总结", "方案", "架构",
+        "root cause", "fixed", "solution", "conclusion", "decided",
+        "verified", "confirmed", "resolved", "architecture",
+    ]
+
+    seen_topics = set()
+    seen_decisions = set()
+
+    for entry in sampled:
         role = entry.get("role", "")
         content = entry.get("content", "")
 
         if role == "user" and content and len(content) < 500:
             result["user_messages"].append(content[:200])
         elif role == "assistant" and content:
-            text = (content[:100] if isinstance(content, str) else str(content)[:100])
-            if text and text not in result["assistant_topics"]:
-                result["assistant_topics"].append(text)
+            text = content[:200] if isinstance(content, str) else str(content)[:200]
+            if text:
+                # Deduplicate topics
+                topic_key = text[:50]
+                if topic_key not in seen_topics:
+                    seen_topics.add(topic_key)
+                    result["assistant_topics"].append(text)
+
+                # Extract key decisions/conclusions (longer content, up to 400 chars)
+                content_lower = content.lower() if isinstance(content, str) else str(content).lower()
+                if any(kw in content_lower for kw in decision_keywords):
+                    decision_text = content[:400] if isinstance(content, str) else str(content)[:400]
+                    decision_key = decision_text[:80]
+                    if decision_key not in seen_decisions:
+                        seen_decisions.add(decision_key)
+                        result["key_decisions"].append(decision_text)
 
         # Extract tool call names
         for tc in entry.get("tool_calls", [])[:3]:
