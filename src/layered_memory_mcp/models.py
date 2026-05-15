@@ -66,7 +66,9 @@ class TodoPriority(str, Enum):
 class TodoEntry(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     domain: str
+    title: str = ""                         # 短标题
     content: str
+    blocked_by: list[str] = Field(default_factory=list)  # 被哪些 TODO 阻塞
     priority: TodoPriority = TodoPriority.MEDIUM
     status: TodoStatus = TodoStatus.PENDING
     source_session_id: str | None = None

@@ -1456,10 +1456,12 @@ async def init_framework() -> str:
 
 
 @mcp.tool()
-async def add_todo(domain: str, content: str, priority: str = "medium", notes: str = "", source_session_id: str = "") -> str:
+async def add_todo(domain: str, content: str, title: str = "", blocked_by: str = "[]", priority: str = "medium", notes: str = "", source_session_id: str = "") -> str:
     """Add a new TODO item."""
+    import json as _json
     store = _get_todo_store()
-    entry = TodoEntry(domain=domain, content=content, priority=TodoPriority(priority), notes=notes, source_session_id=source_session_id or None)
+    blocked = _json.loads(blocked_by) if isinstance(blocked_by, str) else blocked_by
+    entry = TodoEntry(domain=domain, content=content, title=title or content[:50], blocked_by=blocked, priority=TodoPriority(priority), notes=notes, source_session_id=source_session_id or None)
     result = store.add(entry)
     return json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -1473,16 +1475,21 @@ async def list_todos(status: str = "", domain: str = "", priority: str = "", lim
 
 
 @mcp.tool()
-async def update_todo(todo_id: str, status: str = "", priority: str = "", content: str = "", notes: str = "") -> str:
+async def update_todo(todo_id: str, status: str = "", priority: str = "", title: str = "", content: str = "", blocked_by: str = "", notes: str = "") -> str:
     """Update a TODO item's status, priority, content, or notes."""
+    import json as _json
     store = _get_todo_store()
     kwargs = {}
     if status:
         kwargs["status"] = status
     if priority:
         kwargs["priority"] = priority
+    if title:
+        kwargs["title"] = title
     if content:
         kwargs["content"] = content
+    if blocked_by:
+        kwargs["blocked_by"] = _json.loads(blocked_by) if isinstance(blocked_by, str) else blocked_by
     if notes:
         kwargs["notes"] = notes
     result = store.update(todo_id, **kwargs)
