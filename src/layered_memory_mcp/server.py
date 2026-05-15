@@ -36,8 +36,10 @@ from .injector import inject_knowledge
 
 # v2.0 imports
 from .models import KnowledgeEntry, KnowledgeType, SourceInfo, SourceType, ReviewItem, ConfidenceScorer
+from .models import TodoEntry, TodoStatus, TodoPriority
 from .storage import L1Store, VectorStore, ReviewQueue
 from .extractor import SessionReader, KnowledgeExtractor
+from .todo_store import TodoStore
 
 # ---------------------------------------------------------------------------
 # v2.0 Global state
@@ -56,6 +58,23 @@ def _get_v2_stores():
         _v2_stores["vector"] = VectorStore(data_dir / "vectors.db")
         _v2_stores["review"] = ReviewQueue(data_dir / "review_queue.db")
     return _v2_stores
+
+
+# ---------------------------------------------------------------------------
+# v2.1.0: TODO store
+# ---------------------------------------------------------------------------
+_todo_store: TodoStore | None = None
+
+
+def _get_todo_store() -> TodoStore:
+    global _todo_store
+    if _todo_store is None:
+        config = _get_config()
+        data_dir = config.home / "data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        _todo_store = TodoStore(data_dir / "todos.db")
+    return _todo_store
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -1431,6 +1450,61 @@ async def init_framework() -> str:
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
+# ---------------------------------------------------------------------------
+# MCP Tools — v2.1.0: TODO Management
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def add_todo(domain: str, content: str, priority: str = "medium", notes: str = "", source_session_id: str = "") -> str:
+    """Add a new TODO item."""
+    store = _get_todo_store()
+    entry = TodoEntry(domain=domain, content=content, priority=TodoPriority(priority), notes=notes, source_session_id=source_session_id or None)
+    result = store.add(entry)
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def list_todos(status: str = "", domain: str = "", priority: str = "", limit: int = 50) -> str:
+    """List TODOs with optional filtering by status, domain, priority."""
+    store = _get_todo_store()
+    todos = store.list(status=status or None, domain=domain or None, priority=priority or None, limit=limit)
+    return json.dumps({"success": True, "count": len(todos), "todos": todos}, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def update_todo(todo_id: str, status: str = "", priority: str = "", content: str = "", notes: str = "") -> str:
+    """Update a TODO item's status, priority, content, or notes."""
+    store = _get_todo_store()
+    kwargs = {}
+    if status:
+        kwargs["status"] = status
+    if priority:
+        kwargs["priority"] = priority
+    if content:
+        kwargs["content"] = content
+    if notes:
+        kwargs["notes"] = notes
+    result = store.update(todo_id, **kwargs)
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def delete_todo(todo_id: str) -> str:
+    """Delete a TODO item by ID."""
+    store = _get_todo_store()
+    result = store.delete(todo_id)
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def get_todo_stats() -> str:
+    """Get TODO statistics: counts by status, domain, and priority."""
+    store = _get_todo_store()
+    stats = store.stats()
+    return json.dumps({"success": True, "stats": stats}, ensure_ascii=False, indent=2)
+
+
 @mcp.prompt()
 def memory_rules_prompt() -> str:
     """Memory management rules for agents using layered memory.
@@ -1445,6 +1519,50 @@ def memory_rules_prompt() -> str:
 3. **Run compact_memory when warned**. If inject_knowledge returns a memory_bloat_warning, call compact_memory.
 4. **Expand capacity if >90% repeatedly**. If compact doesn't free enough space, increase your memory limit.
 5. **User preferences → user profile. Procedural knowledge → skills. Only durable facts → L1 with L0 pointer."""
+
+
+@mcp.prompt()
+def todo_management_prompt() -> str:
+    """TODO management rules for agents. Inject into system prompt to enable automatic TODO tracking."""
+    return """## TODO Management Rules (Layered Memory MCP)
+
+You have access to TODO management tools through the layered-memory MCP server. Use them to track tasks across sessions.
+
+### When to Auto-Create TODOs
+
+1. **Topic switch without closure** — When the user moves to a new topic but the previous task had no clear resolution or next action, capture it with add_todo.
+2. **Explicit deferral** — User says "put this aside", "continue tomorrow", "we'll come back to this" → add_todo immediately.
+3. **Recurring open topic** — If the same issue appears in 2+ sessions without resolution, it's a pending TODO.
+4. **Blocker identification** — Infrastructure issues blocking multiple other tasks → add_todo with priority=blocker.
+
+### When NOT to Create TODOs
+
+- Single-session tasks that are completed within the same conversation
+- Trivial questions with no follow-up needed
+- Tasks the user explicitly says are done
+
+### Priority Guidelines
+
+- **blocker**: Infrastructure broken, blocks multiple workstreams (e.g., database down, API key expired)
+- **high**: Concrete action item, should be done within a week
+- **medium**: Has direction but no urgency
+- **low**: Nice-to-have, no deadline
+- **waiting**: Waiting for external feedback or dependency
+
+### Usage Pattern
+
+1. At the START of each session, call list_todos(status="pending") to show the user what's outstanding.
+2. When starting work on a task, call update_todo(todo_id, status="in_progress").
+3. When completing a task, call update_todo(todo_id, status="completed").
+4. Periodically call get_todo_stats() to review overall progress.
+
+### Script: Periodic TODO Scan (Optional)
+
+To set up automated weekly scanning:
+1. Call extract_session_knowledge(days=7) to get recent session summaries.
+2. Analyze sessions for: tasks mentioned but not completed, recurring open topics, explicit "TODO/待做/unresolved" signals.
+3. For each detected candidate, call add_todo with the detected domain and priority.
+4. Report the scan results to the user with candidates for confirmation."""
 
 
 # ---------------------------------------------------------------------------

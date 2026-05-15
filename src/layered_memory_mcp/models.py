@@ -48,6 +48,34 @@ class SourceType(str, Enum):
     MIGRATED = "migrated"       # Migrated from legacy format
 
 
+class TodoStatus(str, Enum):
+    PENDING = "pending"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+
+
+class TodoPriority(str, Enum):
+    BLOCKER = "blocker"
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+    WAITING = "waiting"
+
+
+class TodoEntry(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    domain: str
+    content: str
+    priority: TodoPriority = TodoPriority.MEDIUM
+    status: TodoStatus = TodoStatus.PENDING
+    source_session_id: str | None = None
+    notes: str = ""
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    completed_at: datetime | None = None
+
+
 # ---------------------------------------------------------------------------
 # Sub-models
 # ---------------------------------------------------------------------------
