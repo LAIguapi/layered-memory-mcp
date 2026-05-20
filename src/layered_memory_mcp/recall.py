@@ -4,6 +4,11 @@ L1 Knowledge Retrieval Engine.
 Searches knowledge files by keyword with relevance scoring.
 Supports subdirectory scanning, fuzzy search, wiki-links, and L0 index generation.
 Core functions are pure stdlib; embedding search is optional.
+
+Hybrid search uses RRF (Reciprocal Rank Fusion) inspired by Semble
+(https://github.com/MinishLab/semble) for robust cross-modal ranking.
+
+File content caching reduces disk I/O on repeated queries.
 """
 
 import difflib
@@ -13,6 +18,8 @@ import re
 import time
 from collections import Counter
 from pathlib import Path
+
+from .cache import cached_read_text, get_tokenized_cache, invalidate_all_caches
 
 logger = logging.getLogger("layered_memory_mcp.recall")
 
@@ -26,6 +33,11 @@ MAX_KNOWLEDGE_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
 _SCAN_CACHE_TTL = 5.0
 _scan_cache: dict[str, tuple[float, dict[str, str]]] = {}
 
+# Lazy import of ranking module to avoid circular deps
+def _get_ranking():
+    from . import ranking
+    return ranking
+
 def invalidate_scan_cache(knowledge_dir: str | None = None) -> None:
     """Invalidate file listing cache (called after writes to ensure freshness).
 
@@ -36,6 +48,8 @@ def invalidate_scan_cache(knowledge_dir: str | None = None) -> None:
         _scan_cache.clear()
     else:
         _scan_cache.pop(knowledge_dir, None)
+    # Also invalidate content caches
+    invalidate_all_caches()
 
 # Regex to match any markdown heading level (# through ######)
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$", re.MULTILINE)
@@ -319,44 +333,112 @@ def recall(
             if file_size > MAX_KNOWLEDGE_FILE_SIZE:
                 logger.warning("Skipping oversized file %s (%d bytes)", rel_path, file_size)
                 continue
-            content = path.read_text(encoding="utf-8")
+            # Use cached read for reduced disk I/O
+            content = cached_read_text(str(path), encoding="utf-8")
+            if content is None:
+                continue
             wc = len(content.split())
             file_contents[rel_path] = (content, wc)
         except Exception as e:
             logger.debug("Cannot read knowledge file %s: %s", rel_path, e)
             continue
 
-    # Compute avg_dl from in-memory contents if BM25 mode
-    if search_mode == "bm25" and file_contents:
+    # Compute avg_dl from in-memory contents if BM25 or hybrid mode
+    if search_mode in ("bm25", "hybrid") and file_contents:
         total_wc = sum(wc for _, wc in file_contents.values())
         avg_dl = total_wc / len(file_contents) if file_contents else 100.0
 
-    results: list[dict] = []
-    for rel_path, (content, _wc) in file_contents.items():
-        if search_mode == "keyword":
-            score = score_relevance(keyword, content, rel_path)
-        elif search_mode == "fuzzy":
-            score = fuzzy_score(keyword, content, rel_path)
-        elif search_mode == "bm25":
-            score = bm25_relevance(keyword, content, rel_path, avg_dl=avg_dl, doc_count=len(file_contents))
-        elif search_mode == "hybrid":
-            score = score_relevance(keyword, content, rel_path) + fuzzy_score(keyword, content, rel_path) * 0.5
-        else:
-            score = score_relevance(keyword, content, rel_path)
+    # -----------------------------------------------------------------------
+    # Build per-file result structures for all modes (needed for hybrid RRF)
+    # -----------------------------------------------------------------------
+    keyword_scores: dict[str, float] = {}
+    fuzzy_scores: dict[str, float] = {}
+    bm25_scores: dict[str, float] = {}
+    section_counts: dict[str, int] = {}
+    file_keywords_map: dict[str, list[str]] = {}
+    all_sections: dict[str, list[dict]] = {}
+    all_wiki_links: dict[str, list[str]] = {}
 
-        if score > 0:
-            sections = extract_relevant_sections(keyword, content)
-            wiki_links = extract_wiki_links(content)
+    for rel_path, (content, _wc) in file_contents.items():
+        kw_score = score_relevance(keyword, content, rel_path)
+        fz_score = fuzzy_score(keyword, content, rel_path)
+        bm_score = bm25_relevance(keyword, content, rel_path, avg_dl=avg_dl, doc_count=len(file_contents))
+
+        sections = extract_relevant_sections(keyword, content)
+        wiki_links = extract_wiki_links(content)
+
+        if kw_score > 0:
+            keyword_scores[rel_path] = kw_score
+        if fz_score > 0:
+            fuzzy_scores[rel_path] = fz_score
+        if bm_score > 0:
+            bm25_scores[rel_path] = bm_score
+
+        if kw_score > 0 or fz_score > 0 or bm_score > 0:
+            section_counts[rel_path] = len(sections)
+            file_keywords_map[rel_path] = _extract_top_keywords(content, max_keywords=10)
+            all_sections[rel_path] = sections
+            all_wiki_links[rel_path] = wiki_links[:5] if wiki_links else []
+
+    # -----------------------------------------------------------------------
+    # Route to appropriate search mode
+    # -----------------------------------------------------------------------
+    results: list[dict] = []
+
+    if search_mode == "hybrid":
+        # Use RRF-based hybrid ranking
+        ranking = _get_ranking()
+
+        # Build ranked lists (sorted by score desc)
+        kw_ranked = sorted(keyword_scores.items(), key=lambda x: -x[1])
+        fz_ranked = sorted(fuzzy_scores.items(), key=lambda x: -x[1])
+        bm25_ranked = sorted(bm25_scores.items(), key=lambda x: -x[1])
+
+        ranked = ranking.hybrid_search(
+            query=keyword,
+            keyword_results=kw_ranked,
+            fuzzy_results=fz_ranked,
+            bm25_results=bm25_ranked,
+            section_counts=section_counts,
+            file_keywords=file_keywords_map,
+            top_n=top_n,
+            alpha=None,  # auto-detect
+        )
+
+        for file_path, fused_score in ranked:
             results.append({
-                "file": rel_path,
-                "score": round(score, 2),
-                "matched_sections": len(sections),
-                "sections": sections,
-                "wiki_links": wiki_links[:5] if wiki_links else [],
+                "file": file_path,
+                "score": round(fused_score, 4),
+                "matched_sections": section_counts.get(file_path, 0),
+                "sections": all_sections.get(file_path, []),
+                "wiki_links": all_wiki_links.get(file_path, []),
             })
 
-    results.sort(key=lambda x: x["score"], reverse=True)
-    results = results[:top_n]
+    else:
+        # Legacy single-mode scoring
+        for rel_path, (content, _wc) in file_contents.items():
+            if search_mode == "keyword":
+                score = keyword_scores.get(rel_path, 0.0)
+            elif search_mode == "fuzzy":
+                score = fuzzy_scores.get(rel_path, 0.0)
+            elif search_mode == "bm25":
+                score = bm25_scores.get(rel_path, 0.0)
+            else:
+                score = score_relevance(keyword, content, rel_path)
+
+            if score > 0:
+                sections = all_sections.get(rel_path, [])
+                wiki_links = all_wiki_links.get(rel_path, [])
+                results.append({
+                    "file": rel_path,
+                    "score": round(score, 2),
+                    "matched_sections": len(sections),
+                    "sections": sections,
+                    "wiki_links": wiki_links,
+                })
+
+        results.sort(key=lambda x: x["score"], reverse=True)
+        results = results[:top_n]
 
     return {
         "success": True,

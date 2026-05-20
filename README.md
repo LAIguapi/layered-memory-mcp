@@ -38,7 +38,7 @@ AI agents have **limited memory** — typically 2-4KB of persistent context inje
 ## Features
 
 - **Smart Knowledge Injection** — Inject facts with auto-dedup and section merging (upsert/append/merge), auto L0 sync
-- **Keyword Search** — Search with keyword, fuzzy, or BM25/TF-IDF scoring across all L1 files
+- **Hybrid Search (RRF)** — Combines keyword, fuzzy, BM25, and semantic search with Reciprocal Rank Fusion for robust ranking. Query-type auto-detection optimizes the semantic/keyword balance
 - **Agent-Agnostic L0 Access** — `get_l0_index` tool lets any MCP agent retrieve the memory index
 - **Multi-Agent Namespace** — Isolate knowledge per agent via `LAYERED_MEMORY_NAMESPACE` while sharing common knowledge
 - **Session Scanning** — Extract knowledge candidates from recent agent sessions
@@ -48,6 +48,8 @@ AI agents have **limited memory** — typically 2-4KB of persistent context inje
 - **Agent-Neutral** — Works with any MCP-compatible agent (Hermes, Claude, Cursor, etc.)
 - **Zero Dependencies** — Core engine uses Python stdlib only; only `fastmcp` for MCP transport
 - **Privacy First** — All data stored locally, no external API calls
+
+> **Design Note:** The hybrid search ranking is inspired by [Semble](https://github.com/MinishLab/semble), a fast code search library for agents. We adapted their RRF (Reciprocal Rank Fusion) approach — with multi-signal boosting and query-aware alpha detection — for markdown knowledge retrieval.
 
 ## Quick Start
 
