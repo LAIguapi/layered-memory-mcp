@@ -52,6 +52,9 @@ class VectorStore:
         self._svd: TruncatedSVD | None = None
         self._is_fitted = False
 
+        # Refit if database already has entries (e.g., after restart)
+        self._refit_if_needed()
+
     def _init_db(self) -> None:
         """Create tables if not exists."""
         with sqlite3.connect(self.db_path) as conn:
@@ -84,11 +87,19 @@ class VectorStore:
         X = self._vectorizer.fit_transform(texts)
 
         n_features = X.shape[1]
-        n_components = min(DEFAULT_DIM, max(n_features - 1, 1))
+        n_components = min(DEFAULT_DIM, n_features)
 
         self._svd = TruncatedSVD(n_components=n_components)
         self._svd.fit(X)
         self._is_fitted = True
+
+    def _refit_if_needed(self) -> None:
+        """Refit the embedding model from all existing database entries."""
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute("SELECT text FROM vectors").fetchall()
+        texts = [r[0] for r in rows]
+        if texts:
+            self._fit(texts)
 
     def _embed(self, texts: list[str]) -> np.ndarray:
         """Embed texts into vectors."""
