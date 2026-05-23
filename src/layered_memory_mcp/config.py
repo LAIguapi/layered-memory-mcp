@@ -96,6 +96,11 @@ class MemoryConfig:
         self.knowledge_dir = Path(knowledge_dir) if knowledge_dir else default_knowledge_dir(self.home)
         self.sessions_dir = Path(sessions_dir) if sessions_dir else default_sessions_dir()
         self.l0_index_file = Path(l0_index_file) if l0_index_file else None
+        # Fallback to environment variable if not passed explicitly
+        if self.l0_index_file is None:
+            env_l0 = os.environ.get("LAYERED_MEMORY_L0_INDEX_FILE")
+            if env_l0:
+                self.l0_index_file = Path(env_l0)
 
         # v0.5.0: Auto-sync L0 index after writes (default: True)
         self.auto_sync_l0: bool = (
