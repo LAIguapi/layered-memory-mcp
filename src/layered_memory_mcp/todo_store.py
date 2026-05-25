@@ -46,7 +46,10 @@ class TodoStore:
         if entry.updated_at is None:
             entry.updated_at = now
         with sqlite3.connect(str(self.db_path)) as conn:
-            conn.execute("""INSERT INTO todos VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            conn.execute("""INSERT INTO todos
+                (id, domain, title, content, blocked_by, priority, status,
+                 source_session_id, notes, created_at, updated_at, completed_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (entry.id, entry.domain, entry.title, entry.content,
                  json.dumps(entry.blocked_by),
                  entry.priority.value, entry.status.value,
