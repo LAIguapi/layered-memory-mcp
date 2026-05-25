@@ -39,6 +39,12 @@ class TodoStore:
                 pass  # column already exists
 
     def add(self, entry: TodoEntry) -> dict:
+        # Defense: ensure created_at and updated_at are never None
+        now = datetime.now(timezone.utc)
+        if entry.created_at is None:
+            entry.created_at = now
+        if entry.updated_at is None:
+            entry.updated_at = now
         with sqlite3.connect(str(self.db_path)) as conn:
             conn.execute("""INSERT INTO todos VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (entry.id, entry.domain, entry.title, entry.content,

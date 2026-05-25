@@ -1459,11 +1459,25 @@ async def init_framework() -> str:
 async def add_todo(domain: str, content: str, title: str = "", blocked_by: str = "[]", priority: str = "medium", notes: str = "", source_session_id: str = "") -> str:
     """Add a new TODO item."""
     import json as _json
+    from datetime import datetime, timezone
     store = _get_todo_store()
-    blocked = _json.loads(blocked_by) if isinstance(blocked_by, str) else blocked_by
-    entry = TodoEntry(domain=domain, content=content, title=title or content[:50], blocked_by=blocked, priority=TodoPriority(priority), notes=notes, source_session_id=source_session_id or None)
-    result = store.add(entry)
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    try:
+        blocked = _json.loads(blocked_by) if isinstance(blocked_by, str) else blocked_by
+        entry = TodoEntry(
+            domain=domain,
+            content=content,
+            title=title or (content[:50] if content else "Untitled"),
+            blocked_by=blocked if blocked else [],
+            priority=TodoPriority(priority),
+            notes=notes,
+            source_session_id=source_session_id or None,
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+        result = store.add(entry)
+        return _json.dumps(result, ensure_ascii=False, indent=2)
+    except Exception as e:
+        return _json.dumps({"success": False, "error": str(e)}, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
