@@ -134,16 +134,27 @@ def inject_knowledge(
 
     # --- 6. Build result ---
     domain_clean = filename.removesuffix(".md")
+    write_action = write_result.get("write_action", effective_action)
+    is_new_file = write_action == "created"
 
-    # Generate a ready-to-use L0 pointer for the agent's memory system.
-    # This makes the "correct path" the path of least resistance:
-    # agent calls inject_knowledge → gets l0_pointer back → copies it to memory add.
     tag = getattr(config, "l0_tag", "[L0]")
     l0_pointer = f"{tag} {domain_clean}: {_summarize_for_l0(content)} → knowledge/{filename}"
 
+    # Plan B: only prompt agent to write L0 pointer when a NEW L1 file is created.
+    # For existing files (append/upsert/merge/replace), L0 auto-sync already
+    # covers the update — no manual memory write needed.
+    if is_new_file:
+        l0_hint = (
+            "A NEW knowledge file was created. Write the l0_pointer to your "
+            "agent's persistent memory store so future sessions can discover it. "
+            f'Example: add to memory: "{l0_pointer}"'
+        )
+    else:
+        l0_hint = "L0 index auto-synced, no action needed."
+
     result = {
         "success": True,
-        "action": write_result.get("write_action", effective_action),
+        "action": write_action,
         "file": filename,
         "section": f"## {section_clean}",
         "bytes_written": write_result.get("bytes_written", 0),
@@ -151,13 +162,9 @@ def inject_knowledge(
         "dedup": dedup_result,
         "l0_synced": sync_report is not None,
         "l0_sync_report": sync_report,
-        # P0: L0 pointer — agent should write this to its memory layer
         "l0_pointer": l0_pointer,
-        "hint": (
-            "Write the l0_pointer to your agent's persistent memory store "
-            "to complete the dual-write. Example: add this to your memory: "
-            f'"{l0_pointer}"'
-        ),
+        "hint": l0_hint,
+        "is_new_file": is_new_file,
     }
 
     # Size warning
