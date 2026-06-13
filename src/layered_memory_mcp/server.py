@@ -32,7 +32,7 @@ from . import __version__
 from .recall import recall, scan_knowledge_files, score_relevance, knowledge_health
 from .session_scanner import find_recent_sessions, extract_session_summary, scan_sessions
 from .l0_manager import sync_l0_index, auto_sync_if_enabled, manage_entry, check_l0_l1_consistency
-from .injector import inject_knowledge, sync_to_vector_store
+from .injector import inject_knowledge, sync_to_vector_store, remove_from_vector_store
 from .agent_integrator import (
     detect_agent_type,
     is_soul_injected,
@@ -682,6 +682,14 @@ async def delete_knowledge_file(filename: str) -> str:
 
         # v0.5.0: auto-sync L0 index (removes deleted file from L0)
         sync_report = await asyncio.to_thread(auto_sync_if_enabled, config)
+
+        # v2.2.1: remove from vector store
+        domain = filename.removesuffix(".md")
+        await asyncio.to_thread(
+            remove_from_vector_store,
+            data_dir=config.home / "data",
+            domain=domain,
+        )
 
         result = {
             "success": True,

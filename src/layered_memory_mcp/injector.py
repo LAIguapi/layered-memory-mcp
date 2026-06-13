@@ -559,3 +559,31 @@ def sync_to_vector_store(
     except Exception as e:
         logger.warning("Vector store sync failed (non-critical): %s", e)
         return {"success": False, "error": str(e)}
+
+
+def remove_from_vector_store(
+    data_dir: str | Path,
+    domain: str,
+) -> dict:
+    """Remove all entries for a domain from the vector store.
+
+    Called when an L1 knowledge file is deleted.
+    """
+    try:
+        import sqlite3
+        db_path = Path(data_dir) / "vectors.db"
+        if not db_path.exists():
+            return {"success": True, "action": "none", "reason": "No vector store"}
+
+        with sqlite3.connect(db_path) as conn:
+            cursor = conn.execute(
+                "DELETE FROM vectors WHERE domain = ?", (domain,)
+            )
+            deleted = cursor.rowcount
+            conn.commit()
+
+        logger.info("Removed %d vector entries for domain=%s", deleted, domain)
+        return {"success": True, "action": "vector_removed", "domain": domain, "removed": deleted}
+    except Exception as e:
+        logger.warning("Vector store removal failed (non-critical): %s", e)
+        return {"success": False, "error": str(e)}
