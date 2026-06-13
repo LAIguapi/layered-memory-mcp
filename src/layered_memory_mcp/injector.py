@@ -135,6 +135,15 @@ def inject_knowledge(
     # --- 6. Build result ---
     domain_clean = filename.removesuffix(".md")
     write_action = write_result.get("write_action", effective_action)
+
+    # --- 6b. Vector store sync (v2.2.0) ---
+    vector_result = sync_to_vector_store(
+        data_dir=config.home / "data",
+        domain=domain_clean,
+        content=content.strip(),
+        summary=_summarize_for_l0(content),
+    )
+
     is_new_file = write_action == "created"
 
     tag = getattr(config, "l0_tag", "[L0]")
@@ -501,3 +510,52 @@ def _summarize_for_l0(content: str, max_chars: int = 80) -> str:
         return clean
     # Fallback to domain name — shouldn't happen but safe
     return ""
+
+
+def sync_to_vector_store(
+    data_dir: str | Path,
+    domain: str,
+    content: str,
+    summary: str = "",
+) -> dict:
+    """Sync a knowledge entry to the vector store for semantic search.
+
+    Called after every successful write to L1 (inject/append/update/create).
+    Idempotent — existing entries are updated, new ones are added.
+
+    Args:
+        data_dir: Path to the data directory containing vectors.db
+        domain: Knowledge domain (e.g. "infra")
+        content: Full content of the entry
+        summary: One-line summary for indexing
+
+    Returns:
+        dict with success status
+    """
+    try:
+        from .storage.vector_store import VectorStore
+        from .models import KnowledgeEntry, SourceInfo, SourceType, ReviewStatus, KnowledgeType
+        import uuid
+
+        db_path = Path(data_dir) / "vectors.db"
+        vector_store = VectorStore(db_path)
+
+        text = (summary + "\n" + content).strip() if summary else content.strip()
+
+        entry = KnowledgeEntry(
+            id=str(uuid.uuid4()),
+            domain=domain,
+            section=domain,
+            content=content,
+            summary=summary or domain,
+            type=KnowledgeType.FACT,
+            confidence=0.9,
+            review_status=ReviewStatus.APPROVED,
+            source=SourceInfo(type=SourceType.MANUAL, extracted_by="auto_sync"),
+        )
+        vector_store.add(entry)
+        logger.debug("Synced to vector store: domain=%s", domain)
+        return {"success": True, "action": "vector_synced", "domain": domain}
+    except Exception as e:
+        logger.warning("Vector store sync failed (non-critical): %s", e)
+        return {"success": False, "error": str(e)}

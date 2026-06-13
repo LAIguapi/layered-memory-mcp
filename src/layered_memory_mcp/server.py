@@ -32,7 +32,16 @@ from . import __version__
 from .recall import recall, scan_knowledge_files, score_relevance, knowledge_health
 from .session_scanner import find_recent_sessions, extract_session_summary, scan_sessions
 from .l0_manager import sync_l0_index, auto_sync_if_enabled, manage_entry, check_l0_l1_consistency
-from .injector import inject_knowledge
+from .injector import inject_knowledge, sync_to_vector_store
+from .agent_integrator import (
+    detect_agent_type,
+    is_soul_injected,
+    is_memory_injected,
+    inject_soul,
+    inject_memory,
+    remove_soul_injection,
+    build_init_recommendation,
+)
 
 # v2.0 imports
 from .models import KnowledgeEntry, KnowledgeType, SourceInfo, SourceType, ReviewItem, ConfidenceScorer
@@ -555,6 +564,15 @@ async def create_knowledge_file(filename: str, content: str) -> str:
         # v0.5.0: auto-sync L0 index
         sync_report = await asyncio.to_thread(auto_sync_if_enabled, config)
 
+        # v2.2.0: sync to vector store
+        domain = filename.removesuffix(".md")
+        await asyncio.to_thread(
+            sync_to_vector_store,
+            data_dir=config.home / "data",
+            domain=domain,
+            content=content,
+        )
+
         result = {
             "success": True,
             "action": "created",
@@ -605,12 +623,21 @@ async def update_knowledge_file(filename: str, content: str) -> str:
         # v0.5.0: auto-sync L0 index
         sync_report = await asyncio.to_thread(auto_sync_if_enabled, config)
 
+        # v2.2.0: sync to vector store
+        domain = filename.removesuffix(".md")
+        await asyncio.to_thread(
+            sync_to_vector_store,
+            data_dir=config.home / "data",
+            domain=domain,
+            content=content,
+        )
+
         result = {
             "success": True,
             "action": "updated",
             "file": filename,
-            "previous_size_bytes": old_size,
-            "new_size_bytes": new_size,
+            "old_size": old_size,
+            "new_size": new_size,
             "l0_synced": sync_report is not None,
         }
         if sync_report:
@@ -1391,8 +1418,14 @@ async def init_framework() -> str:
     welcome file with getting-started guidance, and returns memory
     management rules for the agent to follow.
 
+    v2.2.0+: Also detects the hosting agent type (Hermes / generic MCP)
+    and checks whether SOUL/MEMORY injection is already in place.
+    Returns integration recommendations so the agent can guide the user
+    through setup.
+
     Returns:
-        JSON with initialization status and memory management rules.
+        JSON with initialization status, memory management rules,
+        and agent integration recommendations.
     """
     config = _get_config()
 
@@ -1413,6 +1446,32 @@ async def init_framework() -> str:
             "Only durable factual knowledge → L1 with L0 pointer.\n"
         )
 
+        # ── v2.2.0: Agent integration detection ───────────────────
+        agent_info = detect_agent_type()
+        soul_injected = False
+        memory_injected = False
+        if agent_info["agent_type"] == "hermes":
+            if agent_info["soul_path"]:
+                soul_injected = is_soul_injected(agent_info["soul_path"])
+            if agent_info["memory_path"]:
+                memory_injected = is_memory_injected(agent_info["memory_path"])
+
+        integration = build_init_recommendation(
+            agent_info=agent_info,
+            version=__version__,
+            memory_already_injected=memory_injected,
+            soul_already_injected=soul_injected,
+        )
+
+        result = {
+            "success": True,
+            "first_run": total == 0,
+            "l1_files_found": total,
+            "rules": rules,
+            "agent_type": agent_info["agent_type"],
+            "integration": integration,
+        }
+
         if total == 0:
             # First run: create welcome file
             welcome_content = (
@@ -1432,21 +1491,75 @@ async def init_framework() -> str:
             welcome_path = config.knowledge_dir / "getting-started.md"
             welcome_path.write_text(welcome_content, encoding="utf-8")
             auto_sync_if_enabled(config)
-            return {
-                "success": True,
-                "first_run": True,
-                "action": "created getting-started.md",
-                "rules": rules,
-            }
+            result["action"] = "created getting-started.md"
 
-        return {
-            "success": True,
-            "first_run": False,
-            "l1_files_found": total,
-            "rules": rules,
-        }
+        return result
 
     result = await asyncio.to_thread(_init)
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def integrate_agent(action: str = "status") -> str:
+    """Execute agent integration for layered-memory awareness.
+
+    Use this after init_framework returns integration recommendations.
+    The agent should present the options to the user and call this tool
+    with the chosen action.
+
+    Actions:
+      - "status": check current injection status (default)
+      - "inject_soul": inject rules into Hermes SOUL.md
+      - "inject_memory": inject awareness snippet into MEMORY.md
+      - "remove_soul": remove the injection block from SOUL.md
+
+    Returns:
+        JSON with the result of the action.
+    """
+    config = _get_config()
+
+    def _integrate():
+        agent_info = detect_agent_type()
+
+        if action == "status":
+            soul_injected = False
+            memory_injected = False
+            if agent_info["agent_type"] == "hermes":
+                if agent_info["soul_path"]:
+                    soul_injected = is_soul_injected(agent_info["soul_path"])
+                if agent_info["memory_path"]:
+                    memory_injected = is_memory_injected(agent_info["memory_path"])
+            return {
+                "success": True,
+                "agent_type": agent_info["agent_type"],
+                "soul_injected": soul_injected,
+                "memory_injected": memory_injected,
+                "soul_path": str(agent_info["soul_path"]) if agent_info["soul_path"] else None,
+                "memory_path": str(agent_info["memory_path"]) if agent_info["memory_path"] else None,
+            }
+
+        if action == "inject_soul":
+            if agent_info["agent_type"] != "hermes":
+                return {"success": False, "error": "SOUL injection only supported for Hermes Agent."}
+            if not agent_info["soul_path"]:
+                return {"success": False, "error": "SOUL.md not found."}
+            return inject_soul(agent_info["soul_path"], __version__)
+
+        if action == "inject_memory":
+            if agent_info["agent_type"] != "hermes":
+                return {"success": False, "error": "Memory injection only supported for Hermes Agent."}
+            if not agent_info["memory_path"]:
+                return {"success": False, "error": "MEMORY.md not found."}
+            return inject_memory(agent_info["memory_path"])
+
+        if action == "remove_soul":
+            if not agent_info["soul_path"]:
+                return {"success": False, "error": "SOUL.md not found."}
+            return remove_soul_injection(agent_info["soul_path"])
+
+        return {"success": False, "error": f"Unknown action: {action}"}
+
+    result = await asyncio.to_thread(_integrate)
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
