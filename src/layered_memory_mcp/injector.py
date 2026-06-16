@@ -183,23 +183,41 @@ def inject_knowledge(
             f"recommended {MAX_RECOMMENDED_SIZE} bytes. Consider splitting."
         )
 
-    # Auto-check agent memory usage
-    try:
-        from .memory_compactor import detect_memory_bloat
-        bloat = detect_memory_bloat(config=config)
-        if bloat.get("success") and bloat.get("total_entries", 0) > 0:
-            bloat_pct = bloat["stats"]["bloat_percentage"]
-            total_chars = bloat["stats"]["total_chars"]
-            # Warn if >80% bloat or >3200 chars (80% of 4KB)
-            if bloat_pct > 80 or total_chars > 3200:
-                result["memory_bloat_warning"] = (
-                    f"Agent memory is {bloat_pct}% full ({total_chars} chars). "
-                    f"{bloat['bloat_entries']} entry(ies) are not L0 index pointers. "
-                    "Run `compact_memory(dry_run=True)` to see what would happen, "
-                    "then run without dry_run to auto-migrate."
-                )
-    except Exception:
-        pass  # Non-critical check, fail silently
+    # v2.3.0: Framework self-maintenance (auto-maintain).
+    # The layered architecture introduced an L1↔agent-memory dual-write; the
+    # framework now owns keeping them consistent and slim, so the agent never
+    # has to manually sync L0 pointers or remember to compact. Rides along on
+    # this natural write call (stdio-safe, no background thread). Fails silently.
+    if getattr(config, "auto_maintain", True):
+        try:
+            from .memory_compactor import auto_maintain_after_write
+            maint = auto_maintain_after_write(config, l0_pointer=l0_pointer)
+            result["auto_maintain"] = maint
+            # When the framework completes the dual-write itself, the agent no
+            # longer needs the manual "write this pointer to memory" hint.
+            dw = (maint or {}).get("dual_write") or {}
+            if dw.get("action") in ("added", "replaced", "present"):
+                result["hint"] = "L0 pointer auto-written to agent memory by framework."
+        except Exception:
+            pass  # Maintenance is non-critical; never break the primary write.
+    else:
+        # Auto-maintain disabled — fall back to legacy advisory warning so the
+        # agent can compact manually.
+        try:
+            from .memory_compactor import detect_memory_bloat
+            bloat = detect_memory_bloat(config=config)
+            if bloat.get("success") and bloat.get("total_entries", 0) > 0:
+                bloat_pct = bloat["stats"]["bloat_percentage"]
+                total_chars = bloat["stats"]["total_chars"]
+                if bloat_pct > 80 or total_chars > 3200:
+                    result["memory_bloat_warning"] = (
+                        f"Agent memory is {bloat_pct}% full ({total_chars} chars). "
+                        f"{bloat['bloat_entries']} entry(ies) are not L0 index pointers. "
+                        "Run `compact_memory(dry_run=True)` to see what would happen, "
+                        "then run without dry_run to auto-migrate."
+                    )
+        except Exception:
+            pass  # Non-critical check, fail silently
 
     return result
 

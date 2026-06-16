@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.0] - 2026-06-16
+
+### Added — Auto-Maintain (write-triggered self-maintenance)
+
+The layered architecture introduced an **L1↔agent-memory dual-write**: every
+`inject_knowledge` writes the knowledge to an L1 file *and* needs the resulting
+L0 pointer mirrored into the agent's memory store. Previously the agent had to
+do that second write manually (and remember to compact when memory filled up),
+which was error-prone — agents forgot to sync pointers, or let memory overflow.
+
+The framework now **owns the complexity it introduced**. After each write it
+self-maintains, riding along on the natural `inject_knowledge` call (stdio-safe,
+no background thread):
+
+- **Dual-write completion** — automatically writes/updates the L0 pointer in
+  agent memory (adds if missing, replaces a stale pointer to the same L1 file).
+  The agent no longer needs to manually mirror pointers.
+- **Lazy compaction** — when agent memory exceeds `compact_bloat_threshold`,
+  **or** more than `auto_maintain_interval_days` (default 7) have elapsed since
+  the last pass, runs `compact_memory()` to migrate bloat to L1 and slim memory
+  back to pointers. Tracked via a `.last_auto_compact` marker in the home dir.
+
+Maintenance fails silently — it never breaks the primary write.
+
+### Configuration
+
+- `LAYERED_MEMORY_AUTO_MAINTAIN`: enable/disable auto-maintain (default: `true`)
+- `LAYERED_MEMORY_AUTO_MAINTAIN_INTERVAL_DAYS`: min days between auto-compaction
+  passes (default: `7`)
+
+When disabled, falls back to the legacy advisory `memory_bloat_warning`.
+
 ## [1.1.0] - 2026-05-08
 
 ### Changed — Agent-Agnostic Architecture

@@ -91,6 +91,9 @@ class MemoryConfig:
         compact_domain_rules_file: str | None = None,
         compact_bloat_threshold: float | None = None,
         compact_capacity_warning_threshold: float | None = None,
+        # v2.3.0 new fields — auto-maintain (write-triggered self-maintenance)
+        auto_maintain: bool | None = None,
+        auto_maintain_interval_days: float | None = None,
     ):
         self.home = Path(home) if home else default_home()
         self.knowledge_dir = Path(knowledge_dir) if knowledge_dir else default_knowledge_dir(self.home)
@@ -146,6 +149,22 @@ class MemoryConfig:
             compact_capacity_warning_threshold
             if compact_capacity_warning_threshold is not None
             else _env_float("LAYERED_MEMORY_COMPACT_CAPACITY_WARNING_THRESHOLD", 0.9)
+        )
+
+        # v2.3.0: Auto-maintain — framework self-manages the L1↔agent-memory
+        # dual-write and triggers compaction after writes, so the agent never
+        # has to manually sync L0 pointers or remember to compact.
+        # Default: enabled (the framework owns the complexity it introduced).
+        self.auto_maintain: bool = (
+            auto_maintain if auto_maintain is not None
+            else _env_bool("LAYERED_MEMORY_AUTO_MAINTAIN", True)
+        )
+        # v2.3.0: Minimum days between automatic compaction passes (default 7).
+        # Compaction also fires immediately when memory exceeds the bloat
+        # threshold, regardless of this interval.
+        self.auto_maintain_interval_days: float = (
+            auto_maintain_interval_days if auto_maintain_interval_days is not None
+            else _env_float("LAYERED_MEMORY_AUTO_MAINTAIN_INTERVAL_DAYS", 7.0)
         )
 
         # v1.2: L0 index entry tag — configurable for i18n (default: "[L0]")

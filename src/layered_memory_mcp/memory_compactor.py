@@ -403,6 +403,189 @@ def compact_memory(
 
 
 # ---------------------------------------------------------------------------
+# v2.3.0: Auto-maintain — write-triggered self-maintenance
+# ---------------------------------------------------------------------------
+
+def _last_compact_marker(config: "MemoryConfig") -> Path:
+    """Path to the timestamp marker recording the last auto-compact pass."""
+    return Path(config.home) / ".last_auto_compact"
+
+
+def _read_last_compact_time(config: "MemoryConfig") -> float:
+    """Return the epoch seconds of the last auto-compact, or 0.0 if never."""
+    marker = _last_compact_marker(config)
+    try:
+        if marker.exists():
+            return float(marker.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        pass
+    return 0.0
+
+
+def _write_last_compact_time(config: "MemoryConfig") -> None:
+    """Record the current time as the last auto-compact pass."""
+    import time
+    try:
+        _last_compact_marker(config).write_text(str(time.time()), encoding="utf-8")
+    except OSError as e:
+        logger.warning("Failed to write last-compact marker: %s", e)
+
+
+def _ensure_l0_pointer_in_memory(
+    l0_pointer: str,
+    config: "MemoryConfig",
+    memory_path: Path | None = None,
+) -> dict:
+    """Dual-write completion: ensure the L0 pointer exists in agent memory.
+
+    The framework introduced the L1↔agent-memory dual-write, so the framework
+    owns keeping the two consistent — the agent should never have to manually
+    sync pointers. This appends the pointer if missing, or replaces a stale
+    pointer for the same domain/file.
+
+    Returns a small report: {action: added|replaced|present|skipped, ...}.
+    """
+    path = memory_path or _resolve_memory_path(None, config)
+    if not path:
+        return {"action": "skipped", "reason": "memory path not resolvable"}
+
+    # Extract the target L1 file from the pointer ("... → knowledge/<file>")
+    target_file = None
+    if "→" in l0_pointer:
+        target_file = l0_pointer.rsplit("→", 1)[-1].strip()
+
+    separator = _resolve_separator(path, config)
+
+    try:
+        raw = path.read_text(encoding="utf-8") if path.exists() else ""
+    except OSError as e:
+        return {"action": "skipped", "reason": f"read failed: {e}"}
+
+    entries = _parse_entries(raw, separator=separator) if raw.strip() else []
+
+    # Already present verbatim → nothing to do
+    if l0_pointer.strip() in (e.strip() for e in entries):
+        return {"action": "present"}
+
+    # Look for a stale pointer to the same L1 file → replace it
+    new_entries = []
+    replaced = False
+    for e in entries:
+        if (
+            target_file
+            and _is_index_entry(e, config)
+            and target_file in e
+        ):
+            new_entries.append(l0_pointer)
+            replaced = True
+        else:
+            new_entries.append(e)
+
+    if not replaced:
+        new_entries.append(l0_pointer)
+
+    joined = f"\n{separator}\n".join(new_entries)
+    if new_entries:
+        joined += "\n"
+
+    try:
+        path.write_text(joined, encoding="utf-8")
+    except OSError as e:
+        return {"action": "skipped", "reason": f"write failed: {e}"}
+
+    return {"action": "replaced" if replaced else "added", "pointer": l0_pointer}
+
+
+def auto_maintain_after_write(
+    config: "MemoryConfig",
+    l0_pointer: str | None = None,
+    memory_path: str | Path | None = None,
+) -> dict:
+    """Framework self-maintenance, invoked automatically after each L1 write.
+
+    Two responsibilities the framework now owns (so the agent doesn't have to):
+
+      1. **Dual-write completion** — ensure the just-generated L0 pointer is
+         present in agent memory (added or stale-replaced). This closes the
+         L1↔agent-memory consistency gap the layered architecture introduced.
+
+      2. **Lazy compaction** — when agent memory exceeds the bloat threshold,
+         or more than ``auto_maintain_interval_days`` have passed since the last
+         pass, run ``compact_memory`` to migrate bloat to L1 and slim memory
+         back to pointers.
+
+    Designed to ride along on natural ``inject_knowledge`` calls (stdio-safe,
+    no background thread required). Fails silently — maintenance must never
+    break the primary write.
+
+    Returns a report dict; ``{"skipped": True, ...}`` when auto-maintain is off.
+    """
+    if not getattr(config, "auto_maintain", True):
+        return {"skipped": True, "reason": "auto_maintain disabled"}
+
+    report: dict = {"dual_write": None, "compact": None}
+
+    path = _resolve_memory_path(memory_path, config)
+    if not path:
+        return {"skipped": True, "reason": "memory path not resolvable"}
+
+    # --- 1. Dual-write completion ---
+    if l0_pointer:
+        try:
+            report["dual_write"] = _ensure_l0_pointer_in_memory(
+                l0_pointer, config, memory_path=path
+            )
+        except Exception as e:  # noqa: BLE001 — maintenance must not raise
+            logger.warning("Auto-maintain dual-write failed: %s", e)
+            report["dual_write"] = {"action": "error", "error": str(e)}
+
+    # --- 2. Lazy compaction decision ---
+    try:
+        import time
+
+        bloat = detect_memory_bloat(memory_path=path, config=config)
+        should_compact = False
+        reason = None
+
+        if bloat.get("success"):
+            total_chars = bloat["stats"]["total_chars"]
+            limit = _get_memory_max_chars()
+            threshold = getattr(config, "compact_bloat_threshold", 0.8)
+            has_bloat = bloat.get("bloat_entries", 0) > 0
+
+            # Trigger A: usage over bloat threshold (and there's bloat to move)
+            if limit and limit > 0 and has_bloat:
+                if total_chars / limit >= threshold:
+                    should_compact = True
+                    reason = f"usage {round(total_chars / limit * 100, 1)}% >= threshold {round(threshold * 100)}%"
+
+            # Trigger B: interval elapsed (and there's bloat to move)
+            if not should_compact and has_bloat:
+                interval_s = getattr(config, "auto_maintain_interval_days", 7.0) * 86400
+                elapsed = time.time() - _read_last_compact_time(config)
+                if elapsed >= interval_s:
+                    should_compact = True
+                    reason = f"interval elapsed ({round(elapsed / 86400, 1)}d >= {interval_s / 86400}d)"
+
+        if should_compact:
+            compact_result = compact_memory(config, memory_path=path, dry_run=False)
+            _write_last_compact_time(config)
+            report["compact"] = {
+                "triggered": True,
+                "reason": reason,
+                "migrated_count": compact_result.get("migrated_count", 0),
+                "after_chars": compact_result.get("stats", {}).get("after_chars"),
+            }
+        else:
+            report["compact"] = {"triggered": False}
+    except Exception as e:  # noqa: BLE001 — maintenance must not raise
+        logger.warning("Auto-maintain compaction failed: %s", e)
+        report["compact"] = {"triggered": False, "error": str(e)}
+
+    return report
+
+
+# ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
