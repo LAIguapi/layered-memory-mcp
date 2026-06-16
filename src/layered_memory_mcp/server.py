@@ -463,6 +463,26 @@ async def list_memory_stats() -> str:
 
 
 @mcp.tool()
+async def audit_rot_tool() -> str:
+    """Audit the knowledge base for decay/rot and return a health report.
+
+    Read-only diagnostic. Detects four decay pathologies:
+      - oversized files (append-without-merge accumulation)
+      - garbled headings (lost punctuation, e.g. from old summariser bugs)
+      - stale sections (transient markers / expired dates)
+      - cross-file duplicate sections (same knowledge in multiple files)
+
+    Returns a JSON report with a health score (0-100), per-pathology
+    findings, and consolidation recommendations. Makes no changes — use it
+    periodically (e.g. a weekly cron) to catch rot before it accumulates.
+    """
+    config = _get_config()
+    from .rot_auditor import audit_rot
+    report = await asyncio.to_thread(audit_rot, config)
+    return json.dumps(report, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
 async def search_sessions_by_keyword(
     keyword: str,
     days: int = 7,

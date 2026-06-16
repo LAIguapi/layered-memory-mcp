@@ -5,6 +5,42 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.0] - 2026-06-16
+
+### Added — Rot Auditor (`audit_rot` tool)
+
+A new **read-only** diagnostic tool, `audit_rot`, surfaces knowledge-base decay
+before it accumulates. It detects the four common rot pathologies seen in
+long-lived layered-memory stores:
+
+- **oversized** — files grown past the recommended size (often from
+  "append-but-never-merge" accumulation).
+- **garbled_heading** — section headings that lost their punctuation/spaces
+  (a run of characters with no separators), e.g. from an older summariser bug
+  or hand-edited memory. CJK-, CamelCase-, and punctuation-aware so genuine
+  headings aren't flagged.
+- **stale** — sections carrying a transient marker (`下次执行`, `待测试`,
+  `TODO`, `临时`, …) **together with** an expired date in the heading/lead.
+  Requiring both keeps false positives low — a standing TODO list or a passing
+  mention of "临时" is not flagged.
+- **cross_file_duplicate** — near-duplicate sections living in different files,
+  i.e. the same knowledge defined in more than one place.
+- **same_file_duplicate** — near-duplicate sections within the *same* file: the
+  classic "append but never merge" rot (often left behind by a dual-write that
+  created two copies of one section).
+
+Returns a health score (0–100), per-pathology findings, and consolidation
+recommendations. Makes no changes — designed to be run periodically (e.g. a
+weekly cron) so a human can decide what to consolidate.
+
+### Fixed — Summariser corrupted snake_case identifiers
+
+`_summarize_for_l0` stripped **all** underscores via a naive `[*_`#]` regex,
+turning `enabled_toolsets` into `enabledtoolsets` and `fallback_providers` into
+`fallbackproviders` in generated L0 pointers. The summariser now strips only
+paired emphasis/code markers and leading heading hashes, preserving underscores
+inside identifiers and file paths while still removing `_italic_` spans.
+
 ## [2.3.0] - 2026-06-16
 
 ### Added — Auto-Maintain (write-triggered self-maintenance)

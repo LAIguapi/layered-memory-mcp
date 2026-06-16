@@ -520,8 +520,19 @@ def _summarize_for_l0(content: str, max_chars: int = 80) -> str:
         # Skip headings — we want content, not structure
         if stripped.startswith("#"):
             continue
-        # Strip bold/italic markers
-        clean = re.sub(r"[*_`#]", "", stripped).strip()
+        # Strip markdown formatting markers while PRESERVING identifier
+        # characters. The naive r"[*_`#]" removal corrupted snake_case
+        # identifiers (e.g. enabled_toolsets → enabledtoolsets); we now only
+        # strip paired emphasis/code markers and leading heading hashes, and
+        # leave underscores inside words intact.
+        clean = stripped
+        clean = re.sub(r"`+", "", clean)              # inline code backticks
+        clean = re.sub(r"\*+", "", clean)             # **bold** / *italic*
+        clean = re.sub(r"^#+\s*", "", clean)          # leading heading hashes
+        # Underscore emphasis only when it wraps a span (e.g. _italic_):
+        # require a non-word boundary on the outer side so snake_case is safe.
+        clean = re.sub(r"(?<!\w)_(?=\S)(.+?)(?<=\S)_(?!\w)", r"\1", clean)
+        clean = clean.strip()
         # Truncate
         if len(clean) > max_chars:
             clean = clean[:max_chars - 3] + "..."
