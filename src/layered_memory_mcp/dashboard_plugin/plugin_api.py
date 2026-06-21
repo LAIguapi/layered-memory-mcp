@@ -204,12 +204,12 @@ async def semantic_search(req: SemanticSearchRequest):
         results = vector_store.search(req.query, top_n=req.top_n)
         return [
             {
-                "id": r.id,
-                "domain": r.domain,
-                "section": r.section,
-                "summary": r.summary,
-                "score": round(float(r.score), 4),
-                "confidence": r.confidence,
+                "id": r.get("id", ""),
+                "domain": r.get("domain", ""),
+                "section": (r.get("metadata") or {}).get("section", ""),
+                "summary": (r.get("metadata") or {}).get("summary") or r.get("text", ""),
+                "score": round(float(r.get("score", 0)), 4),
+                "confidence": (r.get("metadata") or {}).get("confidence"),
             }
             for r in results
         ]
@@ -528,3 +528,232 @@ async def rebuild_vectors_endpoint(req: RebuildVectorsRequest):
         "indexed": result["indexed"],
         "message": f"Vector store rebuilt with {result['indexed']} entries.",
     }
+
+
+# ── #2: Token Economy — quantify the "load on demand" savings ──────────
+
+@router.get("/token-economy")
+async def get_token_economy():
+    """Quantify the core value: L0 index (always resident) vs full L1 corpus.
+
+    Returns char counts and the savings ratio that justifies the
+    layered-on-demand design. Uses a ~4 chars/token heuristic for an
+    approximate token estimate.
+    """
+    _check_imports()
+
+    def _measure():
+        config = _get_config()
+        l0_path = config.home / "L0.md"
+        knowledge_dir = config.knowledge_dir
+
+        l0_chars = l0_path.stat().st_size if l0_path.exists() else 0
+
+        # Sum all L1 files
+        l1_total_chars = 0
+        per_file = []
+        for fpath in sorted(knowledge_dir.glob("*.md")):
+            size = fpath.stat().st_size
+            l1_total_chars += size
+            per_file.append({"domain": fpath.stem, "chars": size})
+        per_file.sort(key=lambda x: x["chars"], reverse=True)
+
+        domain_count = len(per_file)
+        full_load = l0_chars + l1_total_chars  # naive: everything in context
+        resident = l0_chars                    # layered: only L0 resident
+        saved = full_load - resident
+        saved_pct = round(saved / full_load * 100, 1) if full_load else 0.0
+
+        # ~4 chars per token heuristic (rough, for intuition only)
+        CHARS_PER_TOKEN = 4
+        return {
+            "l0_chars": l0_chars,
+            "l1_total_chars": l1_total_chars,
+            "domain_count": domain_count,
+            "full_load_chars": full_load,
+            "resident_chars": resident,
+            "saved_chars": saved,
+            "saved_pct": saved_pct,
+            "l0_tokens_est": round(l0_chars / CHARS_PER_TOKEN),
+            "full_tokens_est": round(full_load / CHARS_PER_TOKEN),
+            "saved_tokens_est": round(saved / CHARS_PER_TOKEN),
+            "chars_per_token": CHARS_PER_TOKEN,
+            "top_files": per_file[:8],
+        }
+
+    return await asyncio.to_thread(_measure)
+
+
+# ── #3: Consistency check — verify the three-write guarantee ───────────
+
+@router.get("/consistency")
+async def get_consistency():
+    """Verify L0 / L1 / vector-store three-way consistency.
+
+    Surfaces orphaned L1 files (in L1 but missing from L0), stale L0
+    entries (point to non-existent L1), and whether the vector store
+    covers every L1 domain. This is the visible proof of the framework's
+    "three writes stay in sync" guarantee.
+    """
+    _check_imports()
+
+    def _check():
+        config = _get_config()
+        knowledge_dir = config.knowledge_dir
+        l0_path = config.home / "L0.md"
+
+        # L1 domains on disk
+        l1_domains = {p.stem for p in knowledge_dir.glob("*.md")}
+
+        # L0 referenced domains — parse L0.md directly (robust even when
+        # config.l0_index_file is None in Hermes inline-memory mode)
+        l0_domains: set[str] = set()
+        if l0_path.exists():
+            for line in l0_path.read_text(encoding="utf-8").splitlines():
+                if "→" not in line:
+                    continue
+                right = line.split("→", 1)[1].strip()
+                fname = right.split("/")[-1]
+                if fname.endswith(".md"):
+                    l0_domains.add(fname[:-3])
+
+        orphaned_l1 = sorted(l1_domains - l0_domains)      # on disk, not in L0
+        stale_l0 = sorted(l0_domains - l1_domains)          # in L0, file gone
+        consistent = sorted(l1_domains & l0_domains)
+
+        # Vector store coverage
+        stores = _get_v2_stores()
+        vector_store = stores["vector"]
+        vstats = vector_store.stats()
+        # domains present in vector store
+        v_domains: set[str] = set()
+        try:
+            import sqlite3
+            db_path = config.home / "data" / "vectors.db"
+            if db_path.exists():
+                conn = sqlite3.connect(str(db_path))
+                try:
+                    for (d,) in conn.execute("SELECT DISTINCT domain FROM vectors"):
+                        if d:
+                            v_domains.add(d)
+                finally:
+                    conn.close()
+        except Exception as exc:
+            logger.warning("vector domain scan failed: %s", exc)
+
+        missing_in_vector = sorted(l1_domains - v_domains)  # L1 not indexed
+
+        issues = len(orphaned_l1) + len(stale_l0) + len(missing_in_vector)
+        if issues == 0:
+            status = "healthy"
+        elif issues <= 2:
+            status = "minor"
+        else:
+            status = "needs_attention"
+
+        return {
+            "status": status,
+            "issue_count": issues,
+            "l1_count": len(l1_domains),
+            "l0_count": len(l0_domains),
+            "vector_count": len(v_domains),
+            "consistent_count": len(consistent),
+            "orphaned_l1": orphaned_l1,
+            "stale_l0_entries": stale_l0,
+            "missing_in_vector": missing_in_vector,
+            "vector_fitted": bool(vstats.get("is_fitted", False)),
+            "checks": [
+                {
+                    "key": "l0_l1",
+                    "label": "L0 ↔ L1 索引一致",
+                    "ok": not orphaned_l1 and not stale_l0,
+                    "detail": (
+                        "L0 索引与 L1 文件完全对应"
+                        if not orphaned_l1 and not stale_l0
+                        else f"{len(orphaned_l1)} 个 L1 未被索引 / {len(stale_l0)} 个 L0 指针失效"
+                    ),
+                },
+                {
+                    "key": "l1_vector",
+                    "label": "L1 ↔ 向量库覆盖",
+                    "ok": not missing_in_vector,
+                    "detail": (
+                        "每个 L1 文件都已建立向量索引"
+                        if not missing_in_vector
+                        else f"{len(missing_in_vector)} 个 L1 文件未进入向量库"
+                    ),
+                },
+                {
+                    "key": "vector_fitted",
+                    "label": "向量模型就绪",
+                    "ok": bool(vstats.get("is_fitted", False)),
+                    "detail": (
+                        "向量检索模型已训练，语义搜索可用"
+                        if vstats.get("is_fitted", False)
+                        else "向量模型未训练，语义搜索不可用（需重建向量）"
+                    ),
+                },
+            ],
+        }
+
+    return await asyncio.to_thread(_check)
+
+
+# ── #1: Search explain — make the hybrid retrieval visible ─────────────
+
+@router.post("/search-explain")
+async def search_explain(req: SemanticSearchRequest):
+    """Semantic search with per-result explanation.
+
+    Runs the vector search and, for each hit, surfaces which query terms
+    overlap with the matched domain/section so the user can see *why* a
+    result ranked where it did — turning black-box retrieval into
+    explainable retrieval.
+    """
+    _check_imports()
+
+    def _search():
+        stores = _get_v2_stores()
+        vector_store = stores["vector"]
+        vstats = vector_store.stats()
+        results = vector_store.search(req.query, top_n=req.top_n)
+
+        # tokenize query for overlap highlighting
+        import re
+        q_terms = [t.lower() for t in re.findall(r"[\w\u4e00-\u9fff]+", req.query) if len(t) > 1]
+
+        # vector_store.search returns list[dict]: {id, domain, text, metadata, score}
+        scores = [float(r.get("score", 0)) for r in results] or [0.0]
+        max_score = max(scores) if scores else 1.0
+
+        items = []
+        for r in results:
+            meta = r.get("metadata") or {}
+            domain = r.get("domain", "")
+            section = meta.get("section", "")
+            summary = meta.get("summary") or r.get("text", "")
+            haystack = f"{domain} {section} {summary}".lower()
+            matched = sorted({t for t in q_terms if t in haystack})
+            raw = float(r.get("score", 0))
+            rel = round(raw / max_score * 100) if max_score > 0 else 0
+            items.append({
+                "id": r.get("id", ""),
+                "domain": domain,
+                "section": section,
+                "summary": summary[:200],
+                "score": round(raw, 4),
+                "relative_pct": rel,
+                "confidence": meta.get("confidence"),
+                "matched_terms": matched,
+            })
+
+        return {
+            "query": req.query,
+            "query_terms": q_terms,
+            "method": "TF-IDF + SVD 向量检索（余弦相似度）",
+            "vector_fitted": bool(vstats.get("is_fitted", False)),
+            "total_indexed": vstats.get("total_entries", 0),
+            "results": items,
+        }
+
+    return await asyncio.to_thread(_search)

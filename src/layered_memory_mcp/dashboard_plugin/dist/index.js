@@ -123,6 +123,14 @@
       h("path", { d: "M10 14 21 3" }),
       h("path", { d: "M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" })
     ),
+    Zap: () => h("svg", { width: 16, height: 16, viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: 2 },
+      h("polygon", { points: "13 2 3 14 12 14 11 22 21 10 12 10 13 2" })
+    ),
+    Link2: () => h("svg", { width: 16, height: 16, viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: 2 },
+      h("path", { d: "M9 17H7A5 5 0 0 1 7 7h2" }),
+      h("path", { d: "M15 7h2a5 5 0 1 1 0 10h-2" }),
+      h("line", { x1: 8, y1: 12, x2: 16, y2: 12 })
+    ),
   };
 
   // ── Markdown renderer (simple, theme-aware) ─────────────────────────
@@ -194,6 +202,9 @@
   // Tab 0: Architecture Overview (design philosophy)
   // ═══════════════════════════════════════════════════════════════════════
   function ArchitectureOverviewTab() {
+    const tokenData = useAsyncData(() => fetchJSON(`${API_BASE}/token-economy`), []);
+    const fmt = (n) => (n == null ? "—" : n.toLocaleString());
+
     // one layer card in the L0→L1→L2→L3 flow
     function LayerCard(opts) {
       return h("div", {
@@ -235,6 +246,56 @@
         h("p", { className: "text-sm text-text-secondary mt-2 leading-relaxed" },
           "把知识按「访问频率」与「抽象层级」分成四层，每轮对话只把最轻的 L0 索引常驻上下文，更重的内容按需逐层拉取。这样既让 Agent 始终\"知道有什么\"，又不会用大量细节撑爆 token 预算。"
         )
+      ),
+
+      // #2 Token economy — the quantified "why this framework exists"
+      h("div", { className: "mb-5 rounded-lg border border-blue-500/30 bg-blue-500/5 p-4" },
+        h("div", { className: "flex items-center gap-2 mb-3" },
+          h(Icons.Zap),
+          h("span", { className: "font-semibold text-text-primary" }, "按需加载省了多少 token"),
+          tokenData.data && h("span", {
+            className: "ml-auto text-2xl font-bold text-blue-400 leading-none"
+          }, `${tokenData.data.saved_pct}%`)
+        ),
+        tokenData.loading ? h("div", { className: "text-text-tertiary text-sm" }, "测算中...")
+          : tokenData.error ? h(ErrorBox, { message: tokenData.error })
+          : tokenData.data && h("div", null,
+              // bar: resident (L0) vs the rest (L1, loaded on demand)
+              h("div", { className: "flex h-3 rounded-full overflow-hidden bg-background mb-2" },
+                h("div", {
+                  className: "bg-blue-400",
+                  style: { width: `${Math.max(100 - tokenData.data.saved_pct, 1.5)}%` },
+                  title: "L0 常驻"
+                }),
+                h("div", {
+                  className: "bg-emerald-500/40",
+                  style: { width: `${tokenData.data.saved_pct}%` },
+                  title: "L1 按需加载"
+                })
+              ),
+              h("div", { className: "grid grid-cols-3 gap-3 mt-3" },
+                h("div", null,
+                  h("div", { className: "text-xs text-text-tertiary" }, "L0 常驻上下文"),
+                  h("div", { className: "text-text-primary font-semibold" }, `${fmt(tokenData.data.l0_chars)} 字符`),
+                  h("div", { className: "text-[11px] text-text-tertiary" }, `≈ ${fmt(tokenData.data.l0_tokens_est)} tokens`)
+                ),
+                h("div", null,
+                  h("div", { className: "text-xs text-text-tertiary" }, "全量加载（不分层）"),
+                  h("div", { className: "text-text-primary font-semibold" }, `${fmt(tokenData.data.full_load_chars)} 字符`),
+                  h("div", { className: "text-[11px] text-text-tertiary" }, `≈ ${fmt(tokenData.data.full_tokens_est)} tokens`)
+                ),
+                h("div", null,
+                  h("div", { className: "text-xs text-text-tertiary" }, "每轮省下"),
+                  h("div", { className: "text-emerald-400 font-semibold" }, `${fmt(tokenData.data.saved_chars)} 字符`),
+                  h("div", { className: "text-[11px] text-text-tertiary" }, `≈ ${fmt(tokenData.data.saved_tokens_est)} tokens`)
+                )
+              ),
+              h("div", { className: "text-xs text-text-tertiary mt-3 leading-relaxed" },
+                `当前 ${tokenData.data.domain_count} 个知识域。每轮对话只把 L0 索引放进上下文，其余 `,
+                h("span", { className: "text-emerald-400" }, `${tokenData.data.saved_pct}%`),
+                " 的内容按需检索——这就是分层设计省下的预算（token 数按 ~4 字符/token 估算）。"
+              )
+            )
       ),
 
       // the four-layer flow
@@ -330,7 +391,7 @@
     const handleSearch = useCallback(() => {
       if (!searchQuery.trim()) { setSearchResults(null); return; }
       setSearching(true);
-      postJSON(`${API_BASE}/semantic-search`, { query: searchQuery, top_n: 5 })
+      postJSON(`${API_BASE}/search-explain`, { query: searchQuery, top_n: 5 })
         .then(r => { setSearchResults(r); setSearching(false); })
         .catch(e => { setSearchResults({ error: e.message }); setSearching(false); });
     }, [searchQuery]);
@@ -359,25 +420,51 @@
           )
         ),
 
-        // Search results overlay
+        // Search results overlay (explainable retrieval)
         searchResults && h("div", { className: "mb-3 bg-surface border border-border rounded-lg p-3" },
           searchResults.error
             ? h(ErrorBox, { message: searchResults.error })
             : h("div", null,
-                h("div", { className: "text-sm text-text-tertiary mb-2" },
-                  `搜索结果: ${searchResults.total || 0} 条`
-                ),
-                (searchResults.results || []).map(r =>
-                  h("div", {
-                    key: r.id,
-                    className: "p-2 rounded cursor-pointer hover:bg-surface-hover border-b border-border last:border-0",
-                    onClick: () => { setSelectedFile(r.domain + ".md"); setSearchResults(null); }
-                  },
-                    h("div", { className: "font-medium text-text-primary" }, r.domain),
-                    h("div", { className: "text-sm text-text-secondary truncate" }, r.summary),
-                    h("div", { className: "text-xs text-text-tertiary" }, `score: ${r.score}`)
+                // method + index status
+                h("div", { className: "flex items-center justify-between mb-2 pb-2 border-b border-border" },
+                  h("div", { className: "text-xs text-text-secondary flex items-center gap-1" },
+                    h(Icons.Compass), searchResults.method || "向量检索"
+                  ),
+                  h("div", { className: "text-[11px] text-text-tertiary" },
+                    searchResults.vector_fitted
+                      ? `已索引 ${searchResults.total_indexed || 0} 条`
+                      : "向量模型未就绪"
                   )
-                )
+                ),
+                !(searchResults.results && searchResults.results.length)
+                  ? h("div", { className: "text-text-tertiary text-sm py-2" }, "无匹配结果")
+                  : (searchResults.results || []).map(r =>
+                      h("div", {
+                        key: r.id,
+                        className: "p-2 rounded cursor-pointer hover:bg-surface-hover border-b border-border last:border-0",
+                        onClick: () => { setSelectedFile(r.domain + ".md"); setSearchResults(null); }
+                      },
+                        h("div", { className: "flex items-center justify-between gap-2" },
+                          h("div", { className: "font-medium text-text-primary truncate" }, r.domain),
+                          h("span", { className: "text-xs text-blue-400 shrink-0" }, `${r.relative_pct}%`)
+                        ),
+                        // relevance bar (relative to top hit)
+                        h("div", { className: "h-1 rounded-full bg-background my-1 overflow-hidden" },
+                          h("div", { className: "h-full bg-blue-400", style: { width: `${r.relative_pct}%` } })
+                        ),
+                        h("div", { className: "text-sm text-text-secondary truncate" }, r.summary),
+                        // why-it-matched: overlapping query terms
+                        r.matched_terms && r.matched_terms.length > 0 && h("div", { className: "flex flex-wrap gap-1 mt-1" },
+                          r.matched_terms.map(t =>
+                            h("span", {
+                              key: t,
+                              className: "text-[10px] px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-400 border border-blue-500/20"
+                            }, t)
+                          )
+                        ),
+                        h("div", { className: "text-[10px] text-text-tertiary mt-1" }, `余弦相似度 ${r.score}`)
+                      )
+                    )
               )
         ),
 
@@ -660,6 +747,7 @@
   function HealthDiagnosticsTab() {
     const healthData = useAsyncData(() => fetchJSON(`${API_BASE}/health`), []);
     const todosData = useAsyncData(() => fetchJSON(`${API_BASE}/todos?status=pending`), []);
+    const consistencyData = useAsyncData(() => fetchJSON(`${API_BASE}/consistency`), []);
 
     const [todoUpdating, setTodoUpdating] = useState(null);
 
@@ -812,6 +900,79 @@
             )
           )
         )
+      ),
+
+      // #3 Three-write consistency check
+      h("div", { className: "bg-surface border border-border rounded-lg p-4" },
+        h("div", { className: "font-semibold text-text-primary mb-1 flex items-center gap-2" },
+          h(Icons.Link2), "三写一致性体检",
+          consistencyData.data && h("span", {
+            className: cn(
+              "ml-auto text-xs px-2 py-0.5 rounded border",
+              consistencyData.data.status === "healthy" ? "text-emerald-400 border-emerald-500/30 bg-emerald-500/10"
+                : consistencyData.data.status === "minor" ? "text-amber-400 border-amber-500/30 bg-amber-500/10"
+                : "text-red-400 border-red-500/30 bg-red-500/10"
+            )
+          }, consistencyData.data.status === "healthy" ? "一致"
+             : consistencyData.data.status === "minor" ? "轻微偏差" : "需处理")
+        ),
+        h("div", { className: "text-xs text-text-tertiary mb-3" },
+          "验证 L1 正文、L0 索引、向量库三者是否同步——这是「三写一致」设计的可视化证明。"
+        ),
+        consistencyData.loading ? h(LoadingSpinner)
+          : consistencyData.error ? h(ErrorBox, { message: consistencyData.error })
+          : consistencyData.data && h("div", null,
+              // counts row
+              h("div", { className: "grid grid-cols-3 gap-3 mb-3" },
+                h("div", { className: "text-center p-2 rounded bg-background border border-border" },
+                  h("div", { className: "text-lg font-bold text-blue-400" }, consistencyData.data.l0_count),
+                  h("div", { className: "text-[11px] text-text-tertiary" }, "L0 索引条目")
+                ),
+                h("div", { className: "text-center p-2 rounded bg-background border border-border" },
+                  h("div", { className: "text-lg font-bold text-emerald-400" }, consistencyData.data.l1_count),
+                  h("div", { className: "text-[11px] text-text-tertiary" }, "L1 知识文件")
+                ),
+                h("div", { className: "text-center p-2 rounded bg-background border border-border" },
+                  h("div", { className: "text-lg font-bold text-purple-400" }, consistencyData.data.vector_count),
+                  h("div", { className: "text-[11px] text-text-tertiary" }, "向量库领域")
+                )
+              ),
+              // checks
+              h("div", { className: "space-y-2" },
+                (consistencyData.data.checks || []).map(c =>
+                  h("div", {
+                    key: c.key,
+                    className: cn(
+                      "flex items-start gap-2 p-2 rounded border text-sm",
+                      c.ok ? "bg-emerald-500/5 border-emerald-500/20" : "bg-amber-500/5 border-amber-500/20"
+                    )
+                  },
+                    h("span", { className: cn("mt-0.5 shrink-0", c.ok ? "text-emerald-400" : "text-amber-400") },
+                      c.ok ? h(Icons.Check) : h(Icons.AlertTriangle)
+                    ),
+                    h("div", { className: "min-w-0" },
+                      h("div", { className: "text-text-primary font-medium" }, c.label),
+                      h("div", { className: "text-xs text-text-tertiary" }, c.detail)
+                    )
+                  )
+                )
+              ),
+              // detailed problem lists (only when present)
+              (consistencyData.data.orphaned_l1.length > 0
+                || consistencyData.data.stale_l0_entries.length > 0
+                || consistencyData.data.missing_in_vector.length > 0) &&
+                h("div", { className: "mt-3 text-xs space-y-1" },
+                  consistencyData.data.orphaned_l1.length > 0 && h("div", { className: "text-amber-400" },
+                    `未被 L0 索引的 L1：${consistencyData.data.orphaned_l1.join(", ")}`
+                  ),
+                  consistencyData.data.stale_l0_entries.length > 0 && h("div", { className: "text-red-400" },
+                    `失效的 L0 指针：${consistencyData.data.stale_l0_entries.join(", ")}`
+                  ),
+                  consistencyData.data.missing_in_vector.length > 0 && h("div", { className: "text-amber-400" },
+                    `未进向量库：${consistencyData.data.missing_in_vector.join(", ")}（可在下方重建向量修复）`
+                  )
+                )
+            )
       ),
 
       // TODO List
