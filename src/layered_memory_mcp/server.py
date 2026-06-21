@@ -46,7 +46,7 @@ from .agent_integrator import (
 # v2.0 imports
 from .models import KnowledgeEntry, KnowledgeType, SourceInfo, SourceType, ReviewItem, ConfidenceScorer
 from .models import TodoEntry, TodoStatus, TodoPriority
-from .storage import L1Store, VectorStore, ReviewQueue
+from .storage import L1Store, VectorStore, ReviewQueue, AccessLogStore
 from .extractor import SessionReader, KnowledgeExtractor
 from .todo_store import TodoStore
 
@@ -83,6 +83,53 @@ def _get_todo_store() -> TodoStore:
         data_dir.mkdir(parents=True, exist_ok=True)
         _todo_store = TodoStore(data_dir / "todos.db")
     return _todo_store
+
+
+# ---------------------------------------------------------------------------
+# v2.6.0: Access-log telemetry store + best-effort recording helpers
+# ---------------------------------------------------------------------------
+_access_log_store: AccessLogStore | None = None
+
+
+def _get_access_log() -> AccessLogStore | None:
+    """Get the access-log store, or None if telemetry is disabled.
+
+    Never raises — telemetry must not break retrieval.
+    """
+    global _access_log_store
+    try:
+        config = _get_config()
+        if not getattr(config, "access_log_enabled", True):
+            return None
+        if _access_log_store is None:
+            data_dir = config.home / "data"
+            data_dir.mkdir(parents=True, exist_ok=True)
+            _access_log_store = AccessLogStore(
+                data_dir / "access_log.db",
+                retention_days=getattr(config, "access_log_retention_days", 90),
+                log_query=getattr(config, "access_log_query", True),
+            )
+        return _access_log_store
+    except Exception as exc:
+        logger.debug("access_log unavailable: %s", exc)
+        return None
+
+
+def _record_access(events: list[dict]) -> None:
+    """Best-effort batch record of recall events. Never raises."""
+    try:
+        store = _get_access_log()
+        if store is not None and events:
+            store.record_batch(events)
+    except Exception as exc:
+        logger.debug("record_access failed: %s", exc)
+
+
+def _domain_from_file(filename: str) -> str:
+    """Map an L1 filename/relpath to its domain (basename minus .md)."""
+    base = filename.rsplit("/", 1)[-1]
+    return base[:-3] if base.endswith(".md") else base
+
 
 
 # ---------------------------------------------------------------------------
@@ -334,6 +381,24 @@ async def recall_knowledge(
         recall, keyword, kdirs if len(kdirs) > 1 else kdirs[0], top_n, search_mode
     )
 
+    # v2.6.0: best-effort recall telemetry (never blocks/raises)
+    try:
+        if result.get("success") and result.get("results"):
+            events = [
+                {
+                    "domain": _domain_from_file(r.get("file", "")),
+                    "access_type": "recall",
+                    "query": keyword,
+                    "rank": i + 1,
+                    "score": r.get("score"),
+                }
+                for i, r in enumerate(result["results"])
+                if r.get("file")
+            ]
+            await asyncio.to_thread(_record_access, events)
+    except Exception as exc:
+        logger.debug("recall telemetry skipped: %s", exc)
+
     # v0.6.0: Lightweight staleness check (stdio-safe)
     from .l0_manager import quick_l0_consistency_check
     staleness = await asyncio.to_thread(quick_l0_consistency_check, config)
@@ -395,6 +460,14 @@ async def get_knowledge_file(filename: str) -> str:
 
     try:
         content = await asyncio.to_thread(filepath.read_text, "utf-8")
+        # v2.6.0: best-effort get_file telemetry
+        try:
+            await asyncio.to_thread(
+                _record_access,
+                [{"domain": _domain_from_file(filename), "access_type": "get_file"}],
+            )
+        except Exception as exc:
+            logger.debug("get_file telemetry skipped: %s", exc)
         return json.dumps({
             "success": True,
             "file": filename,
@@ -1121,6 +1194,24 @@ async def search_semantic(
     """
     stores = _get_v2_stores()
     results = stores["vector"].search(query, top_n=top_n, domain=domain)
+
+    # v2.6.0: best-effort semantic-recall telemetry
+    try:
+        events = [
+            {
+                "domain": r.get("domain", ""),
+                "access_type": "semantic",
+                "query": query,
+                "rank": i + 1,
+                "score": r.get("score"),
+            }
+            for i, r in enumerate(results)
+            if r.get("domain")
+        ]
+        await asyncio.to_thread(_record_access, events)
+    except Exception as exc:
+        logger.debug("semantic telemetry skipped: %s", exc)
+
     return json.dumps({
         "success": True,
         "query": query,
@@ -1750,6 +1841,118 @@ To set up automated weekly scanning:
 2. Analyze sessions for: tasks mentioned but not completed, recurring open topics, explicit "TODO/待做/unresolved" signals.
 3. For each detected candidate, call add_todo with the detected domain and priority.
 4. Report the scan results to the user with candidates for confirmation."""
+
+
+# ---------------------------------------------------------------------------
+# v2.6.0: Access-log telemetry tools (knowledge time dimension)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def get_access_stats(days: int = 30, limit: int = 20) -> str:
+    """Get knowledge recall telemetry — which knowledge is used vs dead weight.
+
+    Reports the most-recalled L1 domains, zombie domains (indexed but never
+    recalled past a grace period), and a window overview. This is the "time
+    dimension" of the knowledge base: it answers whether each domain is
+    actually producing value, not just whether it exists.
+
+    Args:
+        days: Stats window in days (default 30).
+        limit: Max domains in the top-recalled list (default 20).
+
+    Returns:
+        JSON with overview, top_recalled, and zombies.
+    """
+    def _stats():
+        store = _get_access_log()
+        if store is None:
+            return {"success": False, "error": "Access-log telemetry is disabled."}
+
+        config = _get_config()
+        overview = store.overview(days=days)
+        top = store.top_recalled(days=days, limit=limit)
+
+        # Zombie detection: L1 domains never recalled, created > grace days ago.
+        from .recall import scan_knowledge_dirs, scan_knowledge_files
+        kdirs = [str(d) for d in config.knowledge_dirs]
+        files = scan_knowledge_dirs(kdirs) if len(kdirs) > 1 else scan_knowledge_files(kdirs[0])
+        l1_domains = {_domain_from_file(f) for f in files.keys()}
+
+        recalled = store.recalled_domains()
+        from .storage.access_log import ZOMBIE_GRACE_DAYS
+        import time as _time
+        now = _time.time()
+        zombies = []
+        for dom in sorted(l1_domains - recalled):
+            fpath = files.get(dom + ".md") or files.get(dom)
+            age_days = None
+            try:
+                if fpath:
+                    age_days = round((now - Path(fpath).stat().st_mtime) / 86400, 1)
+            except Exception:
+                pass
+            # only flag if older than grace period (or age unknown)
+            if age_days is None or age_days >= ZOMBIE_GRACE_DAYS:
+                zombies.append({"domain": dom, "age_days": age_days})
+
+        return {
+            "success": True,
+            "overview": overview,
+            "top_recalled": top,
+            "zombies": zombies,
+            "zombie_count": len(zombies),
+            "grace_days": ZOMBIE_GRACE_DAYS,
+        }
+
+    result = await asyncio.to_thread(_stats)
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def get_domain_timeline(domain: str, days: int = 30) -> str:
+    """Get the recall timeline for a single knowledge domain.
+
+    Shows recall stats and a per-day recall curve, so you can see whether a
+    domain is heating up, cooling down, or dormant.
+
+    Args:
+        domain: Knowledge domain name (filename without .md).
+        days: Window in days (default 30).
+
+    Returns:
+        JSON with domain stats and a per-day trend series.
+    """
+    def _timeline():
+        store = _get_access_log()
+        if store is None:
+            return {"success": False, "error": "Access-log telemetry is disabled."}
+        dom = _domain_from_file(domain)
+        return {
+            "success": True,
+            "stats": store.domain_stats(dom, days=days),
+            "trend": store.trend(dom, days=days),
+        }
+
+    result = await asyncio.to_thread(_timeline)
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def prune_access_log() -> str:
+    """Delete access-log events older than the retention window.
+
+    Telemetry auto-bounds itself, but this lets you force a cleanup. Returns
+    the number of rows deleted.
+    """
+    def _prune():
+        store = _get_access_log()
+        if store is None:
+            return {"success": False, "error": "Access-log telemetry is disabled."}
+        deleted = store.prune()
+        return {"success": True, "deleted": deleted, "retention_days": store.retention_days}
+
+    result = await asyncio.to_thread(_prune)
+    return json.dumps(result, ensure_ascii=False, indent=2)
 
 
 # ---------------------------------------------------------------------------

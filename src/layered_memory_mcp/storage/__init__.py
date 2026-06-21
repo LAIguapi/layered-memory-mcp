@@ -9,6 +9,7 @@ Provides:
 from .l1_store import L1Store, read_knowledge_file, write_knowledge_file
 from .vector_store import VectorStore
 from .review_queue import ReviewQueue
+from .access_log import AccessLogStore
 
 __all__ = [
     "L1Store",
@@ -16,4 +17,5 @@ __all__ = [
     "write_knowledge_file",
     "VectorStore",
     "ReviewQueue",
+    "AccessLogStore",
 ]

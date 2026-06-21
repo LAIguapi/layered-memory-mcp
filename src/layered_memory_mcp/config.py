@@ -129,6 +129,21 @@ class MemoryConfig:
             raise ValueError(f"Invalid namespace: {_ns!r}. Use alphanumeric, hyphens, underscores only.")
         self.namespace: str = _ns
 
+        # v2.6.0: Access-log telemetry — record knowledge recall events to
+        # answer "which knowledge is used / which is dead weight".
+        # Enabled by default; the log is a best-effort side-channel that never
+        # blocks retrieval.
+        self.access_log_enabled: bool = _env_bool("LAYERED_MEMORY_ACCESS_LOG", True)
+        # Whether to store the query text alongside events (privacy toggle).
+        self.access_log_query: bool = _env_bool("LAYERED_MEMORY_LOG_QUERY", True)
+        # Days of raw events to keep before auto-prune.
+        _ret = os.environ.get("LAYERED_MEMORY_ACCESS_RETENTION_DAYS")
+        try:
+            self.access_log_retention_days: int = int(_ret) if _ret else 90
+        except ValueError:
+            self.access_log_retention_days = 90
+
+
         # v0.7.0: Compact — path to YAML file with domain → keywords mapping
         _rules_file = (
             compact_domain_rules_file
