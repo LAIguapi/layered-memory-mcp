@@ -256,6 +256,40 @@ def build_init_recommendation(
                 "already_done": False,
             })
 
+        # v2.5.0+: Dashboard plugin option
+        from .dashboard_plugin import check_dashboard_plugin_status, deploy_dashboard_plugin
+        dashboard_status = check_dashboard_plugin_status(agent_info["home_dir"])
+        if dashboard_status["status"] == "not_installed":
+            recommendations.append({
+                "option": "C",
+                "label": "安装 Dashboard 插件",
+                "description": (
+                    "在 Hermes Dashboard 中安装可视化面板，展示四层记忆架构、"
+                    "知识生命周期与健康诊断。安装后重启 Dashboard 生效。"
+                ),
+                "action": "install_dashboard",
+                "already_done": False,
+            })
+        elif dashboard_status["status"] == "up_to_date":
+            recommendations.append({
+                "option": "C",
+                "label": "Dashboard 插件已安装",
+                "description": f"Dashboard 插件 v{dashboard_status['version']} 已安装并是最新版本。",
+                "action": "none",
+                "already_done": True,
+            })
+        elif dashboard_status["status"] == "update_available":
+            recommendations.append({
+                "option": "C",
+                "label": "Dashboard 插件需更新",
+                "description": (
+                    f"已安装 v{dashboard_status['version']}，期望 v{dashboard_status['expected_version']}。"
+                    f"请使用 Hermes 协助解决版本冲突。"
+                ),
+                "action": "install_dashboard",  # Will show version conflict in result
+                "already_done": False,
+            })
+
     else:
         recommendations.append({
             "option": "manual",

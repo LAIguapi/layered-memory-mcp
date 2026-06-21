@@ -46,6 +46,17 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/layered_memory_mcp"]
+artifacts = [
+    "src/layered_memory_mcp/dashboard_plugin/dist/*",
+    "src/layered_memory_mcp/dashboard_plugin/*.json",
+]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/README.md",
+    "/LICENSE",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1,5 +1,8 @@
 # Build artifacts
 dist/
+# but the dashboard plugin's dist/ is hand-written source, not a build artifact
+!src/layered_memory_mcp/dashboard_plugin/dist/
+!src/layered_memory_mcp/dashboard_plugin/dist/**
 *.egg-info/
 build/
 *.whl

@@ -1491,6 +1491,12 @@ async def init_framework() -> str:
             soul_already_injected=soul_injected,
         )
 
+        # v2.5.0+: Dashboard plugin status (detect only, don't auto-deploy)
+        dashboard_plugin_info = None
+        if agent_info["agent_type"] == "hermes" and agent_info["home_dir"]:
+            from .dashboard_plugin import check_dashboard_plugin_status
+            dashboard_plugin_info = check_dashboard_plugin_status(agent_info["home_dir"])
+
         result = {
             "success": True,
             "first_run": total == 0,
@@ -1499,6 +1505,9 @@ async def init_framework() -> str:
             "agent_type": agent_info["agent_type"],
             "integration": integration,
         }
+
+        if dashboard_plugin_info:
+            result["dashboard_plugin"] = dashboard_plugin_info
 
         if total == 0:
             # First run: create welcome file
@@ -1584,6 +1593,22 @@ async def integrate_agent(action: str = "status") -> str:
             if not agent_info["soul_path"]:
                 return {"success": False, "error": "SOUL.md not found."}
             return remove_soul_injection(agent_info["soul_path"])
+
+        if action == "install_dashboard":
+            if agent_info["agent_type"] != "hermes":
+                return {"success": False, "error": "Dashboard plugin only supported for Hermes Agent."}
+            if not agent_info["home_dir"]:
+                return {"success": False, "error": "Hermes home directory not found."}
+            from .dashboard_plugin import deploy_dashboard_plugin
+            return deploy_dashboard_plugin(agent_info["home_dir"])
+
+        if action == "remove_dashboard":
+            if agent_info["agent_type"] != "hermes":
+                return {"success": False, "error": "Dashboard plugin only supported for Hermes Agent."}
+            if not agent_info["home_dir"]:
+                return {"success": False, "error": "Hermes home directory not found."}
+            from .dashboard_plugin import remove_dashboard_plugin
+            return remove_dashboard_plugin(agent_info["home_dir"])
 
         return {"success": False, "error": f"Unknown action: {action}"}
 
