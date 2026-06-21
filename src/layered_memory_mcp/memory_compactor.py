@@ -51,7 +51,20 @@ MAX_INDEX_ENTRY_LENGTH = 120
 
 # Default memory capacity in chars (for capacity warning).
 # Users can override via MEMORY_MAX_CHARS env var.
+#
+# Priority chain (see _get_memory_max_chars):
+#   1. explicit max_chars argument
+#   2. MEMORY_MAX_CHARS env var
+#   3. Hermes config.yaml (memory.memory_char_limit / user_char_limit) — dynamic
+#   4. smart default by memory-file type below
+#
+# The generic default (non-Hermes agents, blank-line separated) stays high.
+# Hermes-style memory (§-separated MEMORY.md / USER.md) defaults to the
+# Hermes built-in default of 2000 so we never *over*-estimate capacity and
+# silently skip compaction. This is only a fallback — the real limit is read
+# dynamically from config.yaml when available.
 _DEFAULT_MEMORY_MAX_CHARS = 50_000
+_HERMES_DEFAULT_MEMORY_MAX_CHARS = 2_000
 
 # Generic fallback domain rules — only common English keywords.
 # These are used when no YAML config file is provided.
@@ -245,7 +258,7 @@ def detect_memory_bloat(
     }
 
     # Capacity warning logic
-    _capacity_limit = max_chars or _get_memory_max_chars()
+    _capacity_limit = max_chars or _get_memory_max_chars(config=config, memory_path=path)
     if _capacity_limit and _capacity_limit > 0 and total_chars > 0:
         usage_ratio = total_chars / _capacity_limit
         capacity_threshold = _get_capacity_warning_threshold(config)
@@ -549,15 +562,16 @@ def auto_maintain_after_write(
 
         if bloat.get("success"):
             total_chars = bloat["stats"]["total_chars"]
-            limit = _get_memory_max_chars()
+            limit = _get_memory_max_chars(config=config, memory_path=path)
             threshold = getattr(config, "compact_bloat_threshold", 0.8)
             has_bloat = bloat.get("bloat_entries", 0) > 0
+            usage_ratio = (total_chars / limit) if (limit and limit > 0) else 0.0
 
             # Trigger A: usage over bloat threshold (and there's bloat to move)
             if limit and limit > 0 and has_bloat:
-                if total_chars / limit >= threshold:
+                if usage_ratio >= threshold:
                     should_compact = True
-                    reason = f"usage {round(total_chars / limit * 100, 1)}% >= threshold {round(threshold * 100)}%"
+                    reason = f"usage {round(usage_ratio * 100, 1)}% >= threshold {round(threshold * 100)}%"
 
             # Trigger B: interval elapsed (and there's bloat to move)
             if not should_compact and has_bloat:
@@ -566,6 +580,17 @@ def auto_maintain_after_write(
                 if elapsed >= interval_s:
                     should_compact = True
                     reason = f"interval elapsed ({round(elapsed / 86400, 1)}d >= {interval_s / 86400}d)"
+
+            # Trigger C: hard safety net — memory critically full, compact NOW
+            # regardless of interval. Prevents the "silently over the real
+            # limit" failure when the agent wrote bloat directly to native
+            # memory (bypassing inject_knowledge) and the interval hasn't
+            # elapsed. Fires when usage >= critical threshold (default 0.95).
+            if not should_compact and has_bloat and limit and limit > 0:
+                critical = getattr(config, "compact_critical_threshold", 0.95)
+                if usage_ratio >= critical:
+                    should_compact = True
+                    reason = f"CRITICAL usage {round(usage_ratio * 100, 1)}% >= {round(critical * 100)}% (hard safety net)"
 
         if should_compact:
             compact_result = compact_memory(config, memory_path=path, dry_run=False)
@@ -749,15 +774,137 @@ def _summarize_brief(entry: str, max_chars: int = 60, config=None) -> str:
     return clean
 
 
-def _get_memory_max_chars() -> int:
-    """Get the configured memory max chars limit."""
+def _find_hermes_config() -> Path | None:
+    """Locate the Hermes config.yaml.
+
+    Resolution order:
+      1. HERMES_CONFIG_PATH env var (set by Hermes in the MCP server's env)
+      2. ~/.hermes/config.yaml (standard location)
+
+    Returns the path if it exists, else None.
+    """
     import os
+
+    explicit = os.environ.get("HERMES_CONFIG_PATH")
+    if explicit:
+        p = Path(explicit).expanduser()
+        if p.is_file():
+            return p
+
+    standard = Path("~/.hermes/config.yaml").expanduser()
+    if standard.is_file():
+        return standard
+    return None
+
+
+def _read_hermes_memory_limit(is_user_profile: bool = False) -> int | None:
+    """Dynamically read the real memory char limit from Hermes config.yaml.
+
+    Hermes stores two independent limits under the ``memory:`` section:
+      - ``memory_char_limit``  → MEMORY.md
+      - ``user_char_limit``    → USER.md
+
+    Reading this keeps the framework in sync with whatever the user has
+    actually configured (default 2000, user-adjustable) instead of guessing
+    a fixed value that drifts from reality.
+
+    Args:
+        is_user_profile: When True, read ``user_char_limit`` (USER.md);
+            otherwise ``memory_char_limit`` (MEMORY.md).
+
+    Returns:
+        The configured limit as int, or None if unavailable/unparseable.
+    """
+    cfg_path = _find_hermes_config()
+    if not cfg_path:
+        return None
+    try:
+        import yaml
+
+        with cfg_path.open("r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        mem = data.get("memory") or {}
+        key = "user_char_limit" if is_user_profile else "memory_char_limit"
+        val = mem.get(key)
+        if val is not None:
+            limit = int(val)
+            if limit > 0:
+                return limit
+    except Exception as e:  # noqa: BLE001 — never let limit-detection break maintenance
+        logger.debug("Could not read Hermes memory limit from %s: %s", cfg_path, e)
+    return None
+
+
+def _is_hermes_memory_path(path: "str | Path | None") -> bool:
+    """Heuristic: does this memory path belong to a Hermes-style agent?
+
+    Hermes memory lives under ``.hermes/memories/`` and uses '§' separators.
+    Used to pick the Hermes-appropriate fallback default (2000) instead of
+    the generic 50000.
+    """
+    if not path:
+        return False
+    s = str(path).lower()
+    return "hermes" in s or "memory.md" in s or "user.md" in s
+
+
+def _is_user_profile_path(path: "str | Path | None") -> bool:
+    """Detect whether the memory path is the USER profile (USER.md) vs MEMORY.md."""
+    if not path:
+        return False
+    return "user.md" in str(path).lower()
+
+
+def _get_memory_max_chars(
+    config=None,
+    memory_path: "str | Path | None" = None,
+) -> int:
+    """Resolve the memory capacity limit, preferring real config over guesses.
+
+    Priority chain (most authoritative first):
+      1. config.memory_char_limit (explicit, if the MemoryConfig carries one)
+      2. MEMORY_MAX_CHARS env var
+      3. Hermes config.yaml memory.{memory,user}_char_limit — DYNAMIC, tracks
+         whatever the user actually set (e.g. they raised 2000 → 4000)
+      4. smart default: Hermes-style memory → 2000, generic → 50000
+
+    Args:
+        config: optional MemoryConfig (may carry an explicit limit).
+        memory_path: the memory file being evaluated; used to (a) pick the
+            right Hermes key (MEMORY vs USER) and (b) choose the fallback.
+    """
+    import os
+
+    # 1. explicit config value
+    if config is not None:
+        cfg_val = getattr(config, "memory_char_limit", None)
+        if cfg_val:
+            try:
+                v = int(cfg_val)
+                if v > 0:
+                    return v
+            except (TypeError, ValueError):
+                pass
+
+    # 2. env override
     val = os.environ.get("MEMORY_MAX_CHARS")
     if val:
         try:
-            return int(val)
+            v = int(val)
+            if v > 0:
+                return v
         except ValueError:
             pass
+
+    # 3. dynamic: read the real limit from Hermes config.yaml
+    is_user = _is_user_profile_path(memory_path)
+    hermes_limit = _read_hermes_memory_limit(is_user_profile=is_user)
+    if hermes_limit:
+        return hermes_limit
+
+    # 4. smart default by memory-file type
+    if _is_hermes_memory_path(memory_path):
+        return _HERMES_DEFAULT_MEMORY_MAX_CHARS
     return _DEFAULT_MEMORY_MAX_CHARS
 
 

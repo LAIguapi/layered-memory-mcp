@@ -5,6 +5,64 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.7.0] - 2026-06-21
+
+### Fixed — Dynamic agent-memory limit detection (root-cause of silent bloat)
+
+The framework's lazy compaction silently failed to fire when agent memory
+actually overflowed, because it could not see the *real* capacity limit.
+
+**Root cause:** `_get_memory_max_chars` defaulted to a hard-coded `50_000`
+chars and only honored the `MEMORY_MAX_CHARS` env var. Hermes' real memory
+limit lives in `config.yaml` (`memory.memory_char_limit`, default 2000,
+user-adjustable). With no env var set, the framework thought capacity was
+50000 while the true limit was 4000 — so a 3974-char (≈99% full) MEMORY.md
+registered as ~8% usage and never tripped the compaction threshold.
+
+**Fix:** the limit is now resolved through a priority chain that reads the
+user's actual configuration instead of guessing:
+
+1. explicit `config.memory_char_limit`
+2. `MEMORY_MAX_CHARS` env var
+3. **dynamic read of Hermes `config.yaml` `memory.{memory,user}_char_limit`**
+   (tracks whatever the user set — 2000, 4000, 8000…)
+4. smart default by memory-file type (Hermes-style `§` memory → 2000,
+   generic → 50000)
+
+New helpers in `memory_compactor.py`: `_find_hermes_config()`,
+`_read_hermes_memory_limit(is_user_profile)`, `_is_hermes_memory_path()`,
+`_is_user_profile_path()`. `_get_memory_max_chars()` now takes `config` and
+`memory_path` so it can pick the right limit (MEMORY.md vs USER.md) and the
+right fallback. `detect_memory_bloat` and `auto_maintain_after_write` pass
+both through.
+
+`HERMES_CONFIG_PATH` env var (set by Hermes in the MCP server's env) is the
+preferred config locator; falls back to `~/.hermes/config.yaml`.
+
+### Added — Trigger C: critical-usage safety net
+
+`auto_maintain_after_write` gains a third compaction trigger: when usage
+reaches `compact_critical_threshold` (default 0.95) **and** there is bloat to
+migrate, compaction fires immediately, ignoring the `auto_maintain_interval`.
+This catches the case where bloat was written straight to native memory
+(bypassing `inject_knowledge`) and the 7-day interval hasn't elapsed.
+
+### Added — Ride-along self-maintenance on `get_l0_index`
+
+Under stdio (Hermes' mode), the MCP process is short-lived, so a background
+daemon thread can't run periodic maintenance. Instead, `get_l0_index` — the
+highest-frequency tool, called at the start of nearly every session — now
+piggybacks a best-effort `auto_maintain_after_write` check. This gives the
+framework a real chance to self-maintain even when the agent only ever writes
+to native memory and never calls `inject_knowledge`. Failures are swallowed so
+maintenance can never break index retrieval.
+
+### Added — Config
+
+- `compact_critical_threshold` (0–1, default 0.95, env
+  `LAYERED_MEMORY_COMPACT_CRITICAL_THRESHOLD`), range-validated.
+- `memory_char_limit` (explicit override, env `MEMORY_MAX_CHARS`).
+
 ## [2.4.0] - 2026-06-16
 
 ### Added — Rot Auditor (`audit_rot` tool)

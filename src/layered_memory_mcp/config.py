@@ -94,6 +94,9 @@ class MemoryConfig:
         # v2.3.0 new fields — auto-maintain (write-triggered self-maintenance)
         auto_maintain: bool | None = None,
         auto_maintain_interval_days: float | None = None,
+        # v2.7.0 new fields — critical safety-net + explicit memory limit
+        compact_critical_threshold: float | None = None,
+        memory_char_limit: int | None = None,
     ):
         self.home = Path(home) if home else default_home()
         self.knowledge_dir = Path(knowledge_dir) if knowledge_dir else default_knowledge_dir(self.home)
@@ -182,6 +185,30 @@ class MemoryConfig:
             else _env_float("LAYERED_MEMORY_AUTO_MAINTAIN_INTERVAL_DAYS", 7.0)
         )
 
+        # v2.7.0: Critical safety-net threshold (0–1, default 0.95). When agent
+        # memory usage reaches this fraction of the real limit AND there is
+        # bloat to migrate, compaction fires immediately, ignoring the
+        # auto_maintain interval. Guards against the "silently over the real
+        # limit" failure when bloat was written directly to native memory.
+        self.compact_critical_threshold: float = (
+            compact_critical_threshold if compact_critical_threshold is not None
+            else _env_float("LAYERED_MEMORY_COMPACT_CRITICAL_THRESHOLD", 0.95)
+        )
+
+        # v2.7.0: Explicit agent-memory char limit. Highest-priority override
+        # in _get_memory_max_chars. Normally left None — the framework reads
+        # the real limit dynamically from Hermes config.yaml instead of
+        # hard-coding a value that would drift from the user's actual setting.
+        _mcl = memory_char_limit
+        if _mcl is None:
+            _env_mcl = os.environ.get("MEMORY_MAX_CHARS")
+            if _env_mcl:
+                try:
+                    _mcl = int(_env_mcl)
+                except ValueError:
+                    _mcl = None
+        self.memory_char_limit: int | None = _mcl if (_mcl and _mcl > 0) else None
+
         # v1.2: L0 index entry tag — configurable for i18n (default: "[L0]")
         _tag = os.environ.get("LAYERED_MEMORY_L0_TAG", "[L0]")
         if not (_tag.startswith("[") and _tag.endswith("]")):
@@ -194,6 +221,7 @@ class MemoryConfig:
         for _name, _val in [
             ("compact_bloat_threshold", self.compact_bloat_threshold),
             ("compact_capacity_warning_threshold", self.compact_capacity_warning_threshold),
+            ("compact_critical_threshold", self.compact_critical_threshold),
             ("dedup_threshold", self.dedup_threshold),
         ]:
             if not (0.0 <= _val <= 1.0):

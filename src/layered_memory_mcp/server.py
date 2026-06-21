@@ -1392,6 +1392,20 @@ async def get_l0_index() -> str:
     """
     config = _get_config()
 
+    # v2.7.0: ride-along self-maintenance. get_l0_index is the highest-frequency
+    # tool in the stdio lifecycle — Hermes (and most agents) call it at the
+    # start of every session. Piggybacking a memory-health check here gives the
+    # framework a real chance to self-maintain even when the agent only ever
+    # writes to native memory and never calls inject_knowledge. Best-effort:
+    # any failure is swallowed so it can never break index retrieval.
+    if getattr(config, "auto_maintain", True):
+        try:
+            from .memory_compactor import auto_maintain_after_write
+
+            await asyncio.to_thread(auto_maintain_after_write, config, None)
+        except Exception as e:  # noqa: BLE001 — maintenance must never break reads
+            logger.debug("get_l0_index ride-along auto-maintain skipped: %s", e)
+
     # First try the configured L0 file
     if config.l0_index_file and config.l0_index_file.exists():
         try:
