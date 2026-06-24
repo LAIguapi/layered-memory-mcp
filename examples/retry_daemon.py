@@ -121,6 +121,13 @@ def find_failed_jobs() -> list[dict]:
         if not last_run:
             continue
 
+        # Skip jobs the user has deliberately disabled/paused — never retry
+        # or alarm on them (otherwise a paused job with last_status=error
+        # generates recurring false BLOCKED notifications forever).
+        if job.get("enabled") is False or job.get("state") in ("paused", "disabled"):
+            clear_state(job_id)
+            continue
+
         # 条件1: 显式失败
         if last_status == "error":
             is_model_err = _is_model_failure(last_error)

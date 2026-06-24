@@ -1,6 +1,6 @@
 [project]
 name = "layered-memory-mcp"
-version = "2.8.0"
+version = "2.9.0"
 description = "Layered Memory MCP Server — Extend AI agent memory beyond token limits with a 4-tier knowledge architecture"
 readme = "README.md"
 license = "MIT"
@@ -23,6 +23,8 @@ classifiers = [
 dependencies = [
     "fastmcp>=2.0.0",
     "filelock>=3.0,<4.0",
+    "fastembed>=0.8.0",
+    "numpy>=1.24",
 ]
 
 [project.scripts]

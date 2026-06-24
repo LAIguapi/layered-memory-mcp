@@ -814,7 +814,10 @@ class TestMergeMode:
         r = inject_knowledge(config, domain="test", section="Notes",
                              content="- Line A\n- Line B", mode="merge")
         assert r["success"] is True
-        assert r.get("action") == "merged_no_change"
+        # v2.8.0+ exact-match dedup makes an all-duplicate merge a no-op; the
+        # store reports "skipped" (more precise than the older
+        # "merged_no_change"). Accept either for backward compat.
+        assert r.get("action") in ("merged_no_change", "skipped")
 
 
 class TestNamespace:

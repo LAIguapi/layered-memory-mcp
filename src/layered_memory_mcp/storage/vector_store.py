@@ -1,34 +1,116 @@
 """Lightweight vector store for semantic search.
 
-Uses SQLite for persistence and numpy/scikit-learn for embeddings.
-No external API calls, no GPU required.
+Uses SQLite for persistence and fastembed (ONNX Runtime) for embeddings.
+No external API calls at query time, no GPU, no torch.
 
-Embedding strategy: TF-IDF + TruncatedSVD
-- Fast to compute (no neural network)
-- No model download required
-- Good enough for knowledge retrieval
-- Fully offline
+Embedding strategy: BAAI/bge-small-zh-v1.5 via fastembed
+- True Chinese semantic embeddings (512-dim, L2-normalized)
+- ONNX Runtime backend (~95MB model, no torch/1.5GB dependency)
+- Fully offline once the model is cached locally
+- Replaces the legacy sklearn TF-IDF + TruncatedSVD(64) approach, which
+  degraded to whole-sentence exact matching on CJK text (no semantics).
+
+Model bootstrap:
+- Cached under MODEL_CACHE_DIR (persistent, survives restarts).
+- First-ever load downloads the ONNX model from HuggingFace. HF is blocked
+  in CN, so we route through the local mihomo proxy (PROXY_URL) automatically
+  when the model is missing. hf-mirror.com is rate-limited to a crawl for the
+  large onnx blob, so the proxy path is preferred.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
-from sklearn.decomposition import TruncatedSVD
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
 
 if TYPE_CHECKING:
     from ..models import KnowledgeEntry
 
 logger = logging.getLogger("layered_memory_mcp.storage.vector")
 
-DEFAULT_DIM = 64
+# --- Embedding model config ---
+MODEL_NAME = "BAAI/bge-small-zh-v1.5"
+EMBED_DIM = 512  # bge-small-zh-v1.5 output dimension
+MODEL_CACHE_DIR = os.environ.get(
+    "LAYERED_MEMORY_MODEL_DIR",
+    str(Path.home() / ".layered-memory" / "models"),
+)
+# Local mihomo (Clash) mixed-proxy port. Used only to bootstrap-download the
+# model from HuggingFace when it is not yet cached. Override via env if needed.
+PROXY_URL = os.environ.get("LAYERED_MEMORY_HF_PROXY", "http://127.0.0.1:20172")
+
+# Module-level singleton embedder (heavy to construct; share across stores).
+_embedder = None
+_embedder_lock = threading.Lock()
+
+
+def _get_embedder():
+    """Lazily construct and cache the fastembed TextEmbedding singleton.
+
+    Tries an offline load first (model already cached). If that fails because
+    the model isn't downloaded yet, retries with the local proxy exported so
+    fastembed can fetch it from HuggingFace.
+    """
+    global _embedder
+    if _embedder is not None:
+        return _embedder
+    with _embedder_lock:
+        if _embedder is not None:
+            return _embedder
+        from fastembed import TextEmbedding
+
+        Path(MODEL_CACHE_DIR).mkdir(parents=True, exist_ok=True)
+
+        # Attempt 1: offline (model already cached) — the normal hot path.
+        try:
+            _embedder = TextEmbedding(MODEL_NAME, cache_dir=MODEL_CACHE_DIR)
+            logger.info("Loaded embedding model %s (offline cache)", MODEL_NAME)
+            return _embedder
+        except Exception as offline_err:
+            logger.warning(
+                "Offline model load failed (%s); attempting download via proxy %s",
+                offline_err,
+                PROXY_URL,
+            )
+
+        # Attempt 2: download via local proxy (HF is geo-blocked in CN).
+        old_https = os.environ.get("HTTPS_PROXY")
+        old_http = os.environ.get("HTTP_PROXY")
+        old_all = os.environ.get("ALL_PROXY")
+        try:
+            os.environ["HTTPS_PROXY"] = PROXY_URL
+            os.environ["HTTP_PROXY"] = PROXY_URL
+            os.environ["ALL_PROXY"] = PROXY_URL
+            _embedder = TextEmbedding(MODEL_NAME, cache_dir=MODEL_CACHE_DIR)
+            logger.info("Downloaded + loaded embedding model %s via proxy", MODEL_NAME)
+            return _embedder
+        finally:
+            # Restore prior proxy env so we don't leak it to other code.
+            for key, val in (
+                ("HTTPS_PROXY", old_https),
+                ("HTTP_PROXY", old_http),
+                ("ALL_PROXY", old_all),
+            ):
+                if val is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = val
+
+
+def _embed_texts(texts: list[str]) -> np.ndarray:
+    """Embed a list of texts into L2-normalized 512-dim vectors."""
+    if not texts:
+        return np.zeros((0, EMBED_DIM), dtype=np.float32)
+    model = _get_embedder()
+    vecs = list(model.embed(texts))
+    return np.array(vecs, dtype=np.float32)
 
 
 class VectorStore:
@@ -38,7 +120,7 @@ class VectorStore:
       - id: unique identifier
       - domain: knowledge domain
       - text: searchable text (summary + content)
-      - vector: JSON-serialized numpy array
+      - vector: JSON-serialized 512-dim float array (bge-small-zh-v1.5)
       - metadata: JSON dict
     """
 
@@ -46,14 +128,6 @@ class VectorStore:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
-
-        # Embedding components (fitted on demand)
-        self._vectorizer: TfidfVectorizer | None = None
-        self._svd: TruncatedSVD | None = None
-        self._is_fitted = False
-
-        # Refit if database already has entries (e.g., after restart)
-        self._refit_if_needed()
 
     def _init_db(self) -> None:
         """Create tables if not exists."""
@@ -73,53 +147,13 @@ class VectorStore:
             """)
             conn.commit()
 
-    def _fit(self, texts: list[str]) -> None:
-        """Fit the embedding model on the given texts."""
-        if len(texts) == 0:
-            self._is_fitted = False
-            return
-
-        self._vectorizer = TfidfVectorizer(
-            max_features=1000,
-            min_df=1,
-            stop_words="english",
-        )
-        X = self._vectorizer.fit_transform(texts)
-
-        n_features = X.shape[1]
-        n_components = min(DEFAULT_DIM, n_features)
-
-        self._svd = TruncatedSVD(n_components=n_components)
-        self._svd.fit(X)
-        self._is_fitted = True
-
-    def _refit_if_needed(self) -> None:
-        """Refit the embedding model from all existing database entries."""
-        with sqlite3.connect(self.db_path) as conn:
-            rows = conn.execute("SELECT text FROM vectors").fetchall()
-        texts = [r[0] for r in rows]
-        if texts:
-            self._fit(texts)
-
-    def _embed(self, texts: list[str]) -> np.ndarray:
-        """Embed texts into vectors."""
-        if not self._is_fitted or self._vectorizer is None or self._svd is None:
-            # Return zero vectors if not fitted
-            return np.zeros((len(texts), DEFAULT_DIM))
-
-        X = self._vectorizer.transform(texts)
-        return self._svd.transform(X)
-
     def add(self, entry: "KnowledgeEntry") -> None:
         """Add or update a knowledge entry in the vector store."""
         text = f"{entry.summary}\n{entry.content}".strip()
 
-        # v2.8.0: exact (domain, text) dedup guard. The previous code generated
-        # a fresh random uuid per call, so the `INSERT OR REPLACE` never matched
-        # an existing row and every repeated sync appended a brand-new duplicate
-        # — that is how vectors.db grew to 4449 rows from ~120 unique entries.
-        # If a row with the same domain and identical text already exists, this
-        # write is a verbatim duplicate: skip it.
+        # Exact (domain, text) dedup guard. A verbatim duplicate is a no-op.
+        # (Historically a fresh random uuid per call defeated INSERT OR REPLACE
+        # and let vectors.db balloon to 4449 rows from ~120 unique entries.)
         with sqlite3.connect(self.db_path) as conn:
             existing = conn.execute(
                 "SELECT 1 FROM vectors WHERE domain = ? AND text = ? LIMIT 1",
@@ -128,17 +162,10 @@ class VectorStore:
         if existing:
             return
 
-        # Get all existing texts to refit
-        with sqlite3.connect(self.db_path) as conn:
-            rows = conn.execute(
-                "SELECT text FROM vectors WHERE id != ?", (entry.id,)
-            ).fetchall()
-
-        all_texts = [r[0] for r in rows] + [text]
-        self._fit(all_texts)
-
-        # Embed
-        vector = self._embed([text])[0]
+        # bge embeds each text independently — no corpus refit needed. This is
+        # a major simplification over the old TF-IDF path, which had to refit
+        # the whole vocabulary on every single add.
+        vector = _embed_texts([text])[0]
         vector_json = json.dumps(vector.tolist())
 
         metadata = {
@@ -173,11 +200,9 @@ class VectorStore:
         """Semantic search by query string.
 
         Returns list of {id, domain, text, metadata, score} sorted by score.
+        Scores are cosine similarity in [-1, 1]; bge vectors are L2-normalized
+        so this reduces to a dot product.
         """
-        if not self._is_fitted:
-            return []
-
-        # Get candidate vectors
         with sqlite3.connect(self.db_path) as conn:
             if domain:
                 rows = conn.execute(
@@ -192,56 +217,71 @@ class VectorStore:
         if not rows:
             return []
 
-        ids = []
-        texts = []
-        domains = []
-        metadatas = []
+        ids, texts, domains, metadatas = [], [], [], []
         vectors = []
-
         for row in rows:
+            vec = np.array(json.loads(row[3]), dtype=np.float32)
+            # Skip legacy-dimension rows defensively. After rebuild() all rows
+            # are 512-dim; this guards against a half-migrated DB.
+            if vec.shape[0] != EMBED_DIM:
+                continue
             ids.append(row[0])
             domains.append(row[1])
             texts.append(row[2])
-            vec = json.loads(row[3])
-            vectors.append(np.array(vec, dtype=np.float32))
+            vectors.append(vec)
             metadatas.append(json.loads(row[4]) if row[4] else {})
 
-        # Embed query
-        query_vec = self._embed([query])
+        if not vectors:
+            return []
 
-        # Compute similarities - handle different vector dimensions
-        similarities = []
-        for vec in vectors:
-            # Ensure same dimension
-            if len(vec) != len(query_vec[0]):
-                # Pad or truncate
-                target_len = len(query_vec[0])
-                if len(vec) < target_len:
-                    vec = np.pad(vec, (0, target_len - len(vec)))
-                else:
-                    vec = vec[:target_len]
-            sim = cosine_similarity(query_vec.reshape(1, -1), vec.reshape(1, -1))[0][0]
-            similarities.append(sim)
+        query_vec = _embed_texts([query])[0]
+        matrix = np.vstack(vectors)
+        # Vectors are L2-normalized → cosine == dot product.
+        sims = matrix @ query_vec
 
-        similarities = np.array(similarities)
-
-        # Sort by similarity
-        indexed = list(enumerate(similarities))
-        indexed.sort(key=lambda x: x[1], reverse=True)
-
+        order = np.argsort(sims)[::-1]
         results = []
-        for idx, score in indexed[:top_n]:
+        for idx in order[:top_n]:
+            score = float(sims[idx])
             if score <= 0:
                 continue
+            text = texts[idx]
             results.append({
                 "id": ids[idx],
                 "domain": domains[idx],
-                "text": texts[idx][:200] + "..." if len(texts[idx]) > 200 else texts[idx],
+                "text": text[:200] + "..." if len(text) > 200 else text,
                 "metadata": metadatas[idx],
-                "score": round(float(score), 4),
+                "score": round(score, 4),
             })
-
         return results
+
+    def rebuild(self) -> dict:
+        """Re-embed every stored entry with the current model.
+
+        Required after switching embedding models (e.g. TF-IDF-64 →
+        bge-small-zh-512), since old vectors live in an incompatible space.
+        Reads each row's `text`, recomputes its vector in place. Idempotent.
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute("SELECT id, text FROM vectors").fetchall()
+
+        if not rows:
+            return {"rebuilt": 0, "dim": EMBED_DIM}
+
+        ids = [r[0] for r in rows]
+        texts = [r[1] for r in rows]
+        # Batch-embed all texts in one model call.
+        vectors = _embed_texts(texts)
+
+        with sqlite3.connect(self.db_path) as conn:
+            for entry_id, vec in zip(ids, vectors):
+                conn.execute(
+                    "UPDATE vectors SET vector = ? WHERE id = ?",
+                    (json.dumps(vec.tolist()), entry_id),
+                )
+            conn.commit()
+
+        return {"rebuilt": len(ids), "dim": EMBED_DIM}
 
     def stats(self) -> dict:
         """Return store statistics."""
@@ -254,6 +294,10 @@ class VectorStore:
         return {
             "total_entries": count,
             "domains": {d: c for d, c in domains},
-            "is_fitted": self._is_fitted,
+            "model": MODEL_NAME,
+            "dim": EMBED_DIM,
+            # bge has no "fit" step — the store is ready whenever it has rows.
+            # Kept for backward compat with the dashboard's `is_fitted` checks.
+            "is_fitted": count > 0,
             "db_path": str(self.db_path),
         }
