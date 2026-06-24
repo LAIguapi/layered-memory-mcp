@@ -121,7 +121,7 @@ class KnowledgeEntry(BaseModel):
     # Identity
     id: str                    # UUID v4
     domain: str                # L1 file name (e.g., "infra")
-    section: str               # ## heading (e.g., "WSL 代理")
+    section: str               # ## heading (e.g., "本地代理")
     
     # Content
     type: KnowledgeType
@@ -175,9 +175,9 @@ review_status: "approved"
 tags: ["proxy", "wsl", "network"]
 ---
 
-## WSL 代理
+## 本地代理
 
-HTTP proxy configured at `127.0.0.1:20172` for WSL2 external access.
+HTTP proxy configured at `127.0.0.1:8080` for local external access.
 ```
 
 ---

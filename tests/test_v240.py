@@ -19,8 +19,8 @@ def test_summarize_preserves_snake_case():
 
 
 def test_summarize_preserves_path_underscores():
-    out = _summarize_for_l0("读 /root/.secure/pypi-token.txt 文件 some_var_name")
-    assert "pypi-token.txt" in out
+    out = _summarize_for_l0("读 ~/.config/api-token.txt 文件 some_var_name")
+    assert "api-token.txt" in out
     assert "some_var_name" in out
 
 
@@ -118,7 +118,7 @@ def test_audit_todo_without_date_not_stale(kb):
 
 
 def test_audit_detects_cross_file_duplicate(kb):
-    body = ("stock-analyse 永久只在远程云端运行，localhost 是死端口，"
+    body = ("service-api 永久只在远程云端运行，localhost 是死端口，"
             "脚本访问数据必须走远程或 MCP，绝不连 localhost 端口。")
     (kb / "x.md").write_text(f"# x\n\n## 运行环境\n\n{body}\n", encoding="utf-8")
     (kb / "y.md").write_text(f"# y\n\n## 部署铁律\n\n{body}\n", encoding="utf-8")

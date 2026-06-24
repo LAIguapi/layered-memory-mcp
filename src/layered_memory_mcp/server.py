@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import sys
+import threading
 from pathlib import Path
 
 from fastmcp import FastMCP
@@ -66,6 +67,14 @@ def _get_v2_stores():
         _v2_stores["l1"] = L1Store(knowledge_dir)
         _v2_stores["vector"] = VectorStore(data_dir / "vectors.db")
         _v2_stores["review"] = ReviewQueue(data_dir / "review_queue.db")
+        # Warm the embedding model in the background so the first semantic
+        # search doesn't block on a cold load (or a one-time ~55MB download).
+        # Daemon thread: never blocks shutdown, failures are logged softly.
+        threading.Thread(
+            target=_v2_stores["vector"].warmup,
+            name="vector-warmup",
+            daemon=True,
+        ).start()
     return _v2_stores
 
 

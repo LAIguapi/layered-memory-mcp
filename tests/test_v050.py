@@ -29,7 +29,7 @@ class TestL0Manager:
         # Create L1 knowledge files
         knowledge_dir.mkdir()
         (knowledge_dir / "infra.md").write_text(
-            "# Infrastructure\n\n## Proxy\n\nHTTP proxy at 127.0.0.1:20172\n\n## Git\n\nGitHub connection details\n",
+            "# Infrastructure\n\n## Proxy\n\nHTTP proxy at 127.0.0.1:8080\n\n## Git\n\nGitHub connection details\n",
             encoding="utf-8",
         )
         (knowledge_dir / "dev.md").write_text(
@@ -162,7 +162,7 @@ class TestInjector:
             config,
             domain="infra",
             section="Proxy",
-            content="HTTP proxy at 127.0.0.1:20172",
+            content="HTTP proxy at 127.0.0.1:8080",
             mode="upsert",
         )
 
@@ -174,7 +174,7 @@ class TestInjector:
         # Verify file content
         content = (knowledge_dir / "infra.md").read_text(encoding="utf-8")
         assert "## Proxy" in content
-        assert "HTTP proxy at 127.0.0.1:20172" in content
+        assert "HTTP proxy at 127.0.0.1:8080" in content
 
         # Verify L0 was synced
         assert l0_file.exists()
@@ -309,8 +309,8 @@ class TestAutoSyncIntegration:
         inject_knowledge(
             config,
             domain="infra",
-            section="WSL Proxy",
-            content="The WSL HTTP proxy is configured at 127.0.0.1:20172 for accessing external APIs.",
+            section="Network Proxy",
+            content="The HTTP proxy is configured at 127.0.0.1:8080 for accessing external APIs.",
         )
 
         # Step 2: Verify L0 was synced
@@ -324,7 +324,7 @@ class TestAutoSyncIntegration:
         found = False
         for item in results["results"]:
             for section in item.get("sections", []):
-                if "20172" in section.get("content", ""):
+                if "8080" in section.get("content", ""):
                     found = True
                     break
         assert found, "Injected knowledge should be recallable"

@@ -21,10 +21,10 @@ class TestKnowledgeEntry:
     def test_create_entry(self):
         entry = KnowledgeEntry(
             domain="infra",
-            section="WSL Proxy",
+            section="Network Proxy",
             type=KnowledgeType.CONFIG,
-            content="HTTP proxy at 127.0.0.1:20172",
-            summary="WSL2 proxy configuration",
+            content="HTTP proxy at 127.0.0.1:8080",
+            summary="local proxy configuration",
             tags=["proxy", "wsl"],
         )
         assert entry.domain == "infra"
@@ -34,10 +34,10 @@ class TestKnowledgeEntry:
     def test_to_frontmatter(self):
         entry = KnowledgeEntry(
             domain="infra",
-            section="WSL Proxy",
+            section="Network Proxy",
             type=KnowledgeType.CONFIG,
-            content="HTTP proxy at 127.0.0.1:20172",
-            summary="WSL2 proxy configuration",
+            content="HTTP proxy at 127.0.0.1:8080",
+            summary="local proxy configuration",
             tags=["proxy", "wsl"],
         )
         fm = entry.to_frontmatter()
@@ -73,17 +73,17 @@ class TestConfidenceScorer:
     def test_high_confidence(self):
         entry = KnowledgeEntry(
             domain="infra",
-            section="WSL Proxy",
-            content="""HTTP proxy configured at 127.0.0.1:20172 for WSL2.
+            section="Network Proxy",
+            content="""HTTP proxy configured at 127.0.0.1:8080 for local.
 
 Run this command to verify:
 \`\`\`bash
-$ curl -x http://127.0.0.1:20172 https://api.github.com
+$ curl -x http://127.0.0.1:8080 https://api.github.com
 \`\`\`
 
 Test passed — connection verified successfully.
 """,
-            summary="WSL2 proxy config",
+            summary="local proxy config",
             source=SourceInfo(type=SourceType.SESSION, session_id="s1", message_range=(0, 15)),
         )
         score = ConfidenceScorer.score(entry)
@@ -110,9 +110,9 @@ class TestL1Store:
             store = L1Store(Path(tmp))
             entry = KnowledgeEntry(
                 domain="infra",
-                section="WSL Proxy",
+                section="Network Proxy",
                 type=KnowledgeType.CONFIG,
-                content="HTTP proxy at 127.0.0.1:20172",
+                content="HTTP proxy at 127.0.0.1:8080",
             )
             result = store.write(entry)
             assert result["success"]
@@ -137,13 +137,13 @@ class TestVectorStore:
             vs = VectorStore(Path(tmp) / "vectors.db")
             entry = KnowledgeEntry(
                 domain="infra",
-                section="WSL Proxy",
-                content="HTTP proxy at 127.0.0.1:20172 for WSL2 external access",
-                summary="WSL2 proxy config",
+                section="Network Proxy",
+                content="HTTP proxy at 127.0.0.1:8080 for local external access",
+                summary="local proxy config",
             )
             vs.add(entry)
             
-            results = vs.search("How to configure WSL proxy?", top_n=3)
+            results = vs.search("How to configure network proxy?", top_n=3)
             assert len(results) >= 1
             assert results[0]["domain"] == "infra"
 

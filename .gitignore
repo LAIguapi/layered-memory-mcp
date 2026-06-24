@@ -29,3 +29,6 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+
+# Internal audit snapshots — never publish
+KNOWLEDGE_AUDIT_*.md
