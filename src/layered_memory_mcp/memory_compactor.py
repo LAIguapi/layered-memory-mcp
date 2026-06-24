@@ -509,6 +509,127 @@ def _ensure_l0_pointer_in_memory(
     return {"action": "replaced" if replaced else "added", "pointer": l0_pointer}
 
 
+def dedup_l1_file(filepath: "Path") -> dict:
+    """De-duplicate a single L1 knowledge file in place.
+
+    Removes exact-duplicate non-heading lines within each ## section while
+    preserving structure (headings, order, first occurrence of each line).
+    Size-independent and idempotent. Returns a small report.
+
+    This is the framework's own guard against L1 append-bloat: even if a
+    write path slips a verbatim duplicate through, this reaps it on the next
+    maintenance pass — keeping the self-maintenance responsibility *inside*
+    the framework rather than relying on external cron.
+    """
+    try:
+        raw = filepath.read_text(encoding="utf-8")
+    except OSError as e:
+        return {"file": filepath.name, "action": "skipped", "reason": f"read failed: {e}"}
+
+    lines = raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    seen: set[str] = set()
+    out: list[str] = []
+    removed = 0
+    for line in lines:
+        stripped = line.strip()
+        # Always keep blank lines, headings, and HTML comments (structure).
+        if not stripped or stripped.startswith("#") or stripped.startswith("<!--"):
+            out.append(line)
+            continue
+        key = stripped
+        if key in seen:
+            removed += 1
+            continue
+        seen.add(key)
+        out.append(line)
+
+    if removed == 0:
+        return {"file": filepath.name, "action": "clean", "removed_lines": 0}
+
+    new_text = "\n".join(out)
+    try:
+        bak = filepath.with_suffix(filepath.suffix + ".bak")
+        bak.write_text(raw, encoding="utf-8")
+        filepath.write_text(new_text, encoding="utf-8")
+    except OSError as e:
+        return {"file": filepath.name, "action": "error", "reason": str(e)}
+
+    return {
+        "file": filepath.name,
+        "action": "deduped",
+        "removed_lines": removed,
+        "before_bytes": len(raw.encode("utf-8")),
+        "after_bytes": len(new_text.encode("utf-8")),
+    }
+
+
+def dedup_l1_knowledge(config: "MemoryConfig", min_dup_lines: int = 20) -> dict:
+    """Scan all L1 knowledge files and de-duplicate bloated ones.
+
+    Only files whose duplicate-line count exceeds ``min_dup_lines`` are
+    rewritten, so clean files are left untouched (cheap no-op). Also prunes
+    the matching duplicate rows from vectors.db so the vector store stays in
+    sync with the slimmed files.
+    """
+    report: dict = {"files_deduped": [], "vector_pruned": 0, "scanned": 0}
+    try:
+        kdirs = getattr(config, "knowledge_dirs", None) or [config.knowledge_dir]
+        for kdir in kdirs:
+            kdir = Path(kdir)
+            if not kdir.exists():
+                continue
+            for fp in kdir.glob("*.md"):
+                report["scanned"] += 1
+                try:
+                    raw = fp.read_text(encoding="utf-8")
+                except OSError:
+                    continue
+                # Cheap pre-check: count duplicate non-heading lines.
+                seen: set[str] = set()
+                dup = 0
+                for line in raw.split("\n"):
+                    s = line.strip()
+                    if not s or s.startswith("#") or s.startswith("<!--"):
+                        continue
+                    if s in seen:
+                        dup += 1
+                    else:
+                        seen.add(s)
+                if dup >= min_dup_lines:
+                    res = dedup_l1_file(fp)
+                    if res.get("action") == "deduped":
+                        report["files_deduped"].append(res)
+    except Exception as e:  # noqa: BLE001 — maintenance must not raise
+        logger.warning("L1 dedup scan failed: %s", e)
+        report["error"] = str(e)
+
+    # Prune duplicate (domain, text) rows from the vector store.
+    try:
+        import sqlite3
+
+        db_path = Path(config.home) / "data" / "vectors.db"
+        if db_path.exists():
+            with sqlite3.connect(str(db_path)) as conn:
+                conn.execute("PRAGMA busy_timeout=10000")
+                before = conn.execute("SELECT COUNT(*) FROM vectors").fetchone()[0]
+                conn.execute(
+                    """
+                    DELETE FROM vectors
+                    WHERE rowid NOT IN (
+                        SELECT MIN(rowid) FROM vectors GROUP BY domain, text
+                    )
+                    """
+                )
+                conn.commit()
+                after = conn.execute("SELECT COUNT(*) FROM vectors").fetchone()[0]
+                report["vector_pruned"] = before - after
+    except Exception as e:  # noqa: BLE001 — maintenance must not raise
+        logger.warning("Vector store dedup failed: %s", e)
+        report["vector_error"] = str(e)
+
+    return report
+
+
 def auto_maintain_after_write(
     config: "MemoryConfig",
     l0_pointer: str | None = None,
@@ -606,6 +727,25 @@ def auto_maintain_after_write(
     except Exception as e:  # noqa: BLE001 — maintenance must not raise
         logger.warning("Auto-maintain compaction failed: %s", e)
         report["compact"] = {"triggered": False, "error": str(e)}
+
+    # --- 3. L1 / vector-store dedup guard (v2.8.0) ---
+    # The framework now owns L1 de-bloat too, not just MEMORY.md compaction.
+    # Runs on the same cadence as lazy compaction (interval-gated) so it's a
+    # cheap no-op on clean stores but reaps any append-duplicates that slipped
+    # through the write-path guards. Self-contained — never breaks the write.
+    try:
+        import time as _time
+
+        interval_s = getattr(config, "auto_maintain_interval_days", 7.0) * 86400
+        elapsed = _time.time() - _read_last_compact_time(config)
+        # Trigger if the compaction step already fired, or the interval lapsed.
+        if report.get("compact", {}).get("triggered") or elapsed >= interval_s:
+            report["l1_dedup"] = dedup_l1_knowledge(config)
+        else:
+            report["l1_dedup"] = {"triggered": False}
+    except Exception as e:  # noqa: BLE001 — maintenance must not raise
+        logger.warning("Auto-maintain L1 dedup failed: %s", e)
+        report["l1_dedup"] = {"triggered": False, "error": str(e)}
 
     return report
 

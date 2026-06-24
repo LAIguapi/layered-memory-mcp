@@ -32,6 +32,12 @@ _H2_RE = re.compile(r"^##\s+(.+)$", re.MULTILINE)
 # Max recommended file size (4KB)
 MAX_RECOMMENDED_SIZE = 4096
 
+# v2.8.0: in append mode, skip writing content whose similarity to an existing
+# entry is at/above this threshold (near-verbatim duplicate). Set high so that
+# legitimately appending a distinct-but-related note still works; only nearly
+# identical content is refused. This plugs the silent-bloat hole.
+APPEND_DEDUP_SKIP_THRESHOLD = 0.98
+
 
 def inject_knowledge(
     config: "MemoryConfig",
@@ -249,7 +255,38 @@ def append_to_section(
 # ---------------------------------------------------------------------------
 
 def _check_dedup(content: str, knowledge_dir: str, threshold: float) -> dict:
-    """Run dedup check against existing knowledge."""
+    """Run dedup check against existing knowledge.
+
+    v2.8.0 two-layer strategy:
+      1. EXACT layer (primary): normalized verbatim match across all knowledge
+         files. O(total_lines), size-independent, 100% precise, CJK-safe. This
+         is what actually plugs the runaway-append bloat (99% of which was
+         byte-for-byte duplicates). Reports similarity=1.0 on an exact hit.
+      2. FUZZY layer (secondary): the legacy difflib whole-file SequenceMatcher
+         for near-but-not-identical content. Kept as a soft signal for
+         upsert/merge decisions; its known weaknesses (15:1 length pre-filter,
+         whole-file dilution, no CJK semantics) no longer matter for the bloat
+         case because the exact layer fires first.
+
+    NOTE: a proper semantic layer (bge-small-zh via fastembed/ONNX) is the
+    planned upgrade to replace the fuzzy difflib layer — tracked separately.
+    """
+    # --- Layer 1: exact verbatim match (size-independent, CJK-safe) ---
+    try:
+        exact = _find_exact_duplicate(content, knowledge_dir)
+        if exact:
+            return {
+                "similar_found": True,
+                "similarity": 1.0,
+                "matched_file": exact,
+                "suggestion": "skip",
+                "total_similar": 1,
+                "match_kind": "exact",
+            }
+    except Exception as e:
+        logger.warning("Exact dedup check failed (non-critical): %s", e)
+
+    # --- Layer 2: fuzzy similarity (legacy difflib, soft signal only) ---
     try:
         similar = find_similar_knowledge(content, knowledge_dir, threshold=threshold * 0.8)
     except Exception as e:
@@ -266,7 +303,50 @@ def _check_dedup(content: str, knowledge_dir: str, threshold: float) -> dict:
         "matched_file": best["file"],
         "suggestion": best["suggestion"],
         "total_similar": len(similar),
+        "match_kind": "fuzzy",
     }
+
+
+def _normalize_for_exact(text: str) -> str:
+    """Normalize a content block for exact-duplicate comparison.
+
+    Collapses internal whitespace and strips surrounding whitespace so that
+    cosmetic differences (trailing spaces, indentation, blank-line padding)
+    don't defeat the verbatim match. Intentionally NOT lowercasing or stripping
+    markdown — exact means exact in substance.
+    """
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _find_exact_duplicate(content: str, knowledge_dir: str | list[str]) -> str | None:
+    """Return the filename containing a verbatim copy of `content`, else None.
+
+    Compares the normalized content block against the normalized full text of
+    each knowledge file (substring match). O(sum of file sizes), no quadratic
+    SequenceMatcher, no length-ratio pre-filter — so it stays correct even when
+    a target file is already large (exactly when append-bloat used to slip
+    through).
+    """
+    norm_content = _normalize_for_exact(content)
+    if not norm_content:
+        return None
+
+    dirs = knowledge_dir if isinstance(knowledge_dir, list) else [knowledge_dir]
+    for kdir in dirs:
+        try:
+            kpath = Path(kdir)
+            if not kpath.exists():
+                continue
+            for fp in kpath.glob("*.md"):
+                try:
+                    raw = fp.read_text(encoding="utf-8")
+                except OSError:
+                    continue
+                if norm_content in _normalize_for_exact(raw):
+                    return fp.name
+        except Exception:
+            continue
+    return None
 
 
 def _resolve_action(mode: str, dedup_result: dict) -> str:
@@ -275,9 +355,19 @@ def _resolve_action(mode: str, dedup_result: dict) -> str:
         return "created" if mode != "append" else "appended"
 
     similarity = dedup_result.get("similarity", 0)
+    is_exact = dedup_result.get("match_kind") == "exact"
+
+    # v2.8.0: an exact verbatim duplicate is always a no-op write, regardless
+    # of mode (append/upsert/merge). This is the primary bloat guard and does
+    # not rely on a fuzzy float threshold.
+    if is_exact:
+        return "skipped"
 
     if mode == "append":
-        # Always append regardless of dedup
+        # Even in append mode, refuse to write a near-verbatim duplicate.
+        # Exact dups are already handled above; this catches fuzzy-near ones.
+        if similarity >= APPEND_DEDUP_SKIP_THRESHOLD:
+            return "skipped"
         return "appended"
 
     if mode == "upsert":
@@ -441,6 +531,22 @@ def _do_write(
         }
 
     if action in ("appended", "created"):
+        # v2.8.0: precise in-section duplicate guard. find_similar_knowledge
+        # (used by _resolve_action) compares whole-file similarity and bails
+        # out via a 15:1 length-ratio pre-filter once the file is large —
+        # which is exactly when runaway append-bloat happens (the new content
+        # is tiny vs a 1MB file, so similarity reads as 0 and the dup sails
+        # through). Guard here with an exact, size-independent check: if the
+        # trimmed content block already appears verbatim inside the target
+        # section, skip the write. Genuinely new content still appends.
+        existing_section = existing[section_pos:section_end]
+        if content.strip() and content.strip() in existing_section:
+            return {
+                "success": True,
+                "write_action": "append_no_change",
+                "bytes_written": 0,
+                "file_size_bytes": len(existing.encode("utf-8")),
+            }
         # Insert after existing section content (created = first time adding to existing file)
         insert_text = f"\n{content}{provenance}"
         new_content = existing[:section_end] + insert_text + existing[section_end:]

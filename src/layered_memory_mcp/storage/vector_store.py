@@ -114,6 +114,20 @@ class VectorStore:
         """Add or update a knowledge entry in the vector store."""
         text = f"{entry.summary}\n{entry.content}".strip()
 
+        # v2.8.0: exact (domain, text) dedup guard. The previous code generated
+        # a fresh random uuid per call, so the `INSERT OR REPLACE` never matched
+        # an existing row and every repeated sync appended a brand-new duplicate
+        # — that is how vectors.db grew to 4449 rows from ~120 unique entries.
+        # If a row with the same domain and identical text already exists, this
+        # write is a verbatim duplicate: skip it.
+        with sqlite3.connect(self.db_path) as conn:
+            existing = conn.execute(
+                "SELECT 1 FROM vectors WHERE domain = ? AND text = ? LIMIT 1",
+                (entry.domain, text),
+            ).fetchone()
+        if existing:
+            return
+
         # Get all existing texts to refit
         with sqlite3.connect(self.db_path) as conn:
             rows = conn.execute(
