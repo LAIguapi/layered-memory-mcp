@@ -18,6 +18,7 @@ from layered_memory_mcp.memory_compactor import (
     compact_memory,
     _parse_entries,
     _is_index_entry,
+    is_oversized_index_entry,
     _suggest_migration,
     _get_domain_rules,
     _FALLBACK_DOMAIN_RULES,
@@ -102,11 +103,18 @@ class TestMemoryCompaction:
         """Should correctly identify L0 index entries."""
         assert _is_index_entry("[L0索引] infra: proxy → knowledge/infra.md")
         assert _is_index_entry("[L0索引] dev: principles → knowledge/dev.md")
-        # Too long = bloat even with L0 prefix
+        # Over-long L0 pointer is STILL an index entry (regression guard):
+        # length must never reclassify a pointer as bloat, or compact_memory
+        # migrates it back into L1 and dual_write re-nests the [L0] prefix,
+        # producing the runaway "[L0] [L0] [L0] …" loop.
         long_entry = "[L0索引] infra: " + "x" * 200
-        assert not _is_index_entry(long_entry)
+        assert _is_index_entry(long_entry)
+        assert is_oversized_index_entry(long_entry)  # but flagged for trimming
+        # A normal-length pointer is not oversized
+        assert not is_oversized_index_entry("[L0索引] infra: proxy → knowledge/infra.md")
         # No L0 prefix
         assert not _is_index_entry("Random content about stuff")
+        assert not is_oversized_index_entry("Random content about stuff")
 
     def test_suggest_migration_with_custom_rules(self, tmp_path):
         """Should suggest correct domain based on custom rules from YAML config."""
@@ -313,6 +321,39 @@ class TestMemoryCompaction:
         result = compact_memory(config, memory_path=str(memory_file))
         assert result["success"] is True
         assert result["migrated_count"] == 0
+
+    def test_oversized_l0_pointer_not_migrated(self, tmp_path):
+        """Regression: an over-long L0 pointer must NOT be migrated to L1.
+
+        Previously _is_index_entry() reclassified any L0 pointer longer than
+        MAX_INDEX_ENTRY_LENGTH as bloat. compact_memory then injected it into
+        the L1 file body, dual_write regenerated a nested "[L0] [L0] …"
+        pointer, and the next cycle nested it again — an unbounded loop that
+        corrupted both memory and the L1 file. Guard: oversized pointers stay
+        put, nothing migrates, and no extra [L0] layer appears.
+        """
+        knowledge_dir = tmp_path / "knowledge"
+        knowledge_dir.mkdir()
+        memory_file = tmp_path / "MEMORY.md"
+
+        oversized = "[L0索引] infra: " + "超长摘要" * 60 + " → knowledge/infra.md"
+        assert len(oversized) > 120  # precondition: would have tripped the old gate
+        memory_file.write_text(oversized, encoding="utf-8")
+
+        config = MemoryConfig(
+            home=str(tmp_path),
+            knowledge_dir=str(knowledge_dir),
+        )
+
+        result = compact_memory(config, memory_path=str(memory_file))
+        assert result["success"] is True
+        assert result["migrated_count"] == 0          # nothing treated as bloat
+        # L1 file must not have been created from the pointer
+        assert not (knowledge_dir / "infra.md").exists()
+        # Memory still holds exactly one [L0] entry — no nesting
+        cleaned = memory_file.read_text(encoding="utf-8")
+        assert cleaned.count("[L0索引]") == 1
+        assert cleaned.count("[L0]") == 0
 
 
 class TestValidateMemoryBloat:

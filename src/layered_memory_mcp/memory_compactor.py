@@ -774,14 +774,30 @@ def _parse_entries(raw: str, separator: str = "§") -> list[str]:
 def _is_index_entry(entry: str, config=None) -> bool:
     """Determine if an entry is a proper L0 index pointer.
 
-    Valid L0 entries:
-      - Start with the configured L0 tag (default: [L0])
-      - Are reasonably short (under MAX_INDEX_ENTRY_LENGTH)
+    Valid L0 entries start with the configured L0 tag (default: [L0]).
+
+    Length is NOT a disqualifier: an entry carrying the L0 prefix is an
+    index pointer regardless of how long its summary is. Treating an
+    over-long L0 pointer as "bloat" caused a self-feeding loop —
+    compact_memory() migrated it back into the L1 file body, dual_write
+    then regenerated a (now nested) L0 pointer, and each cycle appended
+    another "[L0] …" layer. An over-long summary is a separate concern
+    (see is_oversized_index_entry) and must never route the pointer into L1.
     """
-    if _get_l0_pattern(config).match(entry):
-        # Even L0 entries can be bloated if too long
-        return len(entry) <= MAX_INDEX_ENTRY_LENGTH
-    return False
+    return bool(_get_l0_pattern(config).match(entry))
+
+
+def is_oversized_index_entry(entry: str, config=None) -> bool:
+    """True for an L0 pointer whose summary exceeds the recommended length.
+
+    Diagnostic only — an oversized pointer is still an index entry and must
+    stay in agent memory. Callers may surface this to suggest trimming the
+    summary, but must NOT migrate the entry to L1 on its basis.
+    """
+    return (
+        bool(_get_l0_pattern(config).match(entry))
+        and len(entry) > MAX_INDEX_ENTRY_LENGTH
+    )
 
 
 def _suggest_migration(entry: str, domain_rules: list[tuple[str, list[str]]] | None = None, config=None) -> dict:

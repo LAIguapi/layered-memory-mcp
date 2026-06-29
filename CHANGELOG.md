@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.9.2] - 2026-06-29
+
+### Fixed — Runaway `[L0]` nesting loop (compaction ate its own index pointers)
+
+An over-long L0 index pointer was misclassified as migratable "bloat",
+creating a self-feeding loop that corrupted both agent memory and L1 files.
+
+**Root cause:** `_is_index_entry()` required an L0 pointer to be **both**
+`[L0]`-prefixed **and** shorter than `MAX_INDEX_ENTRY_LENGTH` (120 chars).
+A pointer with a long summary failed the length test, so `compact_memory()`
+treated it as bloat and `inject_knowledge`-ed it back into the L1 file body.
+That write triggered `dual_write`, which regenerated an L0 pointer now
+prefixed with the *previous* pointer text — `[L0] x: [L0] x: …`. Each
+compaction cycle nested one more `[L0]` layer, unbounded. Observed in the
+wild as dozens of `[L0] [L0] [L0] …` garbage sections inside L1 files after
+high-frequency `inject_knowledge` calls.
+
+**Fix:** length no longer disqualifies an index entry. `_is_index_entry()`
+returns true for **any** `[L0]`-prefixed entry, so pointers are never routed
+into L1. Over-length is now a separate, non-routing diagnostic exposed via
+the new `is_oversized_index_entry()` (callers may suggest trimming the
+summary, but must keep the pointer in memory). Regression tests assert an
+oversized pointer is still an index entry and survives a real `compact_memory`
+run without migration or `[L0]` nesting.
+
 ## [2.7.0] - 2026-06-21
 
 ### Fixed — Dynamic agent-memory limit detection (root-cause of silent bloat)
