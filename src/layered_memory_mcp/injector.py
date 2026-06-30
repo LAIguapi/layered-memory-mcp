@@ -204,8 +204,12 @@ def inject_knowledge(
             dw = (maint or {}).get("dual_write") or {}
             if dw.get("action") in ("added", "replaced", "present"):
                 result["hint"] = "L0 pointer auto-written to agent memory by framework."
-        except Exception:
-            pass  # Maintenance is non-critical; never break the primary write.
+        except Exception as e:  # noqa: BLE001 — maintenance must not break writes
+            # v2.9.3: was a silent `pass`, which hid dual-write/dedup failures
+            # and let duplicate L0 pointers accumulate undetected. Log it (and
+            # surface a soft flag) while still never breaking the primary write.
+            logger.warning("auto_maintain after inject failed (non-critical): %s", e)
+            result["auto_maintain_error"] = str(e)
     else:
         # Auto-maintain disabled — fall back to legacy advisory warning so the
         # agent can compact manually.
@@ -652,17 +656,29 @@ def sync_to_vector_store(
     domain: str,
     content: str,
     summary: str = "",
+    replace_domain: bool = False,
 ) -> dict:
     """Sync a knowledge entry to the vector store for semantic search.
 
     Called after every successful write to L1 (inject/append/update/create).
     Idempotent — existing entries are updated, new ones are added.
 
+    Two modes:
+      - Default (replace_domain=False): add a single entry for ``content``.
+        Used by section-level writes (inject_knowledge), where ``content`` is
+        one section's body.
+      - Full rebuild (replace_domain=True): ``content`` is the WHOLE L1 file.
+        Delete every existing vector for ``domain`` then re-add one vector per
+        ``## section``. This keeps vectors.db strictly in sync with the file
+        for whole-file writes (update/create_knowledge_file), instead of
+        leaving the previous section vectors behind as orphans.
+
     Args:
         data_dir: Path to the data directory containing vectors.db
         domain: Knowledge domain (e.g. "infra")
-        content: Full content of the entry
+        content: Section body (default mode) or full file text (rebuild mode)
         summary: One-line summary for indexing
+        replace_domain: When True, rebuild the whole domain from ``content``.
 
     Returns:
         dict with success status
@@ -670,13 +686,54 @@ def sync_to_vector_store(
     try:
         from .storage.vector_store import VectorStore
         from .models import KnowledgeEntry, SourceInfo, SourceType, ReviewStatus, KnowledgeType
+        import re
+        import sqlite3
         import uuid
 
         db_path = Path(data_dir) / "vectors.db"
         vector_store = VectorStore(db_path)
 
-        text = (summary + "\n" + content).strip() if summary else content.strip()
+        def _make_entry(section: str, body: str) -> "KnowledgeEntry":
+            return KnowledgeEntry(
+                id=str(uuid.uuid4()),
+                domain=domain,
+                section=section,
+                content=body,
+                summary=section,
+                type=KnowledgeType.FACT,
+                confidence=0.9,
+                review_status=ReviewStatus.APPROVED,
+                source=SourceInfo(type=SourceType.MANUAL, extracted_by="auto_sync"),
+            )
 
+        if replace_domain:
+            # Whole-file write: rebuild the domain section-by-section so the
+            # vector store mirrors the file exactly (no leftover orphans).
+            if db_path.exists():
+                with sqlite3.connect(db_path) as conn:
+                    conn.execute("DELETE FROM vectors WHERE domain = ?", (domain,))
+                    conn.commit()
+                vector_store._invalidate_cache()
+
+            # Parse "## section\n body" blocks; skip the file-level "# title"
+            # header and blockquote intro (they carry no recall value).
+            added = 0
+            parts = re.split(r"\n(?=## )", content)
+            for part in parts:
+                m = re.match(r"^##\s+(.+?)\n(.*)", part.strip(), re.DOTALL)
+                if not m:
+                    continue
+                section = m.group(1).strip()
+                body = m.group(2).strip()
+                if not body:
+                    continue
+                vector_store.add(_make_entry(section, f"{section}\n{body}"))
+                added += 1
+
+            logger.debug("Rebuilt vector store domain=%s sections=%d", domain, added)
+            return {"success": True, "action": "vector_rebuilt", "domain": domain, "sections": added}
+
+        text = (summary + "\n" + content).strip() if summary else content.strip()
         entry = KnowledgeEntry(
             id=str(uuid.uuid4()),
             domain=domain,

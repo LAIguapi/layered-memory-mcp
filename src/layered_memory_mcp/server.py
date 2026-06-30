@@ -666,14 +666,36 @@ async def create_knowledge_file(filename: str, content: str) -> str:
         # v0.5.0: auto-sync L0 index
         sync_report = await asyncio.to_thread(auto_sync_if_enabled, config)
 
-        # v2.2.0: sync to vector store
+        # v2.2.0 + v2.9.3: rebuild the domain's vectors from the whole file so
+        # vectors.db mirrors the file (one vector per ## section).
         domain = filename.removesuffix(".md")
         await asyncio.to_thread(
             sync_to_vector_store,
             data_dir=config.home / "data",
             domain=domain,
             content=content,
+            replace_domain=True,
         )
+
+        # v2.9.3: dual-write completion — write the new domain's L0 pointer into
+        # agent memory (added or stale-replaced), same as inject_knowledge.
+        dual_write = None
+        if getattr(config, "auto_maintain", True):
+            try:
+                from .memory_compactor import _ensure_l0_pointer_in_memory
+                from .injector import _summarize_for_l0
+
+                tag = getattr(config, "l0_tag", "[L0]")
+                l0_pointer = (
+                    f"{tag} {domain}: {_summarize_for_l0(content)} "
+                    f"→ knowledge/{filename}"
+                )
+                dual_write = await asyncio.to_thread(
+                    _ensure_l0_pointer_in_memory, l0_pointer, config
+                )
+            except Exception as e:  # noqa: BLE001 — maintenance is non-critical
+                logger.warning("create dual-write failed (non-critical): %s", e)
+                dual_write = {"action": "error", "error": str(e)}
 
         result = {
             "success": True,
@@ -684,6 +706,8 @@ async def create_knowledge_file(filename: str, content: str) -> str:
         }
         if sync_report:
             result["l0_sync"] = sync_report
+        if dual_write:
+            result["dual_write"] = dual_write
         return json.dumps(result)
     except Exception as e:
         logger.error("Failed to create %s: %s", filename, e)
@@ -725,14 +749,40 @@ async def update_knowledge_file(filename: str, content: str) -> str:
         # v0.5.0: auto-sync L0 index
         sync_report = await asyncio.to_thread(auto_sync_if_enabled, config)
 
-        # v2.2.0: sync to vector store
+        # v2.2.0 + v2.9.3: rebuild the domain's vectors from the whole file so
+        # vectors.db mirrors the file (no leftover section orphans).
         domain = filename.removesuffix(".md")
         await asyncio.to_thread(
             sync_to_vector_store,
             data_dir=config.home / "data",
             domain=domain,
             content=content,
+            replace_domain=True,
         )
+
+        # v2.9.3: dual-write completion. Whole-file writes previously bypassed
+        # the L1↔agent-memory dual-write (only inject_knowledge ran it), so the
+        # domain's L0 pointer in agent memory was never refreshed/deduped.
+        # Generate the pointer and reconcile it (added or stale-replaced).
+        dual_write = None
+        if getattr(config, "auto_maintain", True):
+            try:
+                from .memory_compactor import (
+                    _ensure_l0_pointer_in_memory,
+                )
+                from .injector import _summarize_for_l0
+
+                tag = getattr(config, "l0_tag", "[L0]")
+                l0_pointer = (
+                    f"{tag} {domain}: {_summarize_for_l0(content)} "
+                    f"→ knowledge/{filename}"
+                )
+                dual_write = await asyncio.to_thread(
+                    _ensure_l0_pointer_in_memory, l0_pointer, config
+                )
+            except Exception as e:  # noqa: BLE001 — maintenance is non-critical
+                logger.warning("update dual-write failed (non-critical): %s", e)
+                dual_write = {"action": "error", "error": str(e)}
 
         result = {
             "success": True,
@@ -744,6 +794,8 @@ async def update_knowledge_file(filename: str, content: str) -> str:
         }
         if sync_report:
             result["l0_sync"] = sync_report
+        if dual_write:
+            result["dual_write"] = dual_write
         return json.dumps(result)
     except Exception as e:
         logger.error("Failed to update %s: %s", filename, e)
@@ -793,6 +845,22 @@ async def delete_knowledge_file(filename: str) -> str:
             domain=domain,
         )
 
+        # v2.9.3: reap the dangling L0 pointer from agent memory. Deletes
+        # previously left a stale "[L0] <domain>: … → knowledge/<file>" entry
+        # behind (only the L0 index + vectors were cleaned), so recall kept
+        # surfacing a pointer to a file that no longer exists.
+        pointer_cleanup = None
+        if getattr(config, "auto_maintain", True):
+            try:
+                from .memory_compactor import _remove_l0_pointer_from_memory
+
+                pointer_cleanup = await asyncio.to_thread(
+                    _remove_l0_pointer_from_memory, domain, config
+                )
+            except Exception as e:  # noqa: BLE001 — maintenance is non-critical
+                logger.warning("delete pointer cleanup failed (non-critical): %s", e)
+                pointer_cleanup = {"action": "error", "error": str(e)}
+
         result = {
             "success": True,
             "action": "deleted",
@@ -800,6 +868,8 @@ async def delete_knowledge_file(filename: str) -> str:
             "deleted_size_bytes": old_size,
             "l0_synced": sync_report is not None,
         }
+        if pointer_cleanup:
+            result["pointer_cleanup"] = pointer_cleanup
         if sync_report:
             result["l0_sync"] = sync_report
         return json.dumps(result)

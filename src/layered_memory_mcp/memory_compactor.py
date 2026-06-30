@@ -509,6 +509,80 @@ def _ensure_l0_pointer_in_memory(
     return {"action": "replaced" if replaced else "added", "pointer": l0_pointer}
 
 
+def _remove_l0_pointer_from_memory(
+    domain_or_file: str,
+    config: "MemoryConfig",
+    memory_path: Path | None = None,
+) -> dict:
+    """Remove any L0 index pointer(s) for a domain/L1 file from agent memory.
+
+    The framework owns the L1↔agent-memory dual-write, so when an L1 file is
+    deleted the framework must also reap the dangling pointer it once wrote —
+    otherwise the deleted file leaves a stale "[L0] … → knowledge/<file>"
+    entry that recall and the L0 index will keep surfacing.
+
+    Matches an entry if it is an L0 index pointer (carries the [L0] tag) AND
+    references the target file (``knowledge/<file>`` or the bare domain after
+    the tag). Returns {action: removed|absent|skipped, removed: N}.
+    """
+    path = memory_path or _resolve_memory_path(None, config)
+    if not path or not path.exists():
+        return {"action": "skipped", "reason": "memory path not resolvable"}
+
+    # Normalize: accept "infra", "infra.md", or "knowledge/infra.md"
+    base = domain_or_file.strip()
+    base = base.rsplit("/", 1)[-1]  # drop any knowledge/ prefix
+    domain = base[:-3] if base.endswith(".md") else base
+    target_file = f"knowledge/{domain}.md"
+
+    separator = _resolve_separator(path, config)
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as e:
+        return {"action": "skipped", "reason": f"read failed: {e}"}
+
+    entries = _parse_entries(raw, separator=separator) if raw.strip() else []
+    if not entries:
+        return {"action": "absent", "removed": 0}
+
+    kept, removed = [], 0
+    for e in entries:
+        if _is_index_entry(e, config) and (
+            target_file in e or _pointer_domain_matches(e, domain, config)
+        ):
+            removed += 1
+            continue
+        kept.append(e)
+
+    if removed == 0:
+        return {"action": "absent", "removed": 0}
+
+    joined = f"\n{separator}\n".join(kept)
+    if kept:
+        joined += "\n"
+    try:
+        path.write_text(joined, encoding="utf-8")
+    except OSError as e:
+        return {"action": "skipped", "reason": f"write failed: {e}"}
+
+    return {"action": "removed", "removed": removed}
+
+
+def _pointer_domain_matches(entry: str, domain: str, config=None) -> bool:
+    """True if an L0 pointer's domain label equals ``domain``.
+
+    Pointer shape: "[L0] <domain>: <summary> → knowledge/<file>.md". This
+    extracts the <domain> label right after the tag and compares it, so we can
+    reap pointers even if the "→ knowledge/<file>" tail was lost.
+    """
+    tag = getattr(config, "l0_tag", "[L0]") if config else "[L0]"
+    body = entry.strip()
+    if body.startswith(tag):
+        body = body[len(tag):].strip()
+    label = body.split(":", 1)[0].strip()
+    return label == domain
+
+
 def dedup_l1_file(filepath: "Path") -> dict:
     """De-duplicate a single L1 knowledge file in place.
 
