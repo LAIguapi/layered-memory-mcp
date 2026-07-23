@@ -51,7 +51,7 @@
 
 ### 5. Knowledge Extractor (`extractor/knowledge_extractor.py`)
 - Rule-based type detection
-- Domain inference (infra/dev/content/trading)
+- Domain inference (user-configured domain keywords)
 - Context extraction (±3 messages)
 - Confidence scoring
 

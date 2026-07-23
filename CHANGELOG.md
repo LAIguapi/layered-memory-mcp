@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.11.0] - 2026-07-23
+
+### BREAKING — Domain classification unified to a single config source
+
+- **Compaction no longer ships a built-in `_FALLBACK_DOMAIN_RULES` preset
+  table, and no longer reads `compact_domain_rules_file`.** Domain
+  classification is now sourced exclusively from `config.domain_keywords`, the
+  single data source shared by both the auto-extractor and compaction. With no
+  configured table the framework makes no assumption — extracted entries stay
+  `general` and compaction offers no migration suggestion.
+
+### Added
+
+- **`MemoryConfig` now reads `domain_keywords` from `<home>/config.yaml`.**
+  Previously the config object never read its own `config.yaml` for this field,
+  so a migrated file was silently ignored. Resolution priority is now
+  constructor argument > `LAYERED_MEMORY_DOMAIN_KEYWORDS` env var >
+  `config.yaml` > empty table. A malformed `config.yaml` degrades to an empty
+  table instead of crashing start-up.
+- **New `layered-memory-migrate` CLI** (`--config`, `--dry-run`, `--force`).
+  Writes a classic technical-domain default table (`infra`/`dev`/`docs`) into
+  the user's `config.yaml` in one shot. Idempotent — it never overwrites an
+  existing `domain_keywords` section unless `--force` is passed, and preserves
+  the rest of the file. Users upgrading from a version with built-in presets
+  run this once to restore automatic classification.
+
+### Changed
+
+- `memory_compactor` gains a pure `_dict_to_rules` helper as the single reshape
+  point from the `domain_keywords` dict to the internal rule tuples.
+
 ## [2.10.1] - 2026-07-23
 
 ### Changed — Auto-extractor domain classification is now fully user-configurable

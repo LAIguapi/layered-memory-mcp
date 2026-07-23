@@ -66,18 +66,6 @@ MAX_INDEX_ENTRY_LENGTH = 120
 _DEFAULT_MEMORY_MAX_CHARS = 50_000
 _HERMES_DEFAULT_MEMORY_MAX_CHARS = 2_000
 
-# Generic fallback domain rules — only common English keywords.
-# These are used when no YAML config file is provided.
-_FALLBACK_DOMAIN_RULES: list[tuple[str, list[str]]] = [
-    ("infra", ["proxy", "server", "docker", "ssh", "network", "deploy",
-               "config", "cloud", "kubernetes", "nginx", "dns", "firewall",
-               "linux", "shell", "bash", "cron"]),
-    ("dev", ["principle", "testing", "DRY", "design", "refactor",
-             "code review", "TDD", "architecture", "pattern"]),
-    ("docs", ["readme", "documentation", "guide", "tutorial", "how-to"]),
-]
-
-
 def _resolve_memory_path(
     memory_path: str | Path | None = None,
     config: "MemoryConfig | None" = None,
@@ -122,55 +110,38 @@ def _resolve_separator(
 # Domain rules loader
 # ---------------------------------------------------------------------------
 
-def _load_domain_rules_from_config(config) -> list[tuple[str, list[str]]]:
-    """Load domain rules from config (YAML file or MemoryConfig object).
+def _dict_to_rules(dk: dict[str, list[str]] | None) -> list[tuple[str, list[str]]]:
+    """Convert a ``{domain: [keyword, ...]}`` mapping to ``(domain, keywords)``.
 
-    Priority:
-      1. config.load_domain_rules() if available (MemoryConfig)
-      2. config.compact_domain_rules_file if it's a path to a YAML
-      3. Return None to signal "use fallback"
+    Pure transformation — the single point that reshapes the unified data
+    source (``config.domain_keywords``) into the tuple form the compaction
+    engine consumes. Non-dict input (or ``None``) yields an empty list. Values
+    are coerced to lists of strings so callers see a consistent shape.
     """
-    if config is None:
-        return None
-
-    # MemoryConfig objects have the helper method
-    if hasattr(config, "load_domain_rules"):
-        rules_dict = config.load_domain_rules()
-        if rules_dict:
-            return [(domain, keywords) for domain, keywords in rules_dict.items()]
-
-    # Direct path to a YAML file
-    rules_path = getattr(config, "compact_domain_rules_file", None)
-    if rules_path is None:
-        return None
-    rules_path = Path(rules_path) if not isinstance(rules_path, Path) else rules_path
-    if not rules_path.exists():
-        return None
-
-    import yaml
-    with open(rules_path, "r", encoding="utf-8") as fh:
-        data = yaml.safe_load(fh)
-    if not isinstance(data, dict):
-        return None
-
+    if not isinstance(dk, dict):
+        return []
     rules: list[tuple[str, list[str]]] = []
-    for domain, keywords in data.items():
+    for domain, keywords in dk.items():
         if isinstance(keywords, list):
             rules.append((str(domain), [str(k) for k in keywords]))
         elif isinstance(keywords, str):
             rules.append((str(domain), [keywords]))
-    return rules if rules else None
+    return rules
 
 
 def _get_domain_rules(config: "MemoryConfig | None" = None) -> list[tuple[str, list[str]]]:
-    """Get domain rules, falling back to generic defaults.
+    """Derive domain rules solely from ``config.domain_keywords``.
+
+    This is the single unified data source shared with the auto-extractor —
+    the framework ships **no** built-in preset table. When no user table is
+    configured the result is empty, and compaction simply makes no migration
+    suggestion (every unmatched entry stays "misc"), mirroring the extractor's
+    "everything is general" behaviour.
 
     Returns a list of (domain, [keywords]) tuples.
     """
-    custom = _load_domain_rules_from_config(config)
-    if custom:
-        return custom
-    return _FALLBACK_DOMAIN_RULES
+    dk = getattr(config, "domain_keywords", None) if config is not None else None
+    return _dict_to_rules(dk)
 
 
 # ---------------------------------------------------------------------------
@@ -905,12 +876,13 @@ def _suggest_migration(entry: str, domain_rules: list[tuple[str, list[str]]] | N
 
     Args:
         entry: The memory entry text.
-        domain_rules: List of (domain, [keywords]) tuples. If None, uses
-            generic fallback rules.
+        domain_rules: List of (domain, [keywords]) tuples. If None, no keyword
+            table is applied — entries only classify via an explicit L0 tag,
+            otherwise fall back to "misc".
         config: MemoryConfig instance (for l0_tag).
     """
     if domain_rules is None:
-        domain_rules = _FALLBACK_DOMAIN_RULES
+        domain_rules = []
 
     entry_lower = entry.lower()
 

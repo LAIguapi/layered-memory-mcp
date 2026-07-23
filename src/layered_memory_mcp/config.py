@@ -118,6 +118,44 @@ def _env_json_dict(name: str, default: dict[str, list[str]]) -> dict[str, list[s
     return result
 
 
+def _coerce_domain_keywords(data: object) -> dict[str, list[str]]:
+    """Normalise a raw ``{domain: [keyword, ...]}`` mapping.
+
+    Accepts a dict whose values are lists (or a single string) and coerces
+    everything to ``dict[str, list[str]]``. Anything else yields ``{}``.
+    """
+    if not isinstance(data, dict):
+        return {}
+    result: dict[str, list[str]] = {}
+    for domain, keywords in data.items():
+        if isinstance(keywords, list):
+            result[str(domain)] = [str(k) for k in keywords]
+        elif isinstance(keywords, str):
+            result[str(domain)] = [keywords]
+    return result
+
+
+def _load_domain_keywords_from_yaml(home: Path) -> dict[str, list[str]]:
+    """Read the ``domain_keywords`` section from ``<home>/config.yaml``.
+
+    This is the file written by the ``layered-memory-migrate`` CLI. Returns an
+    empty dict when the file is missing, unreadable, not a mapping, or has no
+    ``domain_keywords`` section. Never raises — a broken config.yaml must not
+    crash server start-up; it simply means "no user table configured".
+    """
+    path = home / "config.yaml"
+    if not path.exists():
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = yaml.safe_load(fh)
+    except (OSError, yaml.YAMLError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return _coerce_domain_keywords(data.get("domain_keywords"))
+
+
 class MemoryConfig:
     """Runtime configuration for the memory server."""
     
@@ -299,11 +337,18 @@ class MemoryConfig:
         # framework ships **no** business presets — domain inference is opt-in.
         # Maps ``domain_name -> [keyword, ...]``; when empty (the default), the
         # extractor makes no assumption and tags everything as its fallback
-        # ("general"). Configured via config.yaml, constructor arg, or the
-        # LAYERED_MEMORY_DOMAIN_KEYWORDS env var (JSON object).
+        # ("general"). Resolution priority (highest first):
+        #   1. constructor argument
+        #   2. LAYERED_MEMORY_DOMAIN_KEYWORDS env var (JSON object)
+        #   3. `domain_keywords:` section of <home>/config.yaml
+        #      (written by the `layered-memory-migrate` CLI)
+        #   4. empty table (framework ships no presets)
         self.domain_keywords: dict[str, list[str]] = (
             domain_keywords if domain_keywords is not None
-            else _env_json_dict("LAYERED_MEMORY_DOMAIN_KEYWORDS", {})
+            else _env_json_dict(
+                "LAYERED_MEMORY_DOMAIN_KEYWORDS",
+                _load_domain_keywords_from_yaml(self.home),
+            )
         )
 
         # v1.2: L0 index entry tag — configurable for i18n (default: "[L0]")

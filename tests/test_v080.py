@@ -21,7 +21,7 @@ from layered_memory_mcp.memory_compactor import (
     is_oversized_index_entry,
     _suggest_migration,
     _get_domain_rules,
-    _FALLBACK_DOMAIN_RULES,
+    _dict_to_rules,
 )
 
 
@@ -117,74 +117,71 @@ class TestMemoryCompaction:
         assert not is_oversized_index_entry("Random content about stuff")
 
     def test_suggest_migration_with_custom_rules(self, tmp_path):
-        """Should suggest correct domain based on custom rules from YAML config."""
-        # Create a YAML rules file
-        rules_file = tmp_path / "domain_rules.yaml"
-        rules_file.write_text(
-            "trading:\n  - 'backtest'\n  - 'strategy'\n  - 'signal'\n"
-            "infra:\n  - 'docker'\n  - 'proxy'\n  - 'server'\n"
-            "content:\n  - 'article'\n  - 'publishing'\n",
-            encoding="utf-8",
-        )
-
+        """Should suggest correct domain based on config.domain_keywords."""
         knowledge_dir = tmp_path / "knowledge"
         knowledge_dir.mkdir()
 
+        # The unified data source is config.domain_keywords (neutral domains).
         config = MemoryConfig(
             home=str(tmp_path),
             knowledge_dir=str(knowledge_dir),
-            compact_domain_rules_file=str(rules_file),
+            domain_keywords={
+                "database": ["sql", "query", "index"],
+                "networking": ["tcp", "dns", "proxy"],
+                "docs": ["readme", "guide"],
+            },
         )
 
         domain_rules = _get_domain_rules(config)
 
-        entry = "Backtest strategy v3.4A verified as optimal"
+        entry = "Optimize the sql query and rebuild the index"
         result = _suggest_migration(entry, domain_rules=domain_rules)
-        assert result["domain"] == "trading"
+        assert result["domain"] == "database"
 
-        entry = "Docker proxy port 8080 configuration"
+        entry = "Configure the dns proxy over tcp"
         result = _suggest_migration(entry, domain_rules=domain_rules)
-        assert result["domain"] == "infra"
+        assert result["domain"] == "networking"
 
-        entry = "Article publishing API key configuration"
+        entry = "Update the readme and the setup guide"
         result = _suggest_migration(entry, domain_rules=domain_rules)
-        assert result["domain"] == "content"
+        assert result["domain"] == "docs"
 
         # Unknown domain → misc
         entry = "Something completely unrelated"
         result = _suggest_migration(entry, domain_rules=domain_rules)
         assert result["domain"] == "misc"
 
-    def test_suggest_migration_fallback_rules(self):
-        """Fallback rules should match generic English keywords."""
-        # No config → fallback rules
+    def test_suggest_migration_no_table_yields_misc(self):
+        """With no keyword table, non-L0 entries fall back to misc.
+
+        The framework ships zero presets — an empty/None domain_rules means no
+        keyword classification is applied.
+        """
         result = _suggest_migration("Configure the proxy server for deployment")
-        assert result["domain"] == "infra"
+        assert result["domain"] == "misc"
 
         result = _suggest_migration("Follow TDD principles for code review")
-        assert result["domain"] == "dev"
+        assert result["domain"] == "misc"
 
-        # Unknown → misc
         result = _suggest_migration("Something completely unrelated to anything")
         assert result["domain"] == "misc"
 
-    def test_suggest_migration_no_config_uses_fallback(self, tmp_path):
-        """Without a config file, fallback rules should be used."""
+    def test_get_domain_rules_no_config_is_empty(self, tmp_path):
+        """Without a configured domain_keywords table, rules are empty (no fallback)."""
         knowledge_dir = tmp_path / "knowledge"
         knowledge_dir.mkdir()
 
-        # No compact_domain_rules_file specified
         config = MemoryConfig(
             home=str(tmp_path),
             knowledge_dir=str(knowledge_dir),
         )
 
         domain_rules = _get_domain_rules(config)
-        assert domain_rules == _FALLBACK_DOMAIN_RULES
+        assert domain_rules == []
 
-        # Should match generic infra keyword
+        # No table → even keyword-rich content routes to misc.
         result = _suggest_migration("Docker deploy config for nginx", domain_rules=domain_rules)
-        assert result["domain"] == "infra"
+        assert result["domain"] == "misc"
 
     def test_suggest_migration_l0_tag_extraction(self):
         """L0 index tag domain should be used directly."""
