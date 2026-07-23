@@ -5,6 +5,7 @@ All paths are configurable via environment variables or constructor arguments.
 No hardcoded personal paths.
 """
 
+import json
 import os
 from pathlib import Path
 
@@ -93,6 +94,30 @@ def _env_list(name: str, default: list[str]) -> list[str]:
     return default
 
 
+def _env_json_dict(name: str, default: dict[str, list[str]]) -> dict[str, list[str]]:
+    """Read a JSON object (``{domain: [keyword, ...]}``) from an env variable.
+
+    Malformed or non-object values fall back to ``default``. Values are
+    coerced into lists of strings so downstream code sees a consistent shape.
+    """
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return default
+    if not isinstance(data, dict):
+        return default
+    result: dict[str, list[str]] = {}
+    for domain, keywords in data.items():
+        if isinstance(keywords, list):
+            result[str(domain)] = [str(k) for k in keywords]
+        elif isinstance(keywords, str):
+            result[str(domain)] = [keywords]
+    return result
+
+
 class MemoryConfig:
     """Runtime configuration for the memory server."""
     
@@ -124,6 +149,9 @@ class MemoryConfig:
         promotion_min_sections: int | None = None,
         promotion_cluster_threshold: float | None = None,
         promotion_min_cluster_size: int | None = None,
+        # v2.10.1 new field — user-configured domain classification for the
+        # auto-extractor (framework ships zero business presets)
+        domain_keywords: dict[str, list[str]] | None = None,
     ):
         self.home = Path(home) if home else default_home()
         self.knowledge_dir = Path(knowledge_dir) if knowledge_dir else default_knowledge_dir(self.home)
@@ -265,6 +293,17 @@ class MemoryConfig:
         self.promotion_min_cluster_size: int = (
             promotion_min_cluster_size if promotion_min_cluster_size is not None
             else _env_int("LAYERED_MEMORY_PROMOTION_MIN_CLUSTER_SIZE", 3)
+        )
+
+        # v2.10.1: Domain classification table for the auto-extractor. The
+        # framework ships **no** business presets — domain inference is opt-in.
+        # Maps ``domain_name -> [keyword, ...]``; when empty (the default), the
+        # extractor makes no assumption and tags everything as its fallback
+        # ("general"). Configured via config.yaml, constructor arg, or the
+        # LAYERED_MEMORY_DOMAIN_KEYWORDS env var (JSON object).
+        self.domain_keywords: dict[str, list[str]] = (
+            domain_keywords if domain_keywords is not None
+            else _env_json_dict("LAYERED_MEMORY_DOMAIN_KEYWORDS", {})
         )
 
         # v1.2: L0 index entry tag — configurable for i18n (default: "[L0]")

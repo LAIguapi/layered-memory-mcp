@@ -211,3 +211,106 @@ class TestKnowledgeExtractor:
         extractor = KnowledgeExtractor()
         stats = extractor.get_extraction_stats([])
         assert stats["total"] == 0
+
+
+class TestInferDomain:
+    """The auto-extractor ships zero built-in domain presets.
+
+    Domain classification is entirely user-driven via ``domain_keywords``.
+    All fixtures below use neutral technical placeholders only.
+    """
+
+    def test_empty_keywords_returns_fallback(self):
+        from layered_memory_mcp.extractor.knowledge_extractor import _infer_domain
+
+        # No table at all -> always fallback, regardless of content.
+        assert _infer_domain("sql query with an index on a table") == "general"
+        assert _infer_domain("tcp dns proxy networking notes") == "general"
+        assert _infer_domain("arbitrary content", domain_keywords={}) == "general"
+
+    def test_custom_fallback_is_honored(self):
+        from layered_memory_mcp.extractor.knowledge_extractor import _infer_domain
+
+        assert _infer_domain("anything", fallback="misc") == "misc"
+        assert (
+            _infer_domain("anything", fallback="misc", domain_keywords={})
+            == "misc"
+        )
+
+    def test_keywords_classify_on_match(self):
+        from layered_memory_mcp.extractor.knowledge_extractor import _infer_domain
+
+        keywords = {
+            "database": ["sql", "query", "index"],
+            "networking": ["tcp", "dns", "proxy"],
+        }
+        assert (
+            _infer_domain("optimize the sql query and add an index", domain_keywords=keywords)
+            == "database"
+        )
+        assert (
+            _infer_domain("configure the dns proxy over tcp", domain_keywords=keywords)
+            == "networking"
+        )
+
+    def test_no_keyword_match_falls_back(self):
+        from layered_memory_mcp.extractor.knowledge_extractor import _infer_domain
+
+        keywords = {"database": ["sql", "query", "index"]}
+        # Content shares no keyword -> fallback, not a forced classification.
+        assert (
+            _infer_domain("topic-a unrelated placeholder text", domain_keywords=keywords)
+            == "general"
+        )
+
+    def test_matching_is_case_insensitive(self):
+        from layered_memory_mcp.extractor.knowledge_extractor import _infer_domain
+
+        keywords = {"database": ["SQL", "Index"]}
+        assert (
+            _infer_domain("run the sql migration and rebuild the index", domain_keywords=keywords)
+            == "database"
+        )
+
+    def test_extractor_defaults_to_empty_table(self):
+        # Backward-compatible: constructing without domain_keywords yields an
+        # empty table (no presets baked in).
+        extractor = KnowledgeExtractor()
+        assert extractor.domain_keywords == {}
+
+    def test_extractor_accepts_user_table(self):
+        keywords = {"networking": ["tcp", "dns"]}
+        extractor = KnowledgeExtractor(domain_keywords=keywords)
+        assert extractor.domain_keywords == keywords
+
+
+class TestConfigDomainKeywords:
+    def test_default_is_empty_dict(self):
+        from layered_memory_mcp.config import MemoryConfig
+
+        cfg = MemoryConfig(home="/tmp/lm-domain-kw-default")
+        assert cfg.domain_keywords == {}
+
+    def test_constructor_override(self):
+        from layered_memory_mcp.config import MemoryConfig
+
+        table = {"database": ["sql", "query"]}
+        cfg = MemoryConfig(home="/tmp/lm-domain-kw-override", domain_keywords=table)
+        assert cfg.domain_keywords == table
+
+    def test_env_json_override(self, monkeypatch):
+        from layered_memory_mcp.config import MemoryConfig
+
+        monkeypatch.setenv(
+            "LAYERED_MEMORY_DOMAIN_KEYWORDS",
+            '{"networking": ["tcp", "dns", "proxy"]}',
+        )
+        cfg = MemoryConfig(home="/tmp/lm-domain-kw-env")
+        assert cfg.domain_keywords == {"networking": ["tcp", "dns", "proxy"]}
+
+    def test_malformed_env_falls_back_to_empty(self, monkeypatch):
+        from layered_memory_mcp.config import MemoryConfig
+
+        monkeypatch.setenv("LAYERED_MEMORY_DOMAIN_KEYWORDS", "not-json")
+        cfg = MemoryConfig(home="/tmp/lm-domain-kw-bad")
+        assert cfg.domain_keywords == {}

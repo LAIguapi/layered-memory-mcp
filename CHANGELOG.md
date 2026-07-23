@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.10.1] - 2026-07-23
+
+### Changed — Auto-extractor domain classification is now fully user-configurable
+
+- **Removed hardcoded domain keyword presets from the auto-extractor.** The
+  knowledge extractor previously shipped a built-in keyword table that guessed
+  a domain for every extracted entry. A general-purpose framework should make
+  no assumption about the user's subject matter, so those presets are gone.
+- **Zero presets by default.** `_infer_domain` now performs no keyword matching
+  unless a `domain_keywords` mapping is supplied; with an empty table (the
+  default) every entry falls back to `general`.
+- **New `domain_keywords` config field.** Users who want automatic
+  classification can supply their own `{domain: [keyword, ...]}` table via the
+  `MemoryConfig(domain_keywords=...)` constructor argument or the
+  `LAYERED_MEMORY_DOMAIN_KEYWORDS` env var (JSON object). Defaults to an empty
+  dict — fully backward compatible.
+- **Docs.** `config/config.example.yaml` documents the opt-in `domain_keywords`
+  mapping with neutral technical examples.
+
 ## [2.10.0] - 2026-07-23
 
 ### Added — Promotion Detector (same-topic clustering → "this file should be split")

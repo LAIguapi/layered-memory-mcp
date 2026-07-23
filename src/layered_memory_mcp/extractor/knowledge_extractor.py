@@ -134,27 +134,33 @@ def _generate_summary(content: str, max_chars: int = 120) -> str:
     return clean
 
 
-def _infer_domain(content: str, fallback: str = "general") -> str:
-    """Infer the knowledge domain from content."""
+def _infer_domain(
+    content: str,
+    fallback: str = "general",
+    domain_keywords: dict[str, list[str]] | None = None,
+) -> str:
+    """Infer the knowledge domain from content.
+
+    The framework ships with **zero** built-in domain presets. Domain
+    classification is entirely user-driven: pass a ``domain_keywords`` mapping
+    (``{domain: [keyword, ...]}``, typically sourced from
+    ``config.domain_keywords``) to enable keyword-based classification.
+
+    When ``domain_keywords`` is empty or ``None``, no matching is performed and
+    ``fallback`` is returned for any content — the framework makes no assumption
+    about the user's subject matter.
+    """
+    if not domain_keywords:
+        return fallback
+
     content_lower = content.lower()
 
-    domain_keywords = {
-        "infra": ["proxy", "server", "docker", "ssh", "network", "deploy",
-                  "config", "cloud", "kubernetes", "nginx", "dns", "firewall",
-                  "linux", "shell", "bash", "cron", "wsl"],
-        "dev": ["principle", "testing", "dry", "design", "refactor",
-                "code review", "tdd", "architecture", "pattern", "git"],
-        "docs": ["readme", "documentation", "guide", "tutorial", "how-to"],
-        "content": ["公众号", "文章", "排版", "发布", "blog", "article"],
-        "trading": ["股票", "交易", "量化", "策略", "stock", "trade", "crypto"],
-        "wechat": ["微信", "公众号", "模板消息", "wechat", "mp"],
+    scores = {
+        domain: sum(1 for kw in keywords if kw.lower() in content_lower)
+        for domain, keywords in domain_keywords.items()
     }
 
-    scores = {}
-    for domain, keywords in domain_keywords.items():
-        scores[domain] = sum(1 for kw in keywords if kw in content_lower)
-
-    best = max(scores, key=scores.get)
+    best = max(scores, key=lambda d: scores[d])
     if scores[best] > 0:
         return best
     return fallback
@@ -188,8 +194,16 @@ def _infer_section(content: str, knowledge_type: KnowledgeType) -> str:
 class KnowledgeExtractor:
     """Extract structured knowledge from sessions."""
 
-    def __init__(self, auto_approve_threshold: float = 0.9):
+    def __init__(
+        self,
+        auto_approve_threshold: float = 0.9,
+        domain_keywords: dict[str, list[str]] | None = None,
+    ):
         self.auto_approve_threshold = auto_approve_threshold
+        # User-configured domain classification table (typically
+        # config.domain_keywords). Empty/None means the framework makes no
+        # assumption about subject matter — every entry falls back to "general".
+        self.domain_keywords = domain_keywords or {}
 
     def extract_from_session(self, session: "Session") -> list[ReviewItem]:
         """Extract knowledge entries from a single session.
@@ -207,7 +221,7 @@ class KnowledgeExtractor:
 
             # Build knowledge entry
             entry = KnowledgeEntry(
-                domain=_infer_domain(content),
+                domain=_infer_domain(content, domain_keywords=self.domain_keywords),
                 section=_infer_section(content, decision["type"]),
                 type=decision["type"],
                 content=content,

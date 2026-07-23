@@ -1216,7 +1216,10 @@ async def extract_session_knowledge(
         reader = SessionReader(str(config.sessions_dir))
         sessions = reader.read_recent(days=days, max_sessions=max_sessions)
 
-        extractor = KnowledgeExtractor(auto_approve_threshold=auto_approve_threshold)
+        extractor = KnowledgeExtractor(
+            auto_approve_threshold=auto_approve_threshold,
+            domain_keywords=config.domain_keywords,
+        )
         items = extractor.extract_from_sessions(sessions, max_items_per_session=max_items_per_session)
 
         # Convert to serializable format

@@ -111,3 +111,30 @@ backend:
   - rate limiting
   - caching
   - message queue
+
+# =============================================================================
+# Auto-extractor domain classification (optional)
+# =============================================================================
+#
+# The knowledge auto-extractor ships with **zero** built-in domain presets: by
+# default every extracted entry is tagged with the fallback domain "general".
+# The framework makes no assumption about your subject matter.
+#
+# If you want the extractor to auto-classify entries into your own domains,
+# provide a `domain_keywords` mapping (same shape as the rules above). It can be
+# passed programmatically:
+#
+#     MemoryConfig(domain_keywords={
+#         "database":   ["sql", "query", "index"],
+#         "networking": ["tcp", "dns", "proxy"],
+#     })
+#
+# or via the env var (JSON object):
+#
+#     LAYERED_MEMORY_DOMAIN_KEYWORDS='{"database": ["sql", "query", "index"],
+#                                      "networking": ["tcp", "dns", "proxy"]}'
+#
+# Keywords are matched case-insensitively; the highest-scoring domain wins, and
+# content matching nothing stays "general". Use whatever domains fit your own
+# knowledge base.
+# =============================================================================
