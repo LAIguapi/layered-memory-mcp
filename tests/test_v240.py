@@ -147,6 +147,7 @@ def test_audit_report_shape(kb):
     assert set(r["findings"].keys()) == {
         "oversized", "garbled_heading", "stale",
         "cross_file_duplicate", "same_file_duplicate",
+        "promotion_candidates",
     }
     assert isinstance(r["recommendations"], list)
     assert 0 <= r["health_score"] <= 100

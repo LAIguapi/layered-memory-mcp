@@ -162,6 +162,10 @@ def audit_rot(config: "MemoryConfig") -> dict:
     cross_dup.sort(key=lambda x: x["similarity"], reverse=True)
     same_file_dup.sort(key=lambda x: x["similarity"], reverse=True)
 
+    # Promotion candidates (v2.10.0) — same-topic clusters in watched catch-all
+    # domains that deserve extraction into their own L1 file. Advisory only.
+    promotion_candidates = _detect_promotion_candidates(config, files)
+
     # Health score: start at 100, dock points per finding (capped)
     score = 100
     score -= min(len(oversized) * 4, 24)
@@ -169,6 +173,9 @@ def audit_rot(config: "MemoryConfig") -> dict:
     score -= min(len(stale) * 3, 18)
     score -= min(len(cross_dup) * 5, 30)
     score -= min(len(same_file_dup) * 5, 24)
+    # Promotion is an optimisation suggestion, not decay — dock lightly, and
+    # with a lower weight/cap than oversized (its closest cousin).
+    score -= min(len(promotion_candidates) * 2, 10)
     score = max(score, 0)
 
     return {
@@ -182,6 +189,7 @@ def audit_rot(config: "MemoryConfig") -> dict:
             "stale": stale,
             "cross_file_duplicate": cross_dup,
             "same_file_duplicate": same_file_dup,
+            "promotion_candidates": promotion_candidates,
         },
         "summary": {
             "oversized": len(oversized),
@@ -189,9 +197,41 @@ def audit_rot(config: "MemoryConfig") -> dict:
             "stale": len(stale),
             "cross_file_duplicate": len(cross_dup),
             "same_file_duplicate": len(same_file_dup),
+            "promotion_candidates": len(promotion_candidates),
         },
-        "recommendations": _build_recommendations(oversized, garbled, stale, cross_dup, same_file_dup),
+        "recommendations": _build_recommendations(
+            oversized, garbled, stale, cross_dup, same_file_dup, promotion_candidates
+        ),
     }
+
+
+def _detect_promotion_candidates(config: "MemoryConfig", files: dict[str, str]) -> list[dict]:
+    """Run the promotion detector over each watched catch-all domain file.
+
+    Read-only. Any failure degrades to an empty list — never breaks the audit.
+    Returns a list of candidate dicts (see promotion.detect_promotion_candidate).
+    """
+    if not getattr(config, "promotion_enabled", True):
+        return []
+
+    watch = getattr(config, "promotion_watch_domains", ["misc"]) or []
+    candidates: list[dict] = []
+    try:
+        from .promotion import detect_promotion_candidate
+    except Exception:
+        return []
+
+    for name, path in sorted(files.items()):
+        domain = name.removesuffix(".md")
+        if domain not in watch:
+            continue
+        try:
+            hit = detect_promotion_candidate(config, domain, Path(path))
+        except Exception:
+            continue
+        if hit is not None:
+            candidates.append(hit)
+    return candidates
 
 
 def _normalize(text: str) -> str:
@@ -201,8 +241,9 @@ def _normalize(text: str) -> str:
     return t.strip()[:500]  # cap for speed
 
 
-def _build_recommendations(oversized, garbled, stale, cross_dup, same_file_dup) -> list[str]:
+def _build_recommendations(oversized, garbled, stale, cross_dup, same_file_dup, promotion_candidates=None) -> list[str]:
     recs: list[str] = []
+    promotion_candidates = promotion_candidates or []
     if oversized:
         recs.append(
             f"{len(oversized)} oversized file(s) — review for 'append-without-merge' "
@@ -229,6 +270,16 @@ def _build_recommendations(oversized, garbled, stale, cross_dup, same_file_dup) 
             f"{len(cross_dup)} cross-file duplicate pair(s) — same knowledge in "
             "multiple files; pick a single authoritative source and replace the rest "
             "with a pointer."
+        )
+    if promotion_candidates:
+        domains = ", ".join(
+            sorted({c.get("watch_domain", "?") for c in promotion_candidates})
+        )
+        recs.append(
+            f"{len(promotion_candidates)} promotion candidate(s) in catch-all "
+            f"domain(s) [{domains}] — a same-topic cluster has accumulated; consider "
+            "extracting it into its own L1 file with create_knowledge_file instead of "
+            "letting it keep piling up."
         )
     if not recs:
         recs.append("No significant decay detected. Knowledge base is healthy.")

@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.10.0] - 2026-07-23
+
+### Added — Promotion Detector (same-topic clustering → "this file should be split")
+
+The existing dedup layers only judge whether a *single* piece of content is a
+duplicate; they never notice that a whole topic has quietly accumulated into a
+catch-all domain (default `misc`) until it deserves its own L1 file. This
+release adds a Promotion Detector that closes that gap.
+
+- **Semantic clustering on watched domains:** after a write into a watched
+  catch-all domain, the detector parses the file's `##` sections, embeds each
+  section body with the in-repo embedding pipeline (no new model), single-link
+  clusters them by cosine similarity, and suggests extracting any cluster of
+  `promotion_min_cluster_size` or more into its own domain.
+- **Suggestion-only, never mutating:** the framework computes the objective fact
+  ("these N sections are semantically one topic") and emits a *suggestion* with
+  a rough suggested domain name. It never moves content — the agent decides,
+  exactly like the dedup `suggestion` field.
+- **Dual exit points:** the candidate surfaces both on the `inject` return value
+  (`auto_maintain.promotion`) and via `audit_rot` findings
+  (`promotion_candidates`), so it is visible both inline at write time and in
+  periodic health audits.
+- **`promotion_enabled` switch + tunables:** master on/off plus
+  `promotion_watch_domains`, `promotion_min_sections`,
+  `promotion_cluster_threshold`, and `promotion_min_cluster_size`.
+- **Fault-isolated:** all detection is wrapped in try/except — any failure logs
+  a warning and returns `None`, so it can never break the primary write.
+
 ## [2.9.2] - 2026-06-29
 
 ### Fixed — Runaway `[L0]` nesting loop (compaction ate its own index pointers)

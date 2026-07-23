@@ -708,6 +708,8 @@ def auto_maintain_after_write(
     config: "MemoryConfig",
     l0_pointer: str | None = None,
     memory_path: str | Path | None = None,
+    domain: str | None = None,
+    filepath: str | Path | None = None,
 ) -> dict:
     """Framework self-maintenance, invoked automatically after each L1 write.
 
@@ -733,9 +735,30 @@ def auto_maintain_after_write(
 
     report: dict = {"dual_write": None, "compact": None}
 
+    # --- 0. Promotion detection (v2.10.0) — independent of agent-memory path ---
+    # When the just-written domain is a watched catch-all (default "misc"),
+    # check whether a same-topic cluster has accumulated that deserves its own
+    # L1 file. Runs FIRST and unconditionally on the file (not gated behind the
+    # agent-memory-path resolution below), because promotion is a pure L1-file
+    # concern — it must still surface even when there's no resolvable MEMORY.md.
+    # Only attaches a `promotion` key when there IS a candidate — a None result
+    # leaves the report untouched (no noise on normal writes). detect() is fully
+    # try/except-wrapped internally, so this never breaks the primary write.
+    if domain and filepath:
+        try:
+            from .promotion import detect_promotion_candidate
+
+            candidate = detect_promotion_candidate(config, domain, Path(filepath))
+            if candidate is not None:
+                report["promotion"] = candidate
+        except Exception as e:  # noqa: BLE001 — maintenance must not raise
+            logger.warning("Auto-maintain promotion detection failed: %s", e)
+
     path = _resolve_memory_path(memory_path, config)
     if not path:
-        return {"skipped": True, "reason": "memory path not resolvable"}
+        report["skipped"] = True
+        report["reason"] = "memory path not resolvable"
+        return report
 
     # --- 1. Dual-write completion ---
     if l0_pointer:

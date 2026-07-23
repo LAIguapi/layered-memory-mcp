@@ -72,6 +72,27 @@ def _env_float(name: str, default: float) -> float:
     return default
 
 
+def _env_int(name: str, default: int) -> int:
+    """Read an int from an environment variable."""
+    val = os.environ.get(name)
+    if val:
+        try:
+            return int(val)
+        except ValueError:
+            pass
+    return default
+
+
+def _env_list(name: str, default: list[str]) -> list[str]:
+    """Read a comma-separated list from an environment variable."""
+    val = os.environ.get(name)
+    if val:
+        items = [x.strip() for x in val.split(",") if x.strip()]
+        if items:
+            return items
+    return default
+
+
 class MemoryConfig:
     """Runtime configuration for the memory server."""
     
@@ -97,6 +118,12 @@ class MemoryConfig:
         # v2.7.0 new fields — critical safety-net + explicit memory limit
         compact_critical_threshold: float | None = None,
         memory_char_limit: int | None = None,
+        # v2.10.0 new fields — promotion detector (same-topic clustering)
+        promotion_enabled: bool | None = None,
+        promotion_watch_domains: list[str] | None = None,
+        promotion_min_sections: int | None = None,
+        promotion_cluster_threshold: float | None = None,
+        promotion_min_cluster_size: int | None = None,
     ):
         self.home = Path(home) if home else default_home()
         self.knowledge_dir = Path(knowledge_dir) if knowledge_dir else default_knowledge_dir(self.home)
@@ -209,6 +236,37 @@ class MemoryConfig:
                     _mcl = None
         self.memory_char_limit: int | None = _mcl if (_mcl and _mcl > 0) else None
 
+        # v2.10.0: Promotion detector — when an agent keeps appending
+        # same-topic sections into a catch-all domain (default "misc"), the
+        # framework detects the semantic cluster after a write and *suggests*
+        # extracting it into its own L1 file. It never moves content itself —
+        # like dedup's suggestion, it's a soft advisory signal the agent acts on.
+        self.promotion_enabled: bool = (
+            promotion_enabled if promotion_enabled is not None
+            else _env_bool("LAYERED_MEMORY_PROMOTION_ENABLED", True)
+        )
+        # Only these catch-all domains are scanned (avoids false positives on
+        # legitimately-dense specialised files). Default: only "misc".
+        self.promotion_watch_domains: list[str] = (
+            promotion_watch_domains if promotion_watch_domains is not None
+            else _env_list("LAYERED_MEMORY_PROMOTION_WATCH_DOMAINS", ["misc"])
+        )
+        # Files with fewer sections than this are never scanned.
+        self.promotion_min_sections: int = (
+            promotion_min_sections if promotion_min_sections is not None
+            else _env_int("LAYERED_MEMORY_PROMOTION_MIN_SECTIONS", 4)
+        )
+        # Semantic similarity at/above which two sections join the same cluster.
+        self.promotion_cluster_threshold: float = (
+            promotion_cluster_threshold if promotion_cluster_threshold is not None
+            else _env_float("LAYERED_MEMORY_PROMOTION_CLUSTER_THRESHOLD", 0.60)
+        )
+        # A cluster must reach this size before a promotion is suggested.
+        self.promotion_min_cluster_size: int = (
+            promotion_min_cluster_size if promotion_min_cluster_size is not None
+            else _env_int("LAYERED_MEMORY_PROMOTION_MIN_CLUSTER_SIZE", 3)
+        )
+
         # v1.2: L0 index entry tag — configurable for i18n (default: "[L0]")
         _tag = os.environ.get("LAYERED_MEMORY_L0_TAG", "[L0]")
         if not (_tag.startswith("[") and _tag.endswith("]")):
@@ -223,6 +281,7 @@ class MemoryConfig:
             ("compact_capacity_warning_threshold", self.compact_capacity_warning_threshold),
             ("compact_critical_threshold", self.compact_critical_threshold),
             ("dedup_threshold", self.dedup_threshold),
+            ("promotion_cluster_threshold", self.promotion_cluster_threshold),
         ]:
             if not (0.0 <= _val <= 1.0):
                 raise ValueError(

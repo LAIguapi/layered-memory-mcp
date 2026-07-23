@@ -197,7 +197,12 @@ def inject_knowledge(
     if getattr(config, "auto_maintain", True):
         try:
             from .memory_compactor import auto_maintain_after_write
-            maint = auto_maintain_after_write(config, l0_pointer=l0_pointer)
+            maint = auto_maintain_after_write(
+                config,
+                l0_pointer=l0_pointer,
+                domain=domain_clean,
+                filepath=filepath,
+            )
             result["auto_maintain"] = maint
             # When the framework completes the dual-write itself, the agent no
             # longer needs the manual "write this pointer to memory" hint.
