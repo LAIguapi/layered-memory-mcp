@@ -1,0 +1,40 @@
+# Build artifacts
+dist/
+# but the dashboard plugin's dist/ is hand-written source, not a build artifact
+!src/layered_memory_mcp/dashboard_plugin/dist/
+!src/layered_memory_mcp/dashboard_plugin/dist/**
+*.egg-info/
+build/
+*.whl
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Environment
+.env
+.venv/
+
+# Runtime data (user-generated L1 knowledge files)
+knowledge/*.md
+!knowledge/task-resilience.md
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Internal audit snapshots — never publish
+KNOWLEDGE_AUDIT_*.md
+
+# Agent/host private working dirs — never publish
+.hermes/
+.claude/
+.cursor/
