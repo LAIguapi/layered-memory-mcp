@@ -73,6 +73,22 @@ def _env_float(name: str, default: float) -> float:
     return default
 
 
+def _env_float_or_none(name: str) -> float | None:
+    """Read an optional float from an env var; None when unset/invalid.
+
+    Distinct from ``_env_float``: there is no default float. Used for the
+    semantic-threshold overrides, where "unset" must stay None so the
+    calibrated>config>default resolution chain in injector still applies.
+    """
+    val = os.environ.get(name)
+    if val:
+        try:
+            return float(val)
+        except ValueError:
+            pass
+    return None
+
+
 def _env_int(name: str, default: int) -> int:
     """Read an int from an environment variable."""
     val = os.environ.get(name)
@@ -190,6 +206,11 @@ class MemoryConfig:
         # v2.10.1 new field — user-configured domain classification for the
         # auto-extractor (framework ships zero business presets)
         domain_keywords: dict[str, list[str]] | None = None,
+        # v3.1.2 new fields — semantic write-path thresholds (explicit overrides
+        # of the shipped bge/Chinese defaults; None → use default/calibrated).
+        sem_skip_threshold: float | None = None,
+        sem_fuse_threshold: float | None = None,
+        sem_merge_threshold: float | None = None,
     ):
         self.home = Path(home) if home else default_home()
         self.knowledge_dir = Path(knowledge_dir) if knowledge_dir else default_knowledge_dir(self.home)
@@ -333,6 +354,25 @@ class MemoryConfig:
             else _env_int("LAYERED_MEMORY_PROMOTION_MIN_CLUSTER_SIZE", 3)
         )
 
+        # v3.1.2: Semantic write-path thresholds. These are EXPLICIT overrides
+        # of the shipped defaults (constants live in injector.py). Left as None
+        # they fall through the "calibrated > config > default" chain in
+        # injector._semantic_thresholds; set to a float to pin them. Kept on the
+        # config (not just read via getattr) so `hermes config set` / env vars /
+        # config.yaml can tune the write boundary without code edits.
+        self.sem_skip_threshold: float | None = (
+            sem_skip_threshold if sem_skip_threshold is not None
+            else _env_float_or_none("LAYERED_MEMORY_SEM_SKIP_THRESHOLD")
+        )
+        self.sem_fuse_threshold: float | None = (
+            sem_fuse_threshold if sem_fuse_threshold is not None
+            else _env_float_or_none("LAYERED_MEMORY_SEM_FUSE_THRESHOLD")
+        )
+        self.sem_merge_threshold: float | None = (
+            sem_merge_threshold if sem_merge_threshold is not None
+            else _env_float_or_none("LAYERED_MEMORY_SEM_MERGE_THRESHOLD")
+        )
+
         # v2.10.1: Domain classification table for the auto-extractor. The
         # framework ships **no** business presets — domain inference is opt-in.
         # Maps ``domain_name -> [keyword, ...]``; when empty (the default), the
@@ -368,6 +408,18 @@ class MemoryConfig:
             ("promotion_cluster_threshold", self.promotion_cluster_threshold),
         ]:
             if not (0.0 <= _val <= 1.0):
+                raise ValueError(
+                    f"{_name} must be between 0.0 and 1.0, got {_val}"
+                )
+
+        # v3.1.2: validate the optional semantic overrides only when explicitly
+        # set (None means "use the resolution chain", not a range violation).
+        for _name, _val in [
+            ("sem_skip_threshold", self.sem_skip_threshold),
+            ("sem_fuse_threshold", self.sem_fuse_threshold),
+            ("sem_merge_threshold", self.sem_merge_threshold),
+        ]:
+            if _val is not None and not (0.0 <= _val <= 1.0):
                 raise ValueError(
                     f"{_name} must be between 0.0 and 1.0, got {_val}"
                 )

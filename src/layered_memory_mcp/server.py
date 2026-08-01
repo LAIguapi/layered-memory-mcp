@@ -33,7 +33,8 @@ from . import __version__
 from .recall import recall, scan_knowledge_files, score_relevance, knowledge_health
 from .session_scanner import find_recent_sessions, extract_session_summary, scan_sessions
 from .l0_manager import sync_l0_index, auto_sync_if_enabled, manage_entry, check_l0_l1_consistency
-from .injector import inject_knowledge, sync_to_vector_store, remove_from_vector_store
+from .injector import inject_knowledge, sync_to_vector_store, remove_from_vector_store, reindex_vector_store, vector_store_needs_reindex, calibrate_thresholds
+from .promotion import scan_split_candidates, scan_cross_domain_duplicates
 from .agent_integrator import (
     detect_agent_type,
     is_soul_injected,
@@ -889,12 +890,33 @@ async def inject_knowledge_tool(
     content: str,
     mode: str = "upsert",
     agent_id: str | None = None,
+    fuse: bool = False,
+    expected_hash: str | None = None,
 ) -> str:
     """Smart knowledge injection with dedup, section targeting, and auto L0 sync.
 
     The recommended write path for all agents. Handles deduplication,
     section-level targeting (creates ## headings if needed), and
     automatically syncs the L0 index after successful writes.
+
+    v3.1.0 semantic upsert: dedup now uses bge-small-zh cosine over the
+    section-level vector store (not char-level difflib). When new content is a
+    semantic near-duplicate of an existing section (an UPDATE, not a new fact),
+    the tool returns action="deferred_fusion" with the old section body + your
+    new content instead of blindly appending. You (the LLM) fuse them into one
+    lossless body and re-call with the SAME domain, section=<hit_section>,
+    content=<fused text>, mode="upsert", fuse=True, AND
+    expected_hash=<the expected_hash from the deferred_fusion response> to commit
+    the merge under an optimistic lock.
+
+    v3.1.2 TWO-STEP DEFERRED-FUSION HANDSHAKE (do not skip step 2):
+      1. First call returns action="deferred_fusion" carrying fusion.old_body,
+         fusion.new_content and expected_hash.
+      2. You fuse old_body + new_content into one lossless body, then RE-CALL
+         this tool with section=<hit_section>, content=<fused>, fuse=True,
+         expected_hash=<that token>. The framework recomputes the section's hash
+         and refuses (action="fuse_conflict") if it changed in between — re-defer
+         and retry. Forgetting step 2 means the update is silently dropped.
 
     Args:
         domain: Target L1 file (with or without .md), e.g. "infra" or "infra.md".
@@ -904,9 +926,21 @@ async def inject_knowledge_tool(
         mode: Write mode — "upsert" (default, replace similar), "append" (always add),
               or "merge" (combine unique parts).
         agent_id: Optional agent identifier for provenance tracking.
+        fuse: Commit a fusion write-back (second half of the deferred_fusion
+              handshake). When True, `content` wholesale-replaces the target
+              section; pair with the hit_section returned by the prior call.
+        expected_hash: Optimistic-lock token echoed from the prior
+              deferred_fusion response. REQUIRED for a well-behaved fuse=True
+              write; the framework refuses the overwrite if the section changed
+              since the token was issued (lost-update guard). Omitting it keeps
+              the legacy unlocked behavior for backward compatibility.
 
     Returns:
         JSON with action taken, dedup info, L0 sync status, and warnings.
+        May instead return action="deferred_fusion" (needs_fusion=True) carrying
+        the fusion contract + expected_hash, or action="fuse_conflict" when the
+        optimistic lock rejects a stale fuse. May also carry a passive
+        title_diff_hint / stale_residue_hint (same-file advisories only).
     """
     config = _get_config()
 
@@ -921,7 +955,110 @@ async def inject_knowledge_tool(
         content=content,
         mode=mode,
         agent_id=agent_id,
+        fuse=fuse,
+        expected_hash=expected_hash,
     )
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def reindex_vector_store_tool(drop_existing: bool = True) -> str:
+    """Rebuild the semantic vector store from every L1 knowledge file.
+
+    Vectors are pure derived data (one per ## section, recomputed from the
+    markdown body), so this is a lossless, single-direction rebuild. Run it:
+      - On first use / after a pip upgrade over an existing knowledge base
+        whose historical writes didn't all sync their vectors.
+      - When vectors.db drifts from the .md files (bulk external edits).
+
+    The semantic upsert write path reads this store to decide replace vs merge
+    vs append, so a complete index is what makes dedup accurate.
+
+    Args:
+        drop_existing: wipe vectors.db before rebuilding (default True) so
+            deleted sections/files leave no orphan vectors.
+
+    Returns:
+        JSON: {success, domains, sections, files, errors}.
+    """
+    config = _get_config()
+    result = await asyncio.to_thread(
+        reindex_vector_store, config=config, drop_existing=drop_existing
+    )
+    # Refresh the live singleton store's cache so subsequent searches see it.
+    try:
+        stores = _get_v2_stores()
+        stores["vector"]._invalidate_cache()
+    except Exception:
+        pass
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def reconcile_knowledge_tool(
+    checks: str = "all",
+    dup_threshold: float | None = None,
+    domains: str | None = None,
+) -> str:
+    """Active, pull-based knowledge-base maintenance — suggestions only, never mutates.
+
+    This is the framework's first-class "housekeeping" entry point. The write path
+    stays deterministic and cheap (exact dedup + in-file semantic upsert); the
+    heavy, global, best-effort analysis lives HERE and runs only when you ask for
+    it — NOT on a cron, NOT on every write. It reads the vector store + markdown
+    and returns a structured worklist for the agent/user to act on. It NEVER moves,
+    merges, or deletes any knowledge (that stays a human/agent decision).
+
+    Runs any subset of four checks:
+      - cross_dup:  cross-FILE near-duplicate section pairs (which knowledge is
+                    duplicated across files / namespace / shared), each tagged
+                    with scope so you know if consolidating crosses a red line.
+      - split:      domains where a same-topic cluster has accumulated and
+                    deserves extraction into its own L1 file.
+      - calibrate:  recompute semantic thresholds from the live corpus's own
+                    similarity distribution (valley detection), writing
+                    sem_thresholds.json; reports sample size + reliability +
+                    fallback reason if the corpus is too small to calibrate.
+      - vector_health: section-level drift/gap detection between .md files and
+                    vectors.db (catches silent vector-sync failures that would
+                    otherwise make dedup blind).
+
+    Args:
+        checks: comma-separated subset of {cross_dup, split, calibrate,
+            vector_health} or "all" (default).
+        dup_threshold: override cosine threshold for cross_dup (default: the
+            calibrated/config fuse threshold).
+        domains: comma-separated domain filter for the split check (default: all).
+
+    Returns:
+        JSON: {ran: [...], cross_dup?, split?, calibrate?, vector_health?}.
+        Every section is advisory — nothing is modified.
+    """
+    config = _get_config()
+    requested = (
+        {"cross_dup", "split", "calibrate", "vector_health"}
+        if checks.strip().lower() == "all"
+        else {c.strip().lower() for c in checks.split(",") if c.strip()}
+    )
+    domain_list = (
+        [d.strip() for d in domains.split(",") if d.strip()] if domains else None
+    )
+
+    def _run() -> dict:
+        out: dict = {"ran": sorted(requested)}
+        if "cross_dup" in requested:
+            out["cross_dup"] = scan_cross_domain_duplicates(
+                config, threshold=dup_threshold
+            )
+        if "split" in requested:
+            out["split"] = scan_split_candidates(config, domains=domain_list)
+        if "calibrate" in requested:
+            out["calibrate"] = calibrate_thresholds(config)
+        if "vector_health" in requested:
+            out["vector_health"] = vector_store_needs_reindex(config)
+        return out
+
+    result = await asyncio.to_thread(_run)
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 

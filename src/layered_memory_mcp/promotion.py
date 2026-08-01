@@ -269,3 +269,258 @@ def _tokenize_heading(heading: str) -> list[str]:
     cjk_runs = re.findall(r"[\u4e00-\u9fff]+", heading)
     tokens = [t.lower() for t in ascii_tokens] + cjk_runs
     return [t for t in tokens if t]
+
+
+# ---------------------------------------------------------------------------
+# v3.1.1: Active split inspection — a PULL tool (user asks "what should split?")
+# rather than the PUSH hint that rode along on every write.
+# ---------------------------------------------------------------------------
+
+def scan_split_candidates(
+    config: "MemoryConfig",
+    domains: list[str] | None = None,
+    ignore_watch_gate: bool = True,
+    min_sections: int | None = None,
+    min_cluster_size: int | None = None,
+) -> dict:
+    """Scan L1 files for same-topic clusters that deserve their own file.
+
+    This is the ACTIVE counterpart to ``detect_promotion_candidate`` (which only
+    fired passively after a write into a *watched* catch-all domain). Here the
+    user/agent can proactively ask "which files should be split?" across ANY
+    domain, not just ``misc``.
+
+    Args:
+        config: MemoryConfig.
+        domains: optional explicit list of domains to scan (filenames without
+            .md). None → scan every .md across all knowledge dirs.
+        ignore_watch_gate: when True (default) do NOT restrict to
+            ``promotion_watch_domains`` — the whole point of the active tool is
+            to look everywhere. When False, honor the watch list (parity with
+            the passive detector).
+        min_sections: override ``promotion_min_sections`` for this scan.
+        min_cluster_size: override ``promotion_min_cluster_size`` for this scan.
+
+    Returns:
+        ``{"success": True, "candidates": [ {domain, file, dir, cluster_size,
+        cluster_sections, suggested_domain, file_section_count}, ... ],
+        "scanned": N, "note": ...}``. Read-only — NEVER moves content. Any
+        per-file failure is skipped, not fatal.
+    """
+    result: dict = {"success": True, "candidates": [], "scanned": 0}
+    try:
+        watch = getattr(config, "promotion_watch_domains", ["misc"]) or []
+        want_min_sections = (
+            min_sections if min_sections is not None
+            else getattr(config, "promotion_min_sections", 4)
+        )
+        want_min_cluster = (
+            min_cluster_size if min_cluster_size is not None
+            else getattr(config, "promotion_min_cluster_size", 3)
+        )
+        threshold = getattr(config, "promotion_cluster_threshold", 0.60)
+
+        # Enumerate (domain, filepath, dir_label) across all knowledge dirs.
+        targets: list[tuple[str, Path, str]] = []
+        seen: set[str] = set()
+        for kdir in config.knowledge_dirs:
+            if not kdir.exists():
+                continue
+            dir_label = "shared" if kdir.name == "shared" else "namespace"
+            for fp in sorted(kdir.glob("*.md")):
+                dom = fp.name.removesuffix(".md")
+                if domains is not None and dom not in domains:
+                    continue
+                if not ignore_watch_gate and dom not in watch:
+                    continue
+                if dom in seen:
+                    continue
+                seen.add(dom)
+                targets.append((dom, fp, dir_label))
+
+        for dom, fp, dir_label in targets:
+            result["scanned"] += 1
+            try:
+                raw = fp.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            sections = _parse_sections(raw)
+            if len(sections) < want_min_sections:
+                continue
+            texts = [f"{h}\n{b}".strip() for h, b in sections]
+            matrix = _embed_sections(texts)
+            if matrix is None or matrix.shape[0] != len(sections):
+                continue
+            clusters = _single_link_cluster(matrix, threshold)
+            clusters.sort(key=len, reverse=True)
+            for idx_group in clusters:
+                if len(idx_group) < want_min_cluster:
+                    continue
+                cluster_headings = [sections[i][0] for i in sorted(idx_group)]
+                suggested = _suggest_domain_name(cluster_headings)
+                result["candidates"].append({
+                    "domain": dom,
+                    "file": fp.name,
+                    "dir": dir_label,
+                    "cluster_size": len(idx_group),
+                    "cluster_sections": cluster_headings,
+                    "suggested_domain": suggested,
+                    "file_section_count": len(sections),
+                    "hint": (
+                        f"{dom} 有 {len(idx_group)} 条语义相近 section（疑似同主题），"
+                        f"可用 create_knowledge_file 提取为独立类目 {suggested}.md。"
+                        "仅为建议；框架不会自动搬移内容。"
+                    ),
+                })
+                # Report only the largest qualifying cluster per file to avoid
+                # noise; a second pass after the user acts will surface the next.
+                break
+
+        result["note"] = (
+            "Suggestions only — the framework never moves content. Confirm, then "
+            "use create_knowledge_file to extract, and the source sections will "
+            "dedup on the next semantic write."
+        )
+        return result
+    except Exception as e:  # noqa: BLE001 — inspection must never raise
+        logger.warning("scan_split_candidates failed: %s", e)
+        return {"success": False, "error": str(e), "candidates": []}
+
+
+def scan_cross_domain_duplicates(
+    config: "MemoryConfig",
+    threshold: float | None = None,
+    top_pairs: int = 50,
+) -> dict:
+    """Scan ALL section vectors for cross-FILE near-duplicate section pairs.
+
+    The active, pull-based counterpart to the passive ``cross_domain_hints`` that
+    flickered by on individual writes. Lets the user ask "which knowledge is
+    duplicated across files?" and get a ranked, structured clean-up worklist.
+
+    Method: read every section vector from the store, compute pairwise cosine,
+    and report pairs from DIFFERENT files whose similarity ≥ threshold, each
+    tagged with the scope of the second file (namespace / shared / other_ns) so
+    the user knows whether a consolidation would cross the shared/namespace red
+    line.
+
+    Args:
+        config: MemoryConfig.
+        threshold: cosine cutoff; defaults to the semantic fuse band.
+        top_pairs: cap on returned pairs (highest similarity first).
+
+    Returns:
+        ``{"success": True, "duplicates": [ {domain_a, section_a, domain_b,
+        section_b, cosine, scope_b}, ... ], "total": N }``. Read-only.
+    """
+    try:
+        import numpy as np
+        from .storage.vector_store import VectorStore, EMBED_DIM
+        import json as _json
+        import sqlite3 as _sqlite3
+
+        # Resolve the fuse threshold lazily (avoid an injector import cycle at
+        # module load; injector imports promotion only inside functions).
+        if threshold is None:
+            try:
+                from .injector import _semantic_thresholds
+                _, threshold, _ = _semantic_thresholds(config)
+            except Exception:
+                threshold = 0.72
+
+        db_path = config.home / "data" / "vectors.db"
+        if not db_path.exists():
+            return {"success": True, "duplicates": [], "total": 0,
+                    "note": "No vector store yet — run reindex_vector_store first."}
+
+        with _sqlite3.connect(db_path) as conn:
+            rows = conn.execute(
+                "SELECT domain, vector, metadata FROM vectors"
+            ).fetchall()
+
+        domains: list[str] = []
+        sections: list[str] = []
+        vectors: list = []
+        for dom, vec_json, meta_json in rows:
+            try:
+                vec = np.array(_json.loads(vec_json), dtype=np.float32)
+            except Exception:
+                continue
+            if vec.shape[0] != EMBED_DIM:
+                continue
+            meta = _json.loads(meta_json) if meta_json else {}
+            domains.append(dom)
+            sections.append(meta.get("section") or "")
+            vectors.append(vec)
+
+        n = len(vectors)
+        if n < 2:
+            return {"success": True, "duplicates": [], "total": 0}
+
+        matrix = np.vstack(vectors)
+        sims = matrix @ matrix.T
+
+        pairs: list[dict] = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                if domains[i] == domains[j]:
+                    continue  # same file → not a cross-file duplicate
+                cos = float(sims[i, j])
+                if cos < threshold:
+                    continue
+                scope_b = _classify_scope(config, domains[j])
+                pairs.append({
+                    "domain_a": domains[i],
+                    "section_a": sections[i],
+                    "domain_b": domains[j],
+                    "section_b": sections[j],
+                    "cosine": round(cos, 4),
+                    "scope_b": scope_b,
+                })
+
+        pairs.sort(key=lambda p: p["cosine"], reverse=True)
+        capped = pairs[:top_pairs]
+        return {
+            "success": True,
+            "duplicates": capped,
+            "total": len(pairs),
+            "threshold": round(float(threshold), 4),
+            "note": (
+                "Read-only worklist. Consolidation is manual; note scope_b — "
+                "merging into shared/ or across a namespace crosses the "
+                "framework's no-auto-cross-library red line and is your call."
+            ),
+        }
+    except Exception as e:  # noqa: BLE001
+        logger.warning("scan_cross_domain_duplicates failed: %s", e)
+        return {"success": False, "error": str(e), "duplicates": []}
+
+
+def _classify_scope(config, hit_domain: str) -> str:
+    """Filesystem-scope of a domain (namespace / shared / other_namespace).
+
+    Local copy of the injector's classifier to avoid an import cycle
+    (injector imports promotion lazily; keep this direction clean).
+    """
+    fname = f"{hit_domain}.md"
+    try:
+        if (config.knowledge_dir / fname).exists():
+            return "namespace"
+    except Exception:
+        pass
+    try:
+        shared = getattr(config, "_shared_knowledge_dir", None)
+        if shared and (shared / fname).exists():
+            return "shared"
+    except Exception:
+        pass
+    try:
+        root = getattr(config, "_knowledge_root", None)
+        if root and root.exists():
+            for sub in root.iterdir():
+                if sub.is_dir() and sub != config.knowledge_dir and sub.name != "shared":
+                    if (sub / fname).exists():
+                        return "other_namespace"
+    except Exception:
+        pass
+    return "unknown"

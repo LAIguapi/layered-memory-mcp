@@ -229,7 +229,10 @@ class TestInjector:
                                   mode="upsert")
 
         assert result["success"] is True
-        assert result["action"] in ("replaced", "skipped")  # Should replace due to similarity
+        # v3.1.0: a same-section semantic reword now returns deferred_fusion
+        # (hand the merge to the calling LLM) rather than a blind whole-section
+        # replace. skipped/replaced remain valid for near-verbatim / fallback.
+        assert result["action"] in ("replaced", "skipped", "deferred_fusion")
 
     def test_inject_new_section_in_existing_file(self, tmp_path):
         """injecting into a new section in an existing file should append the section."""
