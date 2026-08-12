@@ -211,6 +211,8 @@ class MemoryConfig:
         sem_skip_threshold: float | None = None,
         sem_fuse_threshold: float | None = None,
         sem_merge_threshold: float | None = None,
+        # v3.2.0 new field — agent-memory write mode
+        memory_mode: str | None = None,
     ):
         self.home = Path(home) if home else default_home()
         self.knowledge_dir = Path(knowledge_dir) if knowledge_dir else default_knowledge_dir(self.home)
@@ -372,6 +374,23 @@ class MemoryConfig:
             sem_merge_threshold if sem_merge_threshold is not None
             else _env_float_or_none("LAYERED_MEMORY_SEM_MERGE_THRESHOLD")
         )
+
+        # v3.2.0: Agent-memory write mode — how dual-write treats MEMORY.md:
+        #   "pointers"   — legacy: one [L0] pointer per domain per write
+        #                  (accumulates; can overflow small memory budgets).
+        #   "index_only" — keep exactly ONE knowledge-index entry; per-domain
+        #                  pointers are reaped on every write, and any
+        #                  non-index entry remains bloat for compaction.
+        #   "off"        — no dual-write at all.
+        self.memory_mode: str = (
+            memory_mode if memory_mode is not None
+            else os.environ.get("LAYERED_MEMORY_MEMORY_MODE", "pointers")
+        ).strip().lower()
+        if self.memory_mode not in ("pointers", "index_only", "off"):
+            raise ValueError(
+                f"Invalid memory_mode: {self.memory_mode!r}. "
+                "Must be 'pointers', 'index_only', or 'off'."
+            )
 
         # v2.10.1: Domain classification table for the auto-extractor. The
         # framework ships **no** business presets — domain inference is opt-in.

@@ -427,8 +427,20 @@ def _ensure_l0_pointer_in_memory(
     sync pointers. This appends the pointer if missing, or replaces a stale
     pointer for the same domain/file.
 
+    v3.2.0: honours ``config.memory_mode`` —
+      - "off"        → skip dual-write entirely;
+      - "index_only" → delegate to ``_ensure_index_entry_in_memory`` (single
+        index entry, per-domain pointers reaped);
+      - "pointers"   → legacy per-domain pointer upsert (below).
+
     Returns a small report: {action: added|replaced|present|skipped, ...}.
     """
+    mode = getattr(config, "memory_mode", "pointers")
+    if mode == "off":
+        return {"action": "skipped", "reason": "memory_mode=off"}
+    if mode == "index_only":
+        return _ensure_index_entry_in_memory(config, memory_path=memory_path)
+
     path = memory_path or _resolve_memory_path(None, config)
     if not path:
         return {"action": "skipped", "reason": "memory path not resolvable"}
@@ -478,6 +490,99 @@ def _ensure_l0_pointer_in_memory(
         return {"action": "skipped", "reason": f"write failed: {e}"}
 
     return {"action": "replaced" if replaced else "added", "pointer": l0_pointer}
+
+# v3.2.0 — index_only mode -------------------------------------------------
+
+def _knowledge_index_marker(config=None) -> str:
+    """Marker prefix identifying the single knowledge-index entry.
+
+    Any entry starting with this prefix IS the index entry (at most one is
+    kept). Tag-aware so custom ``l0_tag`` configs stay consistent.
+    """
+    tag = getattr(config, "l0_tag", "[L0]") if config is not None else "[L0]"
+    return f"{tag} knowledge-index:"
+
+
+def _knowledge_index_entry_text(config: "MemoryConfig") -> str:
+    """Build the single index entry for index_only mode.
+
+    Points at the authoritative L0 index + retrieval tools, and states the
+    write rule (facts go to L1 via inject_knowledge, never into this file).
+    Domain count is refreshed on every write so the entry never goes stale.
+    """
+    try:
+        count = len(list(Path(config.knowledge_dir).glob("*.md")))
+    except Exception:  # noqa: BLE001 — count is cosmetic, never break the write
+        count = 0
+    return (
+        f"{_knowledge_index_marker(config)} {count} domain(s) — call "
+        f"get_l0_index() for the map, recall_knowledge() for content; store "
+        f"facts via inject_knowledge (L1), not in this file."
+    )
+
+
+def _ensure_index_entry_in_memory(
+    config: "MemoryConfig",
+    memory_path: Path | None = None,
+) -> dict:
+    """Index-only dual-write: keep exactly ONE knowledge-index entry.
+
+    - Upserts the single index entry (refreshes the domain count).
+    - REAPS (deletes, never migrates) per-domain [L0] pointer copies — they
+      are redundant with L0.md and are the historical bloat source. They
+      must NOT be routed into L1 (that was the v2.9.2 recursive-pollution
+      trap: pointers are index artifacts, not knowledge).
+    - Leaves non-index entries untouched; bloat detection + lazy compaction
+      route those to L1 through the normal compact_memory path.
+
+    Returns {action: added|upserted|skipped, index_entry, pointers_removed}.
+    """
+    path = memory_path or _resolve_memory_path(None, config)
+    if not path:
+        return {"action": "skipped", "reason": "memory path not resolvable"}
+
+    index_text = _knowledge_index_entry_text(config)
+    separator = _resolve_separator(path, config)
+    marker = _knowledge_index_marker(config)
+
+    try:
+        raw = path.read_text(encoding="utf-8") if path.exists() else ""
+    except OSError as e:
+        return {"action": "skipped", "reason": f"read failed: {e}"}
+
+    entries = _parse_entries(raw, separator=separator) if raw.strip() else []
+
+    kept: list[str] = []
+    pointers_removed = 0
+    index_written = False
+    for e in entries:
+        if e.strip().startswith(marker):
+            if not index_written:
+                kept.append(index_text)  # upsert with fresh count
+                index_written = True
+            # drop any duplicate index lines silently
+        elif _is_index_entry(e, config):
+            pointers_removed += 1  # reap per-domain pointer copy
+        else:
+            kept.append(e)
+
+    if not index_written:
+        kept.insert(0, index_text)
+
+    joined = f"\n{separator}\n".join(kept)
+    if kept:
+        joined += "\n"
+
+    try:
+        path.write_text(joined, encoding="utf-8")
+    except OSError as e:
+        return {"action": "skipped", "reason": f"write failed: {e}"}
+
+    return {
+        "action": "upserted" if index_written else "added",
+        "index_entry": index_text,
+        "pointers_removed": pointers_removed,
+    }
 
 
 def _remove_l0_pointer_from_memory(
