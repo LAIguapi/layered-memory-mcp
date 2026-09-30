@@ -30,6 +30,50 @@ logger = logging.getLogger("layered_memory_mcp.compactor")
 _DEFAULT_L0_TAG = "[L0]"
 _L0_INDEX_PATTERN = re.compile(r"^\[L0\]\s*")
 
+# --- v3.2.1 heading hygiene --------------------------------------------------
+# Max length of a derived section heading, in characters.
+MAX_SECTION_TITLE_CHARS = 40
+
+# Characters that genuinely break a markdown ATX heading or the section parser.
+# Everything else — ':' '/' '.' '（）' '，' '、' '×' etc. — is CONTENT and must
+# survive. The pre-3.2.1 code used an allow-list regex that deleted every one
+# of those, turning "/root/.hermes/cache/documents/" into
+# "roothermescachedocuments" and welding CJK clauses into one unbroken run
+# (the P2 "garbled_heading" pathology the rot auditor kept reporting).
+_HEADING_STRIP_RE = re.compile(r"[#*`_\[\]\r\n]+")
+
+# Boundary characters preferred when truncating a long heading, so we cut at a
+# clause edge instead of mid-word/mid-path.
+_TITLE_BOUNDARY_CHARS = "，,。.；;：:、（(【[ \t"
+
+
+def _clean_heading(text: str) -> str:
+    """Normalise a string for use as a markdown ## heading — losslessly.
+
+    Only strips markdown structural characters and newlines; all punctuation,
+    path separators and CJK marks are preserved. Returns "" when nothing
+    usable remains (caller decides what to do — never invent a title).
+    """
+    if not text:
+        return ""
+    cleaned = _HEADING_STRIP_RE.sub(" ", text)
+    # Collapse runs of whitespace introduced by the strip.
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+def _truncate_on_boundary(text: str, max_chars: int = MAX_SECTION_TITLE_CHARS) -> str:
+    """Truncate to max_chars, preferring a clause boundary over a hard cut."""
+    text = (text or "").strip()
+    if len(text) <= max_chars:
+        return text
+    window = text[:max_chars]
+    cut = max(window.rfind(ch) for ch in _TITLE_BOUNDARY_CHARS)
+    # Only honour the boundary if it keeps a reasonable amount of the title.
+    if cut >= max_chars // 2:
+        return window[:cut].strip()
+    return window.strip()
+
 
 def _get_l0_pattern(config=None) -> re.Pattern:
     """Get the L0 index tag pattern, using the configured l0_tag.
@@ -211,6 +255,7 @@ def detect_memory_bloat(
             "entry_length": len(entry),
             "suggested_domain": suggestion["domain"],
             "suggested_section": suggestion["section"],
+            "needs_title": suggestion.get("needs_title", False),
         })
 
     result = {
@@ -301,6 +346,25 @@ def compact_memory(
 
         # This is a bloat entry — migrate to L1
         suggestion = _suggest_migration(entry, domain_rules=domain_rules, config=config)
+
+        # v3.2.1 (Bug 2): the framework could not derive a trustworthy heading
+        # for this entry. Previously it fabricated one from the body's first 40
+        # chars, which is exactly how stub headings accumulated next to real
+        # ones. Refuse the write, keep the entry in place, and report it so the
+        # calling agent (an LLM) can name it and re-run.
+        if suggestion.get("needs_title"):
+            errors.append({
+                "entry_preview": entry[:80],
+                "error": (
+                    "needs_title: cannot derive a section heading for this entry "
+                    "(no L0 tag). Re-inject it explicitly with an agent-chosen "
+                    "section name; refusing to fabricate a heading from the body."
+                ),
+                "needs_title": True,
+                "suggested_domain": suggestion["domain"],
+            })
+            kept.append(entry)  # leave the original untouched
+            continue
 
         if dry_run:
             migrated.append({
@@ -1034,22 +1098,33 @@ def _suggest_migration(entry: str, domain_rules: list[tuple[str, list[str]]] | N
             after_tag = entry[tag_match.end():]
             # Try to extract meaningful content after the "domain: " prefix
             content_part = re.sub(r"^[\w\-]+:\s*", "", after_tag).strip()
-            section = content_part.split("→")[0].strip() if "→" in content_part else content_part[:40]
-            section = re.sub(r"[^a-zA-Z0-9\u4e00-\u9fff\s\-]", "", section).strip()
+            section = (
+                content_part.split("→")[0].strip()
+                if "→" in content_part
+                else _truncate_on_boundary(content_part, MAX_SECTION_TITLE_CHARS)
+            )
+            section = _clean_heading(section)
         elif "·" in raw_tag:
             # Structured tags like [tag·subcategory]
             section = raw_tag.strip()
         else:
             section = raw_tag.strip()
     else:
-        # Use first meaningful words
-        first_line = entry.split("\n")[0].strip()
-        section = first_line[:40].strip()
+        # v3.2.1 (Bug 2): NO first-line-as-title fallback. Slicing the body's
+        # first 40 chars fabricated a near-miss heading every time the same
+        # knowledge came back reworded, producing the "stub heading sitting
+        # next to the real one" pathology. The zero-LLM core must not guess a
+        # title: signal that naming is required and let the calling agent name
+        # it. Callers surface `needs_title` instead of writing a stub.
+        section = ""
 
-    # Clean section for markdown heading
-    section = re.sub(r"[^\w\s\-·‧\u4e00-\u9fff]", "", section).strip()
-    if not section:
-        section = "migrated"
+    # Clean section for markdown heading (punctuation/paths preserved — see
+    # _clean_heading; the old whitelist regex here ate ':' '/' '.' and CJK
+    # punctuation, which is what mangled paths into "roothermescachedocuments").
+    section = _clean_heading(section)
+    needs_title = not section
+    if needs_title:
+        section = ""
 
     # Generate L0 pointer — strip the L0 tag prefix from summary if present
     summary = _summarize_brief(entry, config=config)
@@ -1065,6 +1140,7 @@ def _suggest_migration(entry: str, domain_rules: list[tuple[str, list[str]]] | N
     return {
         "domain": matched_domain,
         "section": section,
+        "needs_title": needs_title,
         "l0_pointer": l0_pointer,
     }
 

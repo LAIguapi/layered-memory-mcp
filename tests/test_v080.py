@@ -264,10 +264,44 @@ class TestMemoryCompaction:
         result = compact_memory(config, memory_path=str(memory_file), dry_run=True)
         assert result["success"] is True
         assert result["dry_run"] is True
-        assert result["migrated_count"] == 1
+        # v3.2.1: an untagged bloat entry can no longer be auto-titled. The
+        # framework refuses it (needs_title) instead of fabricating a heading
+        # from the body's first 40 chars.
+        assert result["migrated_count"] == 0
+        assert result["error_count"] == 1
+        assert result["errors"][0].get("needs_title") is True
 
         # File should NOT be modified in dry run
         assert memory_file.read_text(encoding="utf-8") == original_content
+
+    def test_compact_memory_dry_run_tagged_entry_migrates(self, tmp_path):
+        """A bloat entry carrying an L0 tag still has a derivable heading."""
+        knowledge_dir = tmp_path / "knowledge"
+        knowledge_dir.mkdir()
+        memory_file = tmp_path / "MEMORY.md"
+
+        memory_file.write_text(
+            "[L0索引] infra: proxy → knowledge/infra.md\n"
+            "§\n"
+            "[proxy] 代理配置：走 /etc/proxy.conf，端口 7890，注意 no_proxy 白名单\n",
+            encoding="utf-8",
+        )
+
+        config = MemoryConfig(
+            home=str(tmp_path),
+            knowledge_dir=str(knowledge_dir),
+        )
+
+        result = compact_memory(config, memory_path=str(memory_file), dry_run=True)
+        assert result["success"] is True
+        assert result["error_count"] == 0
+        assert result["migrated_count"] == 1
+        # A bracket tag supplies the heading directly — no body slicing needed.
+        assert result["migrated"][0]["section"] == "proxy"
+        # Bug 1 guard: the generated L0 pointer keeps the path intact.
+        pointer = result["migrated"][0]["l0_pointer"]
+        assert "/etc/proxy.conf" in pointer
+        assert "etcproxyconf" not in pointer
 
     def test_compact_memory_real_run(self, tmp_path):
         """compact_memory should migrate bloat and write cleaned file."""
@@ -278,7 +312,7 @@ class TestMemoryCompaction:
         memory_file.write_text(
             "[L0索引] infra: proxy → knowledge/infra.md\n"
             "§\n"
-            "Docker deploy config for proxy server setup\n"
+            "[config] Docker deploy config for proxy server setup\n"
             "§\n"
             "[L0索引] dev: principles → knowledge/dev.md",
             encoding="utf-8",
