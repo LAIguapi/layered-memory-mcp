@@ -21,6 +21,7 @@ All fixtures use neutral placeholder content (no business data).
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -340,6 +341,32 @@ class TestPluginWiring:
 
         source = Path(guard.__file__)
         assert (plugin_dir(tmp_path) / "guard.py").read_text(encoding="utf-8") == source.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Release consistency
+# ---------------------------------------------------------------------------
+
+class TestReleaseConsistency:
+    """A release bumps the version in several files; lock them together."""
+
+    def test_versions_agree_across_artifacts(self):
+        repo = Path(__file__).resolve().parents[1]
+        pyproject = (repo / "pyproject.toml").read_text(encoding="utf-8")
+        declared = re.search(r'^version = "([^"]+)"', pyproject, re.M)
+        package_init = (repo / "src" / "layered_memory_mcp" / "__init__.py").read_text(encoding="utf-8")
+        fallback = re.search(r'__version__ = "([^"]+)"', package_init)
+        manifest = (Path(guard.__file__).parent / "plugin.yaml").read_text(encoding="utf-8")
+        plugin_version = re.search(r'^version: "([^"]+)"', manifest, re.M)
+
+        assert declared and fallback and plugin_version, "version declarations not found"
+        assert (
+            declared.group(1) == fallback.group(1) == plugin_version.group(1) == GUARD_VERSION
+        ), (
+            "version drift: pyproject="
+            f"{declared.group(1)} __init__={fallback.group(1)} "
+            f"plugin.yaml={plugin_version.group(1)} guard={GUARD_VERSION}"
+        )
 
 
 # ---------------------------------------------------------------------------
