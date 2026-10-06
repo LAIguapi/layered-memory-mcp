@@ -126,6 +126,25 @@ class TestReadStateDbSessions:
         assert result["sessions"] == []
         assert result["stats"]["excluded_sessions"] == 1
 
+    def test_marker_deep_in_a_long_session_is_still_caught(self, tmp_path):
+        """Regression: an excerpt-based check let markers buried in long sessions through.
+
+        Live finding (2026-10-06): with real sessions the filter reported zero
+        exclusions even though the session plainly contained the configured
+        marker — the check only saw the head+tail sample and 200-char excerpts,
+        so anything deeper was invisible. A privacy filter that under-reports is
+        worse than none, because the operator trusts the count.
+        """
+        head = [("user", f"placeholder head {i} " + "x" * 600) for i in range(30)]
+        buried = [("assistant", "opening " + "y" * 1500 + " placeholder-secret " + "z" * 1500)]
+        tail = [("user", f"placeholder tail {i}") for i in range(30)]
+        db = _build_db(tmp_path, [{"id": "sess-long", "title": "innocent title"}],
+                       {"sess-long": head + buried + tail})
+        result = read_state_db_sessions(db, days=3, max_sessions=5,
+                                        exclude_markers=["placeholder-secret"])
+        assert result["sessions"] == [], "marker buried mid-session must still withhold it"
+        assert result["stats"]["excluded_sessions"] == 1
+
     def test_window_excludes_old_sessions(self, tmp_path):
         old = _now() - 30 * 86400
         db = _build_db(

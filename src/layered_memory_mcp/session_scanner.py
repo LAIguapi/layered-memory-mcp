@@ -426,22 +426,22 @@ def read_state_db_sessions(
                 output["stats"]["skipped_sources"] += 1
                 continue
 
-            summary = _summarize_db_session(conn, row, max_messages=max_messages)
-
+            # Marker check runs against the DB, not against the (sampled and
+            # truncated) summary: a marker buried in a long message would sail
+            # through an excerpt-based check, which is exactly the kind of
+            # silent under-filtering a privacy control must not have.
             if markers:
-                haystack = " ".join(
-                    [summary.get("title", "")]
-                    + summary["user_messages"]
-                    + summary["assistant_topics"]
-                    + summary["key_decisions"]
-                ).lower()
-                hit = next((m for m in markers if m in haystack), None)
+                title_lower = (row["title"] or "").lower()
+                hit = next((m for m in markers if m in title_lower), None)
+                if hit is None:
+                    hit = _session_hits_marker(conn, row["id"], markers)
                 if hit:
                     output["stats"]["excluded_sessions"] += 1
                     by_marker = output["stats"]["excluded_by_marker"]
                     by_marker[hit] = by_marker.get(hit, 0) + 1
                     continue
 
+            summary = _summarize_db_session(conn, row, max_messages=max_messages)
             output["sessions"].append(summary)
             if len(output["sessions"]) >= max_sessions:
                 break

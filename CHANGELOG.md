@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.4.3] - 2026-10-06
+
+### Fixed
+
+- **The session export filter under-reported: it checked excerpts, not content.**
+  `exclude_markers` was matched against the *summarised* session (head+tail sample
+  of at most 50 messages, user messages only when under 500 chars, assistant
+  topics truncated to 200), so a marker buried in a long message was never seen —
+  the very first live run against real sessions reported `excluded_sessions: 0`
+  while the configured markers were plainly present in 13 and 14 of that
+  session's messages. A privacy filter that under-reports is worse than none,
+  because the operator trusts the count: the check now runs against the database
+  itself (title plus a full-content `LIKE` per marker) before any summary is
+  built, so what is filtered is decided by what the session actually contains.
+
 ## [3.4.2] - 2026-10-06
 
 ### Fixed
