@@ -9,9 +9,10 @@ observed in long-lived layered-memory knowledge bases:
   P2  garbled_heading  — section headings that lost their punctuation/spaces
                          (long run of characters with no separators), usually
                          from an early summariser bug or hand-edited memory.
-  P3  stale            — sections carrying an expired date or a transient
-                         marker ("下次执行", "待测试", "TODO", "临时") that
-                         should have been recycled.
+  P3  stale            — sections carrying a *forward-looking* promise
+                         ("下次执行", "待测试", "尚未…") whose date has already
+                         passed, on the same line. Retrospective notes that
+                         merely carry an observation date are history, not rot.
   P4  cross_dup        — near-duplicate sections living in different files,
                          i.e. the same knowledge defined in more than one place.
 
@@ -35,10 +36,17 @@ OVERSIZED_BYTES = 4096          # files above this are flagged (P1)
 GARBLED_MIN_LEN = 30           # heading length above which we check for garbling
 CROSS_DUP_SIMILARITY = 0.82    # section-pair similarity to flag as duplicate (P4)
 
-# Transient markers suggesting a section was meant to be temporary (P3)
-_TRANSIENT_MARKERS = [
-    "下次执行", "待测试", "临时", "TODO", "待后续", "待实施",
-    "暂时", "先放", "稍后", "如仍触发", "兜底拆分",
+# Forward-looking status markers (P3). Each one promises an action that carries
+# a deadline, so a past date next to it means the promise is overdue.
+#
+# Retrospective qualifiers such as 临时 / 暂时 are deliberately absent: they
+# describe the *scope* of a note, not a pending action, and pairing them with an
+# observation date ("（2026-09-11 实测）") flagged every dated lesson in the
+# library — a measured 100% false-positive rate, 18 of 56 points in the score.
+_PENDING_MARKERS = [
+    "下次执行", "下次", "待测试", "待后续", "待实施", "待验证", "待复测", "待定",
+    "尚未", "未完成", "未应用", "未修", "未落地", "稍后", "先放", "如仍触发",
+    "TODO", "FIXME", "PENDING",
 ]
 
 # Date patterns to detect expired content (P3)
@@ -115,29 +123,37 @@ def audit_rot(config: "MemoryConfig") -> dict:
                     garbled.append({"file": name, "heading": heading[:60],
                                     "length": len(heading)})
 
-            # P3 — stale: a transient state marker AND an expired date.
-            # Requiring both keeps false positives low — a section that merely
-            # mentions "TODO" or "临时" in passing (e.g. the P2 difficulty tier,
-            # a standing TODO list) is NOT stale. Real rot is a time-bound
-            # status note ("下次执行 5/22") whose date has passed.
-            head_and_lead = heading + "\n" + "\n".join(body.split("\n")[:2])
-            marker_hit = next((mk for mk in _TRANSIENT_MARKERS if mk in head_and_lead), None)
-            expired = None
-            for dm in _DATE_RE.finditer(head_and_lead):
-                try:
-                    y, mo, d = int(dm.group(1)), int(dm.group(2)), int(dm.group(3))
-                    dt = date(y, mo, d)
-                    if dt < today:
-                        expired = dt.isoformat()
-                except ValueError:
+            # P3 — stale: a *forward-looking* marker and an expired date ON THE
+            # SAME LINE. All three conditions matter:
+            #   • forward-looking marker — a pending action can go overdue; a
+            #     retrospective note cannot. (Requiring this is what removed the
+            #     100%-false-positive behaviour where every dated lesson was
+            #     flagged for the mere presence of 临时/暂时.)
+            #   • a past date — the deadline has passed.
+            #   • same line — otherwise an unrelated observation date elsewhere
+            #     in the lead ("…（2026-09-11 实测）") would convict a note whose
+            #     marker points somewhere else entirely.
+            # The shape that survives all three is "下次执行 2026-08-01".
+            stale_hit: tuple[str, str] | None = None
+            for line in (heading, *body.split("\n")[:2]):
+                marker_hit = next((mk for mk in _PENDING_MARKERS if mk in line), None)
+                if not marker_hit:
                     continue
-            # Flag only when a transient marker co-occurs with a past date in
-            # the heading/lead — the high-confidence "stale status note" shape.
-            if marker_hit and expired:
+                for dm in _DATE_RE.finditer(line):
+                    try:
+                        dt = date(int(dm.group(1)), int(dm.group(2)), int(dm.group(3)))
+                    except ValueError:
+                        continue
+                    if dt < today:
+                        stale_hit = (marker_hit, dt.isoformat())
+                        break
+                if stale_hit:
+                    break
+            if stale_hit:
                 stale.append({
                     "file": name,
                     "heading": heading[:60],
-                    "reason": f"transient '{marker_hit}' + expired date {expired}",
+                    "reason": f"pending '{stale_hit[0]}' + expired date {stale_hit[1]}",
                 })
 
             # collect for cross-dup (skip tiny / pure-pointer sections)

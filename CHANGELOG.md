@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.3.3] - 2026-10-06
+
+### Fixed
+
+- **Stale detection no longer convicts retrospective notes.** The auditor
+  flagged a section when a marker appeared anywhere in the heading or the
+  leading two lines together with any past date in that same text — and the
+  marker list contained the scope qualifiers `临时` / `暂时`. Every dated lesson
+  (`（2026-09-11 实测）`, `（2026-07-16，含实证）`) therefore tripped it: six of
+  six reported "stale" sections in the live library were false positives, and
+  they cost 18 points of a 56-point score.
+  A section can only be *overdue* if it carries a promise, so the marker list is
+  now forward-looking only (`下次执行`, `待…`, `尚未…`, `未落地`, `TODO`, …) and
+  the date must sit **on the same line** as the marker — otherwise an unrelated
+  observation date nearby would still convict it. The surviving shape is
+  `下次执行 2026-08-01`.
+
 ## [3.3.2] - 2026-10-06
 
 ### Fixed
