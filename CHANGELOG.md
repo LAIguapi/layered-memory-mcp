@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.4.0] - 2026-10-06
+
+### Added
+
+- **Periodic self-maintenance on long-lived servers** (`maintenance.py`). On HTTP
+  transport the server now starts a daemon thread: every
+  `maintenance_tick_seconds` (default 1800 / 30 min, first tick after a 60 s
+  `maintenance_initial_delay`) it runs the same self-maintenance the write path
+  used to ride along on — agent-memory compaction plus L1 line-level dedup — and
+  refreshes a deployed write-guard that drifted behind the package. Until now
+  that work only happened when somebody called the server, so an idle daemon
+  never compacted and never healed the guard; the framework's own design notes
+  called for closing this **inside** the framework rather than with an external
+  cron job.
+
+  The work it triggers is itself interval/threshold-gated (memory usage ≥
+  `compact_bloat_threshold`, or `auto_maintain_interval_days` elapsed, or the
+  critical threshold), so a normal tick is a cheap read that does nothing.
+
+  Bounded on purpose:
+
+  * `audit_rot` is **not** in the loop — a full rot audit is an O(n²) scan
+    (seconds of CPU on a real store) and the weekly health-watchdog cron already
+    runs it.
+  * stdio servers do not start it — they are per-session and short-lived, and
+    stdout carries the JSON-RPC stream, so a background thread must not write
+    there. The ride-along still covers them.
+  * A failing job is logged and retried next tick; it never kills the loop, and a
+    failing compaction never blocks the guard refresh (independent jobs).
+
+### Config
+
+- `maintenance_enabled` (default **true** — the kill switch),
+  `maintenance_tick_seconds` (1800; anything under a 30 s floor is raised to it,
+  so a seconds/milliseconds mix-up cannot become a busy loop),
+  `maintenance_initial_delay` (60); env overrides
+  `LAYERED_MEMORY_MAINTENANCE_{ENABLED,TICK,DELAY}`.
+
 ## [3.3.8] - 2026-10-06
 
 ### Fixed

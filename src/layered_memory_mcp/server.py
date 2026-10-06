@@ -2324,6 +2324,15 @@ def main():
             watcher.start()
         except Exception as e:
             logger.warning("Failed to start knowledge watcher: %s", e)
+        # v3.4.0: periodic self-maintenance. Only here (HTTP = long-lived daemon):
+        # a stdio server is per-session, short-lived, and its stdout carries the
+        # JSON-RPC stream, so a background thread must not write there.
+        try:
+            from .maintenance import start_maintenance
+
+            start_maintenance(config)
+        except Exception as e:
+            logger.warning("Failed to start maintenance loop: %s", e)
         mcp.run(transport="http", port=args.port)
 
 

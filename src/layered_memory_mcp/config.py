@@ -252,6 +252,9 @@ class MemoryConfig:
         consolidate_enabled: bool | None = None,
         consolidate_min_family: int | None = None,
         consolidate_size_ceiling: float | None = None,
+        maintenance_enabled: bool | None = None,
+        maintenance_tick_seconds: float | None = None,
+        maintenance_initial_delay: float | None = None,
     ):
         self.home = Path(home) if home else default_home()
         self.knowledge_dir = Path(knowledge_dir) if knowledge_dir else default_knowledge_dir(self.home)
@@ -490,6 +493,39 @@ class MemoryConfig:
             )
         except (TypeError, ValueError):
             self.consolidate_size_ceiling = 0.9
+
+        # v3.4.0: periodic self-maintenance (see maintenance.py). Enabled by
+        # default — the framework's self-maintenance is the framework's job
+        # (the ride-along only ever ran when somebody happened to call the
+        # server). The loop is a daemon thread on long-lived servers only, and
+        # the work it triggers is interval/threshold-gated internally.
+        self.maintenance_enabled: bool = (
+            bool(maintenance_enabled)
+            if maintenance_enabled is not None
+            else _env_bool("LAYERED_MEMORY_MAINTENANCE_ENABLED", True)
+        )
+        _mtick = (
+            maintenance_tick_seconds
+            if maintenance_tick_seconds is not None
+            else os.environ.get("LAYERED_MEMORY_MAINTENANCE_TICK")
+        )
+        try:
+            self.maintenance_tick_seconds: float = (
+                float(_mtick) if _mtick is not None else 1800.0
+            )
+        except (TypeError, ValueError):
+            self.maintenance_tick_seconds = 1800.0
+        _mdelay = (
+            maintenance_initial_delay
+            if maintenance_initial_delay is not None
+            else os.environ.get("LAYERED_MEMORY_MAINTENANCE_DELAY")
+        )
+        try:
+            self.maintenance_initial_delay: float = (
+                float(_mdelay) if _mdelay is not None else 60.0
+            )
+        except (TypeError, ValueError):
+            self.maintenance_initial_delay = 60.0
 
         # v2.10.1: Domain classification table for the auto-extractor. The
         # framework ships **no** business presets — domain inference is opt-in.
