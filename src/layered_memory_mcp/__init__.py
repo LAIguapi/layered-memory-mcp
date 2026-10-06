@@ -22,6 +22,6 @@ from importlib.metadata import version, PackageNotFoundError
 try:
     __version__ = version("layered-memory-mcp")
 except PackageNotFoundError:
-    __version__ = "3.3.7"
+    __version__ = "3.3.8"
 
 __all__ = ["__version__"]

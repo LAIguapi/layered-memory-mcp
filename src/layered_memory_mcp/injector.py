@@ -179,10 +179,11 @@ def _family_gate(config, filepath: Path, section: str, content: str) -> dict | N
             f"understanding, not a change log: rewrite the whole family into ONE "
             f"section — the current understanding plus a one-line provenance note "
             f"(e.g. '出处：09-22/09-26 两期实测') — then re-submit that text with "
-            f"fuse=True and the expected_hash below. The framework refuses a "
-            f"write-back that fails to shrink the family by at least "
+            f"fuse=True and the expected_hash below. Once the family holds two or "
+            f"more members the framework also refuses a write-back that fails to "
+            f"shrink it by at least "
             f"{100 - int(float(getattr(config, 'consolidate_size_ceiling', 0.9) or 0.9) * 100)}% "
-            f"or that does not reduce the section count."
+            f"(a re-statement in a new shape is not consolidation)."
         ),
         "l0_synced": False,
     }
@@ -216,7 +217,14 @@ def _consolidation_writeback(
     total_old = sum(len(b) for _h, b in family)
     new_len = len(content.strip())
     ceiling = float(getattr(config, "consolidate_size_ceiling", 0.9) or 0)
-    if ceiling and total_old and new_len >= total_old * ceiling:
+    # The ceiling compares the write-back against the sections it REPLACES, which
+    # is meaningful once several have piled up. With a single existing member the
+    # incoming note is itself part of what must be preserved, so demanding
+    # shrinkage would refuse every first consolidation and deadlock the gate
+    # (measured on the live service: a 22-character member cannot host a merged
+    # body in under 0.9 × 22 characters). Anti-laziness therefore starts at two
+    # existing members; a single member only has to come back as ONE section.
+    if len(family) >= 2 and ceiling and total_old and new_len >= total_old * ceiling:
         return {
             "refused": {
                 "success": False,

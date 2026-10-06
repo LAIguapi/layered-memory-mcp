@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.3.8] - 2026-10-06
+
+### Fixed
+
+- **The v3.3.7 gate could deadlock a single-member family.** The anti-laziness
+  ceiling was compared against the *existing* member's bytes, but the merged body
+  necessarily carries that member's facts **plus** the incoming note — so for a
+  family of one, the write-back was refused while the write itself stayed
+  blocked: the caller had no legal move. The ceiling now applies from two
+  existing members upward, which is where "a re-statement dressed as
+  consolidation" is the real risk; a single member only has to come back as one
+  section.
+
+  Found by running the handshake against the live service minutes after 3.3.7 was
+  installed — a 22-character member cannot host a merged body in under 0.9 × 22
+  characters. No live data was affected: the library has no same-skeleton families
+  (`same_file_duplicate: 0`), so the gate had nothing to block, and the flaw was
+  reachable only through the probe. Regression test added.
+
 ## [3.3.7] - 2026-10-06
 
 ### Added

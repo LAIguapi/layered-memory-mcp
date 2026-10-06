@@ -147,6 +147,28 @@ class TestWriteback:
         assert headings == [TOPIC_C]
         assert heading_skeleton(headings[0]) == "例行巡检期"
 
+    def test_single_member_family_can_always_be_consolidated(self, tmp_path):
+        """The ceiling compares against the replaced family, so it starts at 2.
+
+        Regression for a deadlock found by running the handshake against the live
+        service: with one existing member, the merged body is naturally longer
+        than that member, so a ceiling applied here would refuse every first
+        consolidation while still blocking the write.
+        """
+        cfg = _seed_family(tmp_path, bodies=(BODY_A,))
+        deferred = inject_knowledge(cfg, "ops", TOPIC_B, BODY_B, mode="upsert")
+        assert deferred["action"] == "deferred_consolidate"
+
+        merged = f"例行巡检：{BODY_A}{BODY_B}出处：两期。"
+        assert len(merged) > len(BODY_A), "the merged body is longer than the member it replaces"
+
+        result = inject_knowledge(
+            cfg, "ops", TOPIC_B, merged,
+            mode="upsert", fuse=True, expected_hash=deferred["expected_hash"],
+        )
+        assert result["action"] == "consolidated", result
+        assert _sections(cfg, "ops") == [TOPIC_B]
+
     def test_lazy_writeback_is_refused(self, tmp_path):
         """Re-stating the family in a new shape is not consolidation."""
         cfg = _seed_family(tmp_path)
