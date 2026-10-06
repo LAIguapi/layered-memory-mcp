@@ -142,15 +142,23 @@ def test_exact_duplicate_still_skipped(tmp_path):
     assert r["dedup"]["match_kind"] == "exact"
 
 
-# --- append mode still force-appends (backward compat) -----------------------
+# --- append mode is deprecated (v3.3.7) -------------------------------------
 
-def test_append_mode_forces_append_on_reword(tmp_path):
+def test_append_mode_is_deprecated_and_behaves_as_upsert(tmp_path):
+    """v3.3.7 contract change: ``mode="append"`` no longer appends.
+
+    Append-without-merge is how periodic notes piled up as same-topic families
+    that no cosine threshold could see. The mode is still accepted (callers keep
+    working) but behaves as ``upsert``, and the response says so — so a reword
+    now defers fusion exactly as it does in upsert mode.
+    """
     cfg = _mk_config(tmp_path)
     inject_knowledge(cfg, "boot", "框架总览", _ORIGINAL, mode="upsert")
     r = inject_knowledge(cfg, "boot", "框架总览", _REWORD, mode="append")
-    # append never defers fusion; a reword (not near-verbatim) is added.
-    assert r["action"] in ("appended", "section_created"), r
-    assert not r.get("needs_fusion")
+
+    assert r["mode_deprecated"] == "append", r
+    assert r["action"] == "deferred_fusion", r
+    assert r["needs_fusion"] is True
 
 
 # --- Cross-domain duplicate: write path stays silent (v3.1.2 slimming) -------

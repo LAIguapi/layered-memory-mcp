@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 
 from filelock import FileLock
 
+from .heading import heading_skeleton
 from .recall import find_similar_knowledge, invalidate_scan_cache, knowledge_health, scan_knowledge_files
 
 if TYPE_CHECKING:
@@ -54,6 +55,237 @@ SEM_SKIP_THRESHOLD = 0.95    # >= → near-verbatim, no-op (Layer 1 usually caug
 SEM_FUSE_THRESHOLD = 0.72    # >= → "same knowledge", defer section fusion to caller
 SEM_MERGE_THRESHOLD = 0.55   # >= → related, line-dedup merge into target section
 # below SEM_MERGE_THRESHOLD → genuinely new → append
+
+
+# ---------------------------------------------------------------------------
+# v3.3.7: same-skeleton families — the write side of the v3.3.2 read detector.
+# ---------------------------------------------------------------------------
+# A periodic note ("AI项目横评 2026-09-22 期（文档解析…）") has a heading that
+# looks unique to a reader and to cosine similarity, but not to
+# ``heading_skeleton``. That asymmetry is why the auditor could already report a
+# family the writer kept appending to. These helpers give the writer the same
+# eyes: when a write would create another member of an existing family, hand the
+# whole family back and require it to be rewritten as one section.
+
+_SECTION_SPLIT_RE = re.compile(r"(?m)^(##[^\n]*)$")
+
+
+def _mode_note(mode_deprecated: str | None) -> dict:
+    """Response fragment for a caller that asked for the retired ``append``.
+
+    Injected into every response shape (deferred/skipped/consolidated/plain) so
+    a stale caller can be found and fixed instead of silently getting different
+    semantics than it asked for.
+    """
+    if not mode_deprecated:
+        return {}
+    return {
+        "mode_deprecated": mode_deprecated,
+        "mode_note": (
+            f"mode={mode_deprecated!r} is no longer honoured (it appended without "
+            "merging, which is how periodic families piled up); it behaved as "
+            "'upsert' for this write."
+        ),
+    }
+
+
+def _split_raw(raw: str) -> tuple[str, list[tuple[str, str]]]:
+    """Split a domain file into (preamble, [(heading_line, body), ...]).
+
+    Byte-faithful: ``preamble + "".join(h + b for h, b in parts)`` restores the
+    input exactly, so a caller can rebuild the file changing only what it means
+    to change.
+    """
+    parts = _SECTION_SPLIT_RE.split(raw)
+    preamble = parts[0]
+    sections: list[tuple[str, str]] = []
+    for i in range(1, len(parts) - 1, 2):
+        sections.append((parts[i], parts[i + 1]))
+    return preamble, sections
+
+
+def _heading_text(heading_line: str) -> str:
+    """``"## Foo"`` → ``"Foo"``."""
+    return heading_line[2:].strip()
+
+
+def _heading_family(raw: str, section: str) -> list[tuple[str, str]]:
+    """Existing (heading_line, body) pairs whose skeleton matches ``section``."""
+    skeleton = heading_skeleton(section)
+    if not skeleton:
+        return []
+    _preamble, sections = _split_raw(raw)
+    return [
+        (h, b) for h, b in sections if heading_skeleton(_heading_text(h)) == skeleton
+    ]
+
+
+def _family_hash(family: list[tuple[str, str]]) -> str:
+    """Optimistic-lock token for a whole family (cf. ``_hash_body`` per section)."""
+    return _hash_body("\n".join(h + b for h, b in family))
+
+
+def _family_gate(config, filepath: Path, section: str, content: str) -> dict | None:
+    """Return a ``deferred_consolidate`` response, or None to write normally.
+
+    Fires when the target file already holds a section with the same heading
+    *skeleton* and this write would add another member (``consolidate_min_family``
+    members in total). A write whose heading matches a member exactly is an
+    ordinary update — the family does not grow, so it is not gated.
+    """
+    if not bool(getattr(config, "consolidate_enabled", False)):
+        return None
+    try:
+        if not filepath.exists():
+            return None
+        raw = filepath.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    if not raw:
+        return None
+
+    family = _heading_family(raw, section)
+    if not family:
+        return None
+    if any(_heading_text(h) == section for h, _b in family):
+        return None  # exact-heading update, not a new member
+
+    min_family = int(getattr(config, "consolidate_min_family", 2) or 2)
+    if len(family) < max(1, min_family - 1):
+        return None
+
+    # Visible on purpose: an unattended caller that ignores the action would
+    # otherwise look like a silent no-op write.
+    logger.warning(
+        "deferred_consolidate: %s already holds %d section(s) with skeleton %r; "
+        "refusing to add another",
+        section, len(family), heading_skeleton(section),
+    )
+
+    return {
+        "success": True,
+        "action": "deferred_consolidate",
+        "domain": None,  # filled in by the caller
+        "section": section,
+        "family_size": len(family),
+        "would_be_family_size": len(family) + 1,
+        "family": [{"heading": _heading_text(h), "body": b.strip()} for h, b in family],
+        "new_content": content.strip(),
+        "expected_hash": _family_hash(family),
+        "hint": (
+            f"This file already holds {len(family)} section(s) on the same topic "
+            f"(same heading skeleton after dropping dates/issue numbers), and this "
+            f"write would add another. A memory file is a snapshot of the current "
+            f"understanding, not a change log: rewrite the whole family into ONE "
+            f"section — the current understanding plus a one-line provenance note "
+            f"(e.g. '出处：09-22/09-26 两期实测') — then re-submit that text with "
+            f"fuse=True and the expected_hash below. The framework refuses a "
+            f"write-back that fails to shrink the family by at least "
+            f"{100 - int(float(getattr(config, 'consolidate_size_ceiling', 0.9) or 0.9) * 100)}% "
+            f"or that does not reduce the section count."
+        ),
+        "l0_synced": False,
+    }
+
+
+def _consolidation_writeback(
+    config, filepath: Path, section: str, expected_hash: str | None, content: str
+) -> dict | None:
+    """Validate a consolidation write-back (second half of the handshake).
+
+    Distinguishes a consolidation from a plain fusion by the hash: the
+    ``deferred_consolidate`` response carries the hash of the whole *family*,
+    ``deferred_fusion`` the hash of one section body. Returns ``{"ok": True}``,
+    ``{"refused": <response>}`` or None when this is not a consolidation.
+    """
+    if not bool(getattr(config, "consolidate_enabled", False)):
+        return None
+    if not expected_hash:
+        return None
+    try:
+        if not filepath.exists():
+            return None
+        raw = filepath.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+    family = _heading_family(raw, section)
+    if not family or _family_hash(family) != expected_hash:
+        return None
+
+    total_old = sum(len(b) for _h, b in family)
+    new_len = len(content.strip())
+    ceiling = float(getattr(config, "consolidate_size_ceiling", 0.9) or 0)
+    if ceiling and total_old and new_len >= total_old * ceiling:
+        return {
+            "refused": {
+                "success": False,
+                "action": "consolidate_refused",
+                "domain": None,
+                "section": section,
+                "family_size": len(family),
+                "family_bytes": total_old,
+                "submitted_bytes": new_len,
+                "ratio": round(new_len / total_old, 3),
+                "ceiling": ceiling,
+                "reason": (
+                    "The write-back is not smaller than the family it replaces "
+                    f"({new_len} vs {total_old} bytes, ratio "
+                    f"{new_len / total_old:.3f} ≥ ceiling {ceiling}). This is the "
+                    "anti-laziness check: re-stating the old sections in a new "
+                    "shape is not consolidation. Rewrite the family as the current "
+                    "understanding plus a provenance line, then re-submit."
+                ),
+                "l0_synced": False,
+            }
+        }
+    return {"ok": True, "family_size": len(family)}
+
+
+def _write_consolidated(
+    filepath: Path, raw: str, section: str, content: str, provenance: str
+) -> dict:
+    """Collapse every same-skeleton section into one, in the first member's slot.
+
+    Called under the file lock, after ``_do_write`` has already written ``.bak``.
+    """
+    skeleton = heading_skeleton(section)
+    preamble, sections = _split_raw(raw)
+    idxs = [
+        i
+        for i, (h, _b) in enumerate(sections)
+        if heading_skeleton(_heading_text(h)) == skeleton
+    ]
+    if not idxs:
+        return {
+            "success": False,
+            "write_action": "consolidate_conflict",
+            "error": "no sections matched the heading skeleton at write time",
+        }
+
+    first = idxs[0]
+    kept: list[str] = []
+    removed = 0
+    for i, (h, b) in enumerate(sections):
+        if i == first:
+            kept.append(f"## {section}\n\n{content}{provenance}\n")
+        elif i in idxs:
+            removed += 1
+            continue
+        else:
+            kept.append(h + b)
+
+    new_text = preamble + "".join(kept)
+    filepath.write_text(new_text, encoding="utf-8")
+    size = len(new_text.encode("utf-8"))
+    return {
+        "success": True,
+        "write_action": "consolidated",
+        "family_size_before": len(idxs),
+        "sections_removed": removed,
+        "bytes_written": size,
+        "file_size_bytes": size,
+    }
 
 # v3.1.1: short-text semantic guard. bge-small-zh cosine is unreliable on very
 # short, structured English facts: "PostgreSQL on 5432" vs "Redis on 6379" lands
@@ -413,6 +645,28 @@ def inject_knowledge(
         except ValueError:
             return {"success": False, "error": f"Path traversal blocked: {filename}"}
 
+    # v3.3.7: append is no longer honoured. Appending each periodic entry is how
+    # this store accumulated four-issue families that no cosine threshold can
+    # see; "append" now behaves as upsert (and the response says so), so the
+    # family gate below covers every write path.
+    mode_deprecated: str | None = None
+    if mode == "append":
+        mode = "upsert"
+        mode_deprecated = "append"
+
+    # v3.3.7: same-skeleton family gate. It runs before the dedup layers because
+    # cosine is blind to this by construction — the family's members resemble
+    # each other, but it is the *heading* that makes them one topic, and each
+    # heading carries a fresh date.
+    if not fuse:
+        family_gate = _family_gate(config, filepath, section_clean, content)
+        if family_gate is not None:
+            family_gate["domain"] = filename.removesuffix(".md")
+            family_gate["file"] = filename
+            if mode_deprecated:
+                family_gate["mode_deprecated"] = mode_deprecated
+            return family_gate
+
     # --- 2. Dedup check (scan across all knowledge dirs: namespace + shared) ---
     kdirs = [str(d) for d in config.knowledge_dirs]
     knowledge_arg = kdirs if len(kdirs) > 1 else kdirs[0]
@@ -436,7 +690,29 @@ def inject_knowledge(
     # also closes the "fuse=True is a Layer-1-dedup bypass backdoor" concern:
     # you can only replace a section whose content is exactly what you were
     # shown, so the bypass can't be aimed at arbitrary sections.
-    if fuse and mode != "append":
+    family_wb = (
+        _consolidation_writeback(config, filepath, section_clean, expected_hash, content)
+        if (fuse and mode != "append")
+        else None
+    )
+    if family_wb and family_wb.get("refused"):
+        refused = family_wb["refused"]
+        refused["domain"] = filename.removesuffix(".md")
+        refused["file"] = filename
+        return refused
+
+    if family_wb and family_wb.get("ok"):
+        # Collapsing a family: the family hash already matched, so there is no
+        # section-level lock to verify, and the write below rewrites every member.
+        dedup_result = {
+            "similar_found": True,
+            "similarity": 1.0,
+            "matched_file": filename,
+            "suggestion": "replace",
+            "match_kind": "consolidation_writeback",
+        }
+        effective_action = "consolidated"
+    elif fuse and mode != "append":
         lock_check = _verify_fuse_precondition(
             filepath, section_clean, expected_hash
         )
@@ -534,6 +810,7 @@ def inject_knowledge(
             "thresholds_source": _thresholds_source(config),
             "dedup": dedup_result,
             "l0_synced": False,
+            **_mode_note(mode_deprecated),
         }
 
     if effective_action == "skipped":
@@ -632,6 +909,11 @@ def inject_knowledge(
         "hint": l0_hint,
         "is_new_file": is_new_file,
     }
+    # v3.3.7: surface the effect of a consolidation so the caller can report it
+    # ("collapsed 4 sections into 1") instead of guessing from the file.
+    if write_result.get("sections_removed") is not None:
+        result["sections_removed"] = write_result["sections_removed"]
+        result["family_size_before"] = write_result.get("family_size_before")
 
     # v3.1.1: vector-sync visibility. sync_to_vector_store was best-effort and
     # swallowed its own exceptions, so a write that succeeded to the .md file
@@ -733,6 +1015,12 @@ def inject_knowledge(
                     )
         except Exception:
             pass  # Non-critical check, fail silently
+
+    # v3.3.7: tell the caller when we overrode a deprecated mode, so a stale
+    # caller can be found and fixed instead of silently getting different
+    # semantics than it asked for.
+    if isinstance(result, dict):
+        result.update(_mode_note(mode_deprecated))
 
     return result
 
@@ -1195,6 +1483,13 @@ def _do_write(
         bak_path.write_text(raw, encoding="utf-8")
     except Exception as e:
         logger.debug("Failed to create .bak for %s: %s", filename, e)
+
+    # v3.3.7: consolidation write-back — collapse the whole same-skeleton family
+    # into a single section, in the first member's slot. Runs here (under the
+    # lock, after .bak) instead of through the section-replace arithmetic below,
+    # which only ever touches one section.
+    if action == "consolidated":
+        return _write_consolidated(filepath, raw, section, content, provenance)
 
     # CRLF normalization — _find_section and all slice operations use
     # line-length arithmetic; CRLF (\r\n) causes positional drift because

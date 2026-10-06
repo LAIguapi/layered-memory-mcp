@@ -5,6 +5,42 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.3.7] - 2026-10-06
+
+### Added
+
+- **Same-skeleton family gate on the write path** — the write side of the
+  v3.3.2 read-side detector, and the answer to "why does this store keep growing
+  periodic families?". Two headings that agree after dropping dates, issue
+  numbers, versions and parentheticals are one topic; when a write would add
+  another member to such a family, **nothing is written**: the response is
+  `action="deferred_consolidate"` carrying the whole family, an optimistic-lock
+  `expected_hash`, and the instruction to rewrite it as ONE section (current
+  understanding + one provenance line). Re-submitting that text with `fuse=True`
+  and the hash collapses the family in place (`action="consolidated"`,
+  `family_size_before`, `sections_removed`).
+- **Anti-laziness check**: a write-back that is not smaller than the family it
+  replaces (default ceiling: 0.9 of the family's bytes) is refused with
+  `action="consolidate_refused"`, leaving the family untouched — re-stating the
+  old sections in a new shape is not consolidation.
+- A refused deferral is logged (`deferred_consolidate: …`), so an unattended
+  caller that ignores the action is visible instead of looking like a no-op.
+
+### Changed
+
+- **`mode="append"` is retired.** It now behaves as `upsert`, and the response
+  carries `mode_deprecated` + `mode_note` so a stale caller can be found and
+  fixed. Append-without-merge is what produced the families in the first place;
+  callers keep working (no errors), they just stop being able to grow one.
+- Heading normalisation is shared with the read side (`heading.py`), so the
+  auditor's notion of a family and the writer's are the same function.
+
+### Config
+
+- `consolidate_enabled` (default **true** — this is the kill switch),
+  `consolidate_min_family` (default 2), `consolidate_size_ceiling` (default 0.9),
+  each with a `LAYERED_MEMORY_CONSOLIDATE_*` env override.
+
 ## [3.3.6] - 2026-10-06
 
 ### Fixed

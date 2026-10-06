@@ -249,6 +249,9 @@ class MemoryConfig:
         memory_mode: str | None = None,
         # v3.3.0 new field — MEMORY.md write-guard install policy
         write_guard: str | None = None,
+        consolidate_enabled: bool | None = None,
+        consolidate_min_family: int | None = None,
+        consolidate_size_ceiling: float | None = None,
     ):
         self.home = Path(home) if home else default_home()
         self.knowledge_dir = Path(knowledge_dir) if knowledge_dir else default_knowledge_dir(self.home)
@@ -456,6 +459,37 @@ class MemoryConfig:
                 f"Invalid write_guard: {self.write_guard!r}. "
                 "Must be 'auto', 'manual', or 'off'."
             )
+
+        # v3.3.7: same-skeleton family consolidation (the write side of the
+        # v3.3.2 read detector). Precedence: constructor → env → default.
+        # `consolidate_enabled` is the kill switch: with it off, an upsert that
+        # would add another member to a same-topic family writes as it always
+        # did (the auditor will still report the family afterwards).
+        self.consolidate_enabled: bool = (
+            bool(consolidate_enabled)
+            if consolidate_enabled is not None
+            else _env_bool("LAYERED_MEMORY_CONSOLIDATE_ENABLED", True)
+        )
+        _cmf = (
+            consolidate_min_family
+            if consolidate_min_family is not None
+            else os.environ.get("LAYERED_MEMORY_CONSOLIDATE_MIN_FAMILY")
+        )
+        try:
+            self.consolidate_min_family: int = int(_cmf) if _cmf is not None else 2
+        except (TypeError, ValueError):
+            self.consolidate_min_family = 2
+        _csc = (
+            consolidate_size_ceiling
+            if consolidate_size_ceiling is not None
+            else os.environ.get("LAYERED_MEMORY_CONSOLIDATE_SIZE_CEILING")
+        )
+        try:
+            self.consolidate_size_ceiling: float = (
+                float(_csc) if _csc is not None else 0.9
+            )
+        except (TypeError, ValueError):
+            self.consolidate_size_ceiling = 0.9
 
         # v2.10.1: Domain classification table for the auto-extractor. The
         # framework ships **no** business presets — domain inference is opt-in.
