@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.4.2] - 2026-10-06
+
+### Fixed
+
+- **Session scanning read a directory that no longer holds sessions.** Hermes keeps
+  live sessions in a SQLite database (`~/.hermes/state.db`); the JSON directory
+  `sessions_dir` points at now only accumulates stale request dumps. A scan
+  therefore reported **zero** sessions while the agent had been busy for weeks, and
+  everything downstream (knowledge extraction, keyword search, an external
+  compression job) degraded to "nothing new" — a failure that looks like success.
+  `scan_sessions()` and `search_sessions_by_keyword()` now read the database first
+  and keep the file directory as a fallback, so file-based setups are unaffected.
+
+### Added
+
+- `read_state_db_sessions()` / `search_state_db_sessions()` — read summaries and
+  keyword hits straight from `state.db`, timestamp-windowed, opened **read-only**
+  (never take a writable handle on a live agent's database).
+- **Source filter**: `cron` sessions are skipped by default and counted in
+  `stats.skipped_sources`. On a real host they are ~87% of the table (5763/6607
+  rows; 12 of the last 3 days' 137 sessions were interactive), so leaving them in
+  would crowd out exactly the sessions that carry durable knowledge.
+- **Export filter**: `session_scan.exclude_markers` in `config.yaml` withholds any
+  session whose title or body matches one of the given substrings, and reports the
+  hit in `stats.excluded_by_marker` instead of silently dropping it. This is a
+  privacy control: scan output is handed to a model that may run off-machine, so an
+  operator needs a way to keep selected work out of that export. The shipped
+  default is an **empty list** — the package makes no assumptions about anyone's
+  work, and the markers live in the operator's own config.
+- `session_scan.hermes_db_path` / `LAYERED_MEMORY_HERMES_DB` to point at a
+  non-default database location.
+
 ## [3.4.1] - 2026-10-06
 
 ### Fixed

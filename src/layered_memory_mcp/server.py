@@ -31,7 +31,12 @@ from fastmcp import FastMCP
 from .config import MemoryConfig
 from . import __version__
 from .recall import recall, scan_knowledge_files, score_relevance, knowledge_health
-from .session_scanner import find_recent_sessions, extract_session_summary, scan_sessions
+from .session_scanner import (
+    extract_session_summary,
+    find_recent_sessions,
+    scan_sessions,
+    search_state_db_sessions,
+)
 from .l0_manager import sync_l0_index, auto_sync_if_enabled, manage_entry, check_l0_l1_consistency
 from .injector import inject_knowledge, sync_to_vector_store, remove_from_vector_store, reindex_vector_store, vector_store_needs_reindex, calibrate_thresholds
 from .promotion import scan_split_candidates, scan_cross_domain_duplicates
@@ -437,15 +442,26 @@ async def scan_recent_sessions(
     """
     config = _get_config()
 
-    if not config.sessions_dir or not config.sessions_dir.exists():
+    db_available = config.hermes_db_path is not None and config.hermes_db_path.is_file()
+    dir_available = bool(config.sessions_dir) and config.sessions_dir.exists()
+    if not db_available and not dir_available:
         return json.dumps({
             "success": False,
-            "error": "Sessions directory not configured or not found. "
-                     "Set LAYERED_MEMORY_SESSIONS_DIR or ensure ~/.hermes/sessions/ exists.",
+            "error": "No session source available: neither Hermes' state.db "
+                     f"({config.hermes_db_path}) nor a session directory exists. "
+                     "Set LAYERED_MEMORY_HERMES_DB or LAYERED_MEMORY_SESSIONS_DIR.",
         })
 
+    # scan_sessions prefers state.db and falls back to the directory; the privacy
+    # markers come from the operator's config.yaml (empty unless they set them).
     result = await asyncio.to_thread(
-        scan_sessions, str(config.sessions_dir), days, max_sessions
+        scan_sessions,
+        str(config.sessions_dir) if dir_available else None,
+        days,
+        max_sessions,
+        config.hermes_db_path,
+        config.session_exclude_markers,
+        config.session_exclude_sources,
     )
     return json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -585,8 +601,24 @@ async def search_sessions_by_keyword(
     """
     config = _get_config()
 
-    if not config.sessions_dir or not config.sessions_dir.exists():
-        return json.dumps({"success": False, "error": "Sessions directory not configured"})
+    db_available = config.hermes_db_path is not None and config.hermes_db_path.is_file()
+    dir_available = bool(config.sessions_dir) and config.sessions_dir.exists()
+    if not db_available and not dir_available:
+        return json.dumps({"success": False, "error": "No session source available (state.db or session directory)"})
+
+    # Live sessions live in state.db; the file directory is the legacy fallback.
+    if db_available:
+        result = await asyncio.to_thread(
+            search_state_db_sessions,
+            keyword,
+            config.hermes_db_path,
+            days,
+            max_results,
+            config.session_exclude_markers,
+            config.session_exclude_sources,
+        )
+        if result.get("matches") or not dir_available:
+            return json.dumps(result, ensure_ascii=False, indent=2)
 
     sessions = await asyncio.to_thread(find_recent_sessions, str(config.sessions_dir), days)
 

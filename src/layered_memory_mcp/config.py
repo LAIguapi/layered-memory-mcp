@@ -34,6 +34,20 @@ def default_knowledge_dir(home: Path | None = None) -> Path:
     return base / "knowledge"
 
 
+def default_hermes_db_path() -> Path:
+    """Path of Hermes' live session database.
+
+    Hermes keeps sessions in a SQLite DB (``~/.hermes/state.db``), not in the
+    JSON directory :func:`default_sessions_dir` points at — that directory only
+    holds stale request dumps these days, which is why a directory scan can come
+    back with zero sessions while the agent has been busy for weeks.
+    """
+    env = os.environ.get("LAYERED_MEMORY_HERMES_DB")
+    if env:
+        return Path(env).expanduser()
+    return Path.home() / ".hermes" / "state.db"
+
+
 def default_sessions_dir() -> Path | None:
     """Try to auto-detect agent sessions directory.
     
@@ -206,9 +220,53 @@ def _load_write_guard_from_yaml(home: Path) -> str | None:
     return token
 
 
+def _load_session_scan_from_yaml(home: Path) -> dict:
+    """Read the ``session_scan`` section from ``<home>/config.yaml``.
+
+    Shape (all keys optional)::
+
+        session_scan:
+          hermes_db_path: ~/.hermes/state.db   # Hermes' live session database
+          exclude_sources: [cron]              # session sources to skip
+          exclude_markers: [...]               # substrings that drop a session
+
+    ``exclude_markers`` exists for a privacy reason, not a tidy-up one: the scan
+    output is handed to a model that may run outside this machine, so the
+    operator must be able to keep selected work (e.g. a client's confidential
+    material) out of the export. It is deliberately **empty by default** — this
+    package ships zero assumptions about what any operator works on. Never
+    raises: a broken config.yaml must not crash server start-up.
+    """
+    path = home / "config.yaml"
+    if not path.exists():
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = yaml.safe_load(fh)
+    except (OSError, yaml.YAMLError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    section = data.get("session_scan")
+    return section if isinstance(section, dict) else {}
+
+
+def _coerce_str_list(value: object) -> list[str]:
+    """Coerce a YAML scalar or list into a clean list of strings."""
+    if value is None:
+        return []
+    items = value if isinstance(value, (list, tuple)) else str(value).split(",")
+    out = []
+    for item in items:
+        text = str(item).strip()
+        if text:
+            out.append(text)
+    return out
+
+
 class MemoryConfig:
     """Runtime configuration for the memory server."""
-    
+
     def __init__(
         self,
         home: str | None = None,
@@ -255,6 +313,10 @@ class MemoryConfig:
         maintenance_enabled: bool | None = None,
         maintenance_tick_seconds: float | None = None,
         maintenance_initial_delay: float | None = None,
+        # v3.4.2 new fields — session scan source + privacy filter
+        hermes_db_path: str | None = None,
+        session_exclude_markers: list[str] | None = None,
+        session_exclude_sources: list[str] | None = None,
     ):
         self.home = Path(home) if home else default_home()
         self.knowledge_dir = Path(knowledge_dir) if knowledge_dir else default_knowledge_dir(self.home)
@@ -265,6 +327,29 @@ class MemoryConfig:
             env_l0 = os.environ.get("LAYERED_MEMORY_L0_INDEX_FILE")
             if env_l0:
                 self.l0_index_file = Path(env_l0)
+
+        # v3.4.2: where session summaries come from, and what must never leave
+        # this machine. Precedence: explicit arg → env var → config.yaml → default.
+        _scan_cfg = _load_session_scan_from_yaml(self.home)
+        _db_setting = (
+            hermes_db_path
+            or os.environ.get("LAYERED_MEMORY_HERMES_DB")
+            or _scan_cfg.get("hermes_db_path")
+        )
+        self.hermes_db_path: Path = (
+            Path(str(_db_setting)).expanduser() if _db_setting else default_hermes_db_path()
+        )
+        self.session_exclude_markers: list[str] = _coerce_str_list(
+            session_exclude_markers
+            if session_exclude_markers is not None
+            else os.environ.get("LAYERED_MEMORY_SESSION_EXCLUDE_MARKERS")
+            or _scan_cfg.get("exclude_markers")
+        )
+        self.session_exclude_sources: list[str] = _coerce_str_list(
+            session_exclude_sources
+            if session_exclude_sources is not None
+            else _scan_cfg.get("exclude_sources", ["cron"])
+        )
 
         # v0.5.0: Auto-sync L0 index after writes (default: True)
         self.auto_sync_l0: bool = (
