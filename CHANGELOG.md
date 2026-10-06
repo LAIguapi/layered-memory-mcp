@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.4.4] - 2026-10-07
+
+### Fixed
+
+- **The size penalty stopped responding, so the backlog it was meant to flag was
+  never touched.** `oversized` docked `min(count * 4, 24)` points: with 45 files
+  over the 4KB threshold on the live store the cap was already fully charged, so
+  fixing 39 of them moved the score by exactly zero — 89% of the work for no
+  visible return, which is why that backlog sat for 8 weeks. The penalty is now
+  charged on **excess bytes** (`OVERSIZED_BYTES_PER_POINT` = 24KB per point,
+  still capped at 24), so every fixed file moves the score and a 57KB file costs
+  more than a 4.5KB one. Live effect: 45 files / 505KB of excess now docks 21
+  points instead of a saturated 24, and drops as files are consolidated.
+- **Test-suite isolation test failed whenever TMPDIR lived inside `~/.hermes`.**
+  `test_home_is_redirected` asserted the sandbox home is not *path-prefixed* by
+  `~/.hermes`, but Hermes points TMPDIR at `~/.hermes/cache/scratch`, so pytest's
+  `tmp_path` (and therefore the sandbox home) sits under that prefix by design —
+  a red that had nothing to do with the leak it guards. It now compares resolved
+  paths (sandbox home ≠ real home; sandbox `MEMORY.md` ≠ production `MEMORY.md`),
+  which holds in both environments.
+
 ## [3.4.3] - 2026-10-06
 
 ### Fixed

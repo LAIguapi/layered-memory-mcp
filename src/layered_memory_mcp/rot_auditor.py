@@ -33,6 +33,15 @@ if TYPE_CHECKING:
 
 # Thresholds
 OVERSIZED_BYTES = 4096          # files above this are flagged (P1)
+# Size is docked on *excess bytes*, not on the file count. A count-based penalty
+# with a cap saturates: with 45 files over the limit (measured on the live store)
+# a cap of 24 was already fully charged, so fixing 39 of them moved the score by
+# exactly zero — an incentive that only pays once the work is nearly finished is
+# no incentive at all (that backlog sat untouched for 8 weeks). Excess-denominated
+# points keep falling with every file fixed, and a 57KB file still costs more than
+# a 4.5KB one.
+OVERSIZED_BYTES_PER_POINT = 24_576  # 24KB of excess size == one docked point
+OVERSIZED_PENALTY_CAP = 24          # never dock more than this for size alone
 GARBLED_MIN_LEN = 30           # heading length above which we check for garbling
 CROSS_DUP_SIMILARITY = 0.82    # section-pair similarity to flag as duplicate (P4)
 
@@ -244,9 +253,16 @@ def audit_rot(config: "MemoryConfig") -> dict:
     # domains that deserve extraction into their own L1 file. Advisory only.
     promotion_candidates = _detect_promotion_candidates(config, files)
 
-    # Health score: start at 100, dock points per finding (capped)
+    # Health score: start at 100, dock points per finding (capped).
+    #
+    # Oversized is charged on excess bytes: `//` floors, so each 24KB of excess
+    # over the threshold costs one point and the score moves on every fix until
+    # the last file (see OVERSIZED_BYTES_PER_POINT for why count-based saturates).
+    oversized_excess = sum(f["size_bytes"] - OVERSIZED_BYTES for f in oversized)
     score = 100
-    score -= min(len(oversized) * 4, 24)
+    score -= min(
+        max(oversized_excess, 0) // OVERSIZED_BYTES_PER_POINT, OVERSIZED_PENALTY_CAP
+    )
     score -= min(len(garbled) * 6, 24)
     score -= min(len(stale) * 3, 18)
     score -= min(len(cross_dup) * 5, 30)

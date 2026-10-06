@@ -40,7 +40,16 @@ class TestPathIsolation:
         """Path.home() must be sandboxed for code that bypasses config."""
         sandbox_home = str(Path.home())
         assert sandbox_home == os.environ["HOME"]
-        assert not sandbox_home.startswith(os.path.join(_REAL_HOME, ".hermes"))
+        # Not the real home — but it may legitimately sit *under* ~/.hermes when
+        # TMPDIR points there (Hermes sets TMPDIR=~/.hermes/cache/scratch, which
+        # is where pytest's tmp_path lands), so compare resolved paths rather
+        # than path prefixes. What must never happen is the sandbox resolving to
+        # the production memory file.
+        assert sandbox_home != _REAL_HOME, f"home not redirected: {sandbox_home}"
+        sandbox_memory = os.path.join(sandbox_home, ".hermes", "memories", "MEMORY.md")
+        assert sandbox_memory != _REAL_MEMORY, (
+            f"sandbox home resolves to production memory {sandbox_memory}"
+        )
 
     def test_sandbox_paths_are_writable(self):
         """Isolation must not break legitimate writes."""

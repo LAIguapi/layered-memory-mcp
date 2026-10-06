@@ -80,6 +80,40 @@ def test_audit_detects_oversized(kb):
     assert r["findings"]["oversized"][0]["file"] == "big.md"
 
 
+def test_audit_oversized_penalty_moves_on_every_fix(kb):
+    """Size is docked on excess bytes, so each fixed file must move the score.
+
+    The count-based cap this replaced had already saturated on the live store
+    (45 oversized files, penalty pinned at its 24-point ceiling): fixing 39 of
+    them changed the score by exactly zero, which is why that backlog was never
+    touched. Lock the property down — one file fixed, visible points back.
+    """
+    import random
+    import string
+
+    from layered_memory_mcp.rot_auditor import (
+        OVERSIZED_BYTES,
+        OVERSIZED_BYTES_PER_POINT,
+    )
+
+    body_bytes = OVERSIZED_BYTES + OVERSIZED_BYTES_PER_POINT * 3  # 3 points each
+    for i in range(4):
+        rng = random.Random(i)  # distinct filler: bodies must not read as dupes
+        body = "".join(rng.choice(string.ascii_lowercase + " ") for _ in range(body_bytes))
+        (kb / f"big{i}.md").write_text(f"# b{i}\n\n## s{i}\n\n{body}\n", encoding="utf-8")
+
+    before = _audit(kb)
+    assert before["summary"]["oversized"] == 4
+    # Guard: the fixture must not trip another pathology and mask the delta.
+    assert before["summary"]["cross_file_duplicate"] == 0
+    assert before["summary"]["garbled_heading"] == 0
+
+    (kb / "big0.md").unlink()
+    after = _audit(kb)
+    assert after["summary"]["oversized"] == 3
+    assert after["health_score"] - before["health_score"] == 3
+
+
 def test_audit_detects_garbled_heading(kb):
     garbled = "## someverylongheadingwithoutanyspacesorpunctuationthatlookslikelostformatting"
     (kb / "g.md").write_text(f"# g\n\n{garbled}\n\n内容\n", encoding="utf-8")
