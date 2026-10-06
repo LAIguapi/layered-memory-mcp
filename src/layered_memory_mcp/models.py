@@ -76,6 +76,10 @@ class TodoEntry(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     completed_at: datetime | None = None
+    # Terminal timestamps are owned by the status machine in TodoStore.update():
+    # whoever sets status also stamps/clears BOTH fields, so a row can never
+    # claim "finished" while still open (or vice versa). Never set these directly.
+    cancelled_at: datetime | None = None
 
 
 # ---------------------------------------------------------------------------

@@ -28,10 +28,13 @@ class TodoStore:
                 notes TEXT DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                completed_at TEXT
+                completed_at TEXT,
+                cancelled_at TEXT
             )""")
         # Migration: add title/blocked_by columns if upgrading from v2.1.0
-        for col in [("title", "TEXT DEFAULT ''"), ("blocked_by", "TEXT DEFAULT '[]'")]:
+        # cancelled_at added in v3.4.1 (terminal timestamp for status='cancelled')
+        for col in [("title", "TEXT DEFAULT ''"), ("blocked_by", "TEXT DEFAULT '[]'"),
+                    ("cancelled_at", "TEXT")]:
             try:
                 with sqlite3.connect(str(self.db_path)) as conn:
                     conn.execute(f"ALTER TABLE todos ADD COLUMN {col[0]} {col[1]}")
@@ -48,14 +51,15 @@ class TodoStore:
         with sqlite3.connect(str(self.db_path)) as conn:
             conn.execute("""INSERT INTO todos
                 (id, domain, title, content, blocked_by, priority, status,
-                 source_session_id, notes, created_at, updated_at, completed_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 source_session_id, notes, created_at, updated_at, completed_at, cancelled_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (entry.id, entry.domain, entry.title, entry.content,
                  json.dumps(entry.blocked_by),
                  entry.priority.value, entry.status.value,
                  entry.source_session_id, entry.notes,
                  entry.created_at.isoformat(), entry.updated_at.isoformat(),
-                 entry.completed_at.isoformat() if entry.completed_at else None))
+                 entry.completed_at.isoformat() if entry.completed_at else None,
+                 entry.cancelled_at.isoformat() if entry.cancelled_at else None))
         return {"success": True, "id": entry.id}
 
     def list(self, status=None, domain=None, priority=None, limit=50) -> list:
@@ -95,7 +99,10 @@ class TodoStore:
         return result
 
     def update(self, todo_id: str, **kwargs) -> dict:
-        allowed = {"status", "priority", "title", "content", "blocked_by", "notes", "completed_at"}
+        # completed_at / cancelled_at are intentionally NOT caller-writable: they are
+        # terminal timestamps owned by the status machine below (v3.4.1). Exposing them
+        # let any caller fake a finish time, and nothing stamped a cancel at all.
+        allowed = {"status", "priority", "title", "content", "blocked_by", "notes"}
         updates = {k: v for k, v in kwargs.items() if k in allowed and v is not None}
         if not updates:
             return {"success": False, "error": "No valid fields"}
@@ -103,10 +110,23 @@ class TodoStore:
         if "blocked_by" in updates and isinstance(updates["blocked_by"], list):
             updates["blocked_by"] = json.dumps(updates["blocked_by"])
 
-        if "status" in updates and updates["status"] == "completed":
-            updates["completed_at"] = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(timezone.utc).isoformat()
+        if "status" in updates:
+            status = updates["status"]
+            if status == "completed":
+                updates["completed_at"] = now
+                updates["cancelled_at"] = None
+            elif status == "cancelled":
+                updates["cancelled_at"] = now
+                updates["completed_at"] = None
+            else:
+                # Reopened (pending / in_progress): clear BOTH terminal stamps, otherwise
+                # the row reads "still open, but has a finish time" — the stale-timestamp
+                # bug this version fixes.
+                updates["completed_at"] = None
+                updates["cancelled_at"] = None
 
-        updates["updated_at"] = datetime.now(timezone.utc).isoformat()
+        updates["updated_at"] = now
 
         set_clause = ", ".join(f"{k}=?" for k in updates)
         values = list(updates.values()) + [todo_id]

@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.4.1] - 2026-10-06
+
+### Fixed
+
+- **TODO terminal timestamps: `cancelled` had none, and a reopened row kept its
+  finish time.** `todos` carried a single `completed_at` column, stamped only when
+  `status` became `completed`. Two consequences, both found by auditing the live
+  DB: (a) six `cancelled` rows had `completed_at` NULL and no cancel time at all,
+  so “when was this abandoned?” could only be answered by `updated_at` — which any
+  later edit (e.g. appending a note) silently refreshes; and (b) nothing cleared
+  `completed_at` when a row moved back out of `completed`, so the first reopen
+  would have produced a still-open task that claimed a finish time.
+
+  `update()` now owns both stamps as a single status machine: `completed` stamps
+  `completed_at` and clears `cancelled_at`; `cancelled` stamps the new
+  `cancelled_at` column and clears `completed_at`; a move back to
+  `pending`/`in_progress` clears both (the stale-timestamp half). Both fields were
+  also removed from the caller-writable set, so they can only be derived from a
+  status transition — a caller can no longer pass a fabricated finish time.
+
+  Existing databases gain `cancelled_at` through the same idempotent ALTER
+  migration already used for `title`/`blocked_by`; pre-existing rows keep `NULL`
+  and are otherwise untouched.
+
 ## [3.4.0] - 2026-10-06
 
 ### Added
