@@ -5,6 +5,97 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.3.1] - 2026-10-06
+
+### Fixed
+
+- **Declare `PyYAML` as a real dependency.** `config.py` imports `yaml` at
+  module level, so the package cannot be imported without it — but it was only
+  arriving transitively (fastembed → huggingface_hub). A clean environment
+  installing with `--no-deps` (or any future dependency reshuffle) would hit
+  `ModuleNotFoundError: No module named 'yaml'`. Comment in `pyproject.toml`
+  records why the pin exists.
+
+## [3.3.0] - 2026-10-06
+
+### Added
+
+- **MEMORY.md write guard** (`write_guard/`), shipped as a deployable Hermes
+  `pre_tool_call` plugin. Blocks the native `memory` tool with `target="memory"`
+  (and an omitted target, which defaults to MEMORY.md) plus direct
+  `write_file`/`patch` edits of `memories/MEMORY.md`, and points the model at
+  `inject_knowledge` (L1) or `target="user"` instead. `USER.md` and unrelated
+  paths stay writable. The policy accepts both `args` (what Hermes passes) and
+  `tool_input` (a spelling that silently kills hooks reading it).
+- `write_guard.check_guard_status` / `install_guard` / `remove_guard` /
+  `ensure_guard_installed`, mirroring `dashboard_plugin`. Installation enables
+  the plugin through `hermes plugins enable`, silences `memory.nudge_interval`
+  (the periodic review fork that drove the writes) and records the previous
+  value for `remove_guard` to restore. It never hand-edits the host config:
+  without a resolvable `hermes` CLI it returns the exact commands instead.
+- `init_framework()` now reports guard status; `integrate_agent()` gains
+  `install_guard` / `guard_status` / `remove_guard`.
+- New `write_guard` config policy: `auto` / `manual` (default) / `off`.
+- Installation runs a seven-case self-test against the *deployed* payload,
+  negative controls included, so a guard that blocks everything cannot look
+  healthy.
+
+### Changed
+
+- **Test suite now runs against the working tree** (`pythonpath = ["src"]`).
+  Before this, pytest imported whatever copy happened to be installed in the
+  active interpreter, so it silently tested a stale snapshot and could not see
+  newly added modules at all.
+- Version consistency is locked by a test: `pyproject.toml` == `__init__.py`
+  fallback == `plugin.yaml` == `write_guard.GUARD_VERSION`.
+
+### Notes
+
+- YAML 1.1 parses a bare `off` as the boolean `False`, so the `write_guard`
+  config loader coerces booleans; without that, the most natural spelling of
+  "turn it off" raised at start-up.
+
+## [3.2.2] - 2026-10-01
+
+### Fixed
+
+- **Test suite no longer writes to production memory.** `detect_agent_memory_path()`
+  resolved `~/.hermes/memories/MEMORY.md` through `Path.home()`, ignoring
+  `LAYERED_MEMORY_HOME`, so tests exercising the dual-write path appended junk
+  `[L0]` pointers to a live MEMORY.md. `tests/conftest.py` now redirects every
+  resolution route (L1 home, agent memory path, HOME/USERPROFILE) and wraps
+  `open` to turn any write into the real memory dirs into a loud failure.
+
+## [3.2.1] - 2026-09-30
+
+### Fixed
+
+- **Compaction no longer mangles section headings.** Heading text was being
+  trimmed mid-token (lost punctuation/characters) when written back.
+
+## [3.2.0] - 2026-08-12
+
+### Added
+
+- **`memory_mode`** — how the dual-write treats the agent's MEMORY.md:
+  `pointers` (legacy: one `[L0]` pointer per domain per write), `index_only`
+  (exactly one `knowledge-index` entry; per-domain pointer copies are reaped,
+  not migrated), `off` (no dual-write). Selectable via `LAYERED_MEMORY_MEMORY_MODE`.
+  `auto_maintain_after_write` dispatches through the mode.
+
+## [3.1.0] - 2026-07-31
+
+### Added
+
+- **Content-only semantic upsert**: write-path dedup compares section bodies
+  semantically (bge-small-zh cosine) instead of char-level similarity, and a
+  semantic near-duplicate returns a `deferred_fusion` handshake instead of
+  blindly appending — the caller fuses the two bodies and commits with an
+  optimistic-lock token.
+- **Active reconcile tools** (`reconcile_knowledge_tool`, `audit_rot_tool`):
+  pull-based housekeeping that reports decay worklists without mutating
+  knowledge.
+
 ## [2.11.0] - 2026-07-23
 
 ### BREAKING — Domain classification unified to a single config source
