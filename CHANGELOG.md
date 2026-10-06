@@ -5,6 +5,42 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.3.5] - 2026-10-06
+
+### Fixed
+
+- **A deployed write guard no longer drifts behind the framework.** The guard
+  on the host is a copy of the payload bundled in this package, so every release
+  left it one version behind — and the ``auto`` policy could not heal it:
+  ``ensure_guard_installed`` routed a version drift into ``install_guard``,
+  which refuses to overwrite without ``force=True``. The result was sticky:
+  ``check_guard_status`` reported ``update_available`` forever. Measured on a
+  real host: deployed 3.3.0 against a 3.3.4 package, ``guard.py`` byte-identical
+  and only ``plugin.yaml`` differing, so nothing but bookkeeping was wrong —
+  which is exactly the kind of silent drift that hides a real one later.
+
+### Added
+
+- ``refresh_deployed_plugin(...)`` — files-only re-copy of the payload when the
+  deployed version differs. It writes no Hermes config, invokes no CLI, and
+  enables/disables nothing (that is ``install_guard``'s job, on the explicit
+  path). It acts only when the guard is already installed **and** the policy is
+  ``auto``, and it never raises.
+- ``get_l0_index`` now carries a guard-refresh ride-along (auto policy only)
+  next to the existing auto-maintain ride-along, so one framework upgrade plus
+  one session start is enough to bring the host in step — no manual re-install.
+- ``ensure_guard_installed`` handles ``update_available`` by refreshing instead
+  of conflicting, so the ``auto`` policy can finally heal what it detects.
+
+### Notes
+
+- Refreshing the files does not reload a running host: a *logic* change still
+  needs the host to restart, while a version bump alone does not.
+- Test isolation hardened with this change: the production-path guard now also
+  blocks writes to ``~/.hermes/plugins`` and ``~/.hermes/config.yaml`` (the two
+  places a guard deploy/enable can reach), and resolves the real home at import
+  time so fixture ordering cannot defeat it.
+
 ## [3.3.4] - 2026-10-06
 
 ### Fixed

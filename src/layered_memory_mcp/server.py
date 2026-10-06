@@ -1625,6 +1625,28 @@ async def get_l0_index() -> str:
         except Exception as e:  # noqa: BLE001 — maintenance must never break reads
             logger.debug("get_l0_index ride-along auto-maintain skipped: %s", e)
 
+    # v3.3.5: ride-along guard self-repair. The guard on the host is a copy of
+    # the payload bundled in this package, so a framework upgrade used to leave
+    # it a version behind until somebody re-ran install_guard — and the auto
+    # policy could not heal it either (install_guard refuses a version drift
+    # unless forced). Refreshing is a files-only copy, so doing it on this read
+    # path keeps the host in step without any approval step. Auto policy only:
+    # a manual host keeps the human in the loop.
+    if str(getattr(config, "write_guard", "manual")).strip().lower() == "auto":
+        try:
+            from .write_guard import refresh_deployed_plugin
+
+            agent_info = detect_agent_type()
+            if agent_info.get("home_dir"):
+                await asyncio.to_thread(
+                    refresh_deployed_plugin,
+                    agent_info["home_dir"],
+                    "auto",
+                    config.home / "write_guard_state.json",
+                )
+        except Exception as e:  # noqa: BLE001 — a repair must never break reads
+            logger.debug("get_l0_index ride-along guard refresh skipped: %s", e)
+
     # First try the configured L0 file
     if config.l0_index_file and config.l0_index_file.exists():
         try:
@@ -1840,6 +1862,8 @@ async def init_framework() -> str:
                 write_guard_info["policy"] = guard_policy
                 if ensured.get("install"):
                     write_guard_info["install"] = ensured["install"]
+                if ensured.get("refresh"):
+                    write_guard_info["refresh"] = ensured["refresh"]
             else:
                 write_guard_info = check_guard_status(agent_info["home_dir"], **guard_kwargs)
                 write_guard_info["policy"] = guard_policy

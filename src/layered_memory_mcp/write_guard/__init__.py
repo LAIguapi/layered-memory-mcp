@@ -21,7 +21,19 @@ in-process ``pre_tool_call`` blocking contract.
 SHAPE
 -----
 Mirrors ``dashboard_plugin``: ``check_guard_status`` / ``install_guard`` /
-``remove_guard``, plus ``ensure_guard_installed`` for the ``auto`` policy.
+``remove_guard``, plus ``ensure_guard_installed`` for the ``auto`` policy and
+``refresh_deployed_plugin`` to keep a deployed copy in step with the package.
+
+KEEPING THE DEPLOYED COPY IN STEP
+---------------------------------
+The guard on the host is a *copy* of the payload bundled in this package. Every
+framework upgrade therefore leaves the host one version behind unless somebody
+re-runs an install — and the ``auto`` policy could not heal that by itself,
+because ``install_guard`` refuses a version drift unless forced. So a drift was
+sticky: ``check_guard_status`` reported ``update_available`` forever while the
+deployed files quietly aged. ``refresh_deployed_plugin`` (v3.3.5) closes that:
+it re-copies the payload when the versions differ, taking no other action, and
+the framework calls it on its read path so upgrades self-heal.
 """
 
 from __future__ import annotations
@@ -40,7 +52,7 @@ logger = logging.getLogger("layered_memory_mcp.write_guard")
 
 # Plugin identity — the directory name doubles as the `plugins.enabled` key.
 GUARD_PLUGIN_NAME = "layered-memory-guard"
-GUARD_VERSION = "3.3.4"
+GUARD_VERSION = "3.3.5"
 
 # Files that make up the deployed plugin (source dir → plugin dir).
 PLUGIN_FILES = ("plugin.yaml", "__init__.py", "guard.py")
@@ -530,6 +542,77 @@ def install_guard(
     }
 
 
+def refresh_deployed_plugin(
+    hermes_home: Path,
+    mode: str = "auto",
+    state_path: str | Path | None = None,
+) -> dict:
+    """Re-copy the bundled plugin when the deployed copy is a different version.
+
+    Deliberately **files-only**: no Hermes config is written, no CLI is invoked,
+    nothing is enabled or disabled. This is the narrow repair for version drift,
+    not an install — installing (config + enable) stays on the explicit path.
+
+    Guarded so it can never surprise anyone:
+
+    * ``mode`` must be ``auto`` — a ``manual`` host keeps the human in the loop,
+      and the framework calls this on a read path nobody asked about;
+    * the guard must already be installed;
+    * a version match is a no-op.
+
+    Never raises: it is called from ``get_l0_index`` and a repair attempt must
+    not be able to break index retrieval.
+    """
+    home = Path(hermes_home)
+    try:
+        mode_clean = str(mode or "").strip().lower()
+        if mode_clean != "auto":
+            return {"refreshed": False, "reason": "policy_not_auto", "policy": mode_clean}
+        if not is_guard_installed(home):
+            return {"refreshed": False, "reason": "not_installed"}
+
+        deployed = get_guard_version(home)
+        if deployed == GUARD_VERSION:
+            return {"refreshed": False, "reason": "up_to_date", "version": deployed}
+
+        deploy = _deploy_files(home)
+        if not deploy.get("ok"):
+            logger.warning("write guard auto-refresh failed: %s", deploy.get("detail"))
+            return {
+                "refreshed": False,
+                "reason": "deploy_failed",
+                "from": deployed,
+                "to": GUARD_VERSION,
+                "detail": deploy.get("detail"),
+            }
+
+        # Keep the install record honest about what is now on disk.
+        st_path = Path(state_path) if state_path else _default_state_path()
+        state = _read_state(st_path)
+        if state:
+            state.update({"version": GUARD_VERSION, "refreshed_at": _now_iso()})
+            try:
+                _write_state(st_path, state)
+            except OSError as exc:
+                logger.debug("write guard refresh could not update state: %s", exc)
+
+        logger.info("write guard auto-refreshed %s → %s", deployed, GUARD_VERSION)
+        return {
+            "refreshed": True,
+            "from": deployed,
+            "to": GUARD_VERSION,
+            "detail": deploy.get("detail"),
+            "note": (
+                "Files refreshed. A running host keeps the previously loaded "
+                "plugin until it restarts; a logic change needs that restart, a "
+                "version bump alone does not."
+            ),
+        }
+    except Exception as exc:  # noqa: BLE001 — a repair must never break a read
+        logger.debug("write guard auto-refresh skipped: %s", exc)
+        return {"refreshed": False, "reason": "error", "detail": str(exc)}
+
+
 def ensure_guard_installed(
     hermes_home: Path,
     config_path: str | Path | None = None,
@@ -545,6 +628,21 @@ def ensure_guard_installed(
     before = check_guard_status(home, config_path=cfg_path, state_path=st_path)
     if before["status"] == "up_to_date":
         return {"action": "noop", "before": before, "install": None, "status": before}
+
+    if before["status"] == "update_available":
+        # A version drift is not an install: install_guard refuses it without
+        # force=True (to protect a host somebody else configured), so routing it
+        # there made the drift permanent under the auto policy — which is
+        # exactly how a deployed guard stayed behind a released framework.
+        refreshed = refresh_deployed_plugin(home, mode="auto", state_path=st_path)
+        after = check_guard_status(home, config_path=cfg_path, state_path=st_path)
+        return {
+            "action": "refreshed" if refreshed.get("refreshed") else "refresh_noop",
+            "before": before,
+            "install": None,
+            "refresh": refreshed,
+            "status": after,
+        }
 
     install = install_guard(
         home,

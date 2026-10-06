@@ -23,6 +23,10 @@ import os
 
 import pytest
 
+# The developer's real home, captured at import time — before any fixture
+# redirects HOME — so the production-path guard cannot be fooled by ordering.
+_REAL_HOME = os.path.expanduser("~")
+
 # Every env var that can steer a write at production data.
 _REDIRECTED_ENV_VARS = (
     "LAYERED_MEMORY_HOME",
@@ -82,14 +86,25 @@ def _guard_production_paths(monkeypatch):
     Defence in depth. If a code path ever hardcodes an absolute production
     path (bypassing both config and env), this converts a silent production
     write into a loud test failure.
+
+    The plugin directory and the host config are on the list too: the write
+    guard can deploy into ``~/.hermes/plugins`` and ``hermes plugins enable``
+    rewrites ``config.yaml``, so a test that forgot to redirect ``HOME`` would
+    otherwise be able to reconfigure the developer's own host.
     """
     import builtins
 
     real_open = builtins.open
     # Resolved once, from the real environment, before HOME is redirected.
-    forbidden = (
-        os.path.expanduser("~/.hermes/memories"),
-        os.path.expanduser("~/.layered-memory"),
+    # Snapshotting at import time keeps this independent of fixture ordering.
+    forbidden = tuple(
+        os.path.join(_REAL_HOME, part)
+        for part in (
+            ".hermes/memories",
+            ".layered-memory",
+            ".hermes/plugins",
+            ".hermes/config.yaml",
+        )
     )
 
     def guarded_open(file, mode="r", *args, **kwargs):
