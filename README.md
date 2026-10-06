@@ -70,6 +70,21 @@ mcp_servers:
     timeout: 30
 ```
 
+Then, from an agent session:
+
+1. `init_framework()` — creates the store and reports whether the MEMORY.md
+   write guard is installed.
+2. `integrate_agent(action="install_guard")` — deploys and enables the guard
+   plugin (Hermes only) and silences the periodic memory-review nudge.
+3. Restart Hermes so the plugin loads (gateway: `hermes gateway restart`).
+
+The guard keeps agent-side writes out of the framework-owned MEMORY.md: the
+native `memory` tool with `target="memory"` and direct `write_file` / `patch`
+edits of `memories/MEMORY.md` are blocked, and the model is pointed at
+`inject_knowledge` (L1 knowledge) or `target="user"` (the user profile) instead.
+Set `write_guard: auto` in `~/.layered-memory/config.yaml` to have
+`init_framework()` install or repair it on its own.
+
 ### OpenClaw
 
 Install the MCP server, then register it:

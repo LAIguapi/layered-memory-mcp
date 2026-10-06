@@ -138,3 +138,35 @@ backend:
 # content matching nothing stays "general". Use whatever domains fit your own
 # knowledge base.
 # =============================================================================
+
+# =============================================================================
+# MEMORY.md write guard (optional)
+# =============================================================================
+#
+# The framework keeps the agent's MEMORY.md for itself (one index entry). When
+# the host agent is Hermes, a bundled pre_tool_call plugin can stop agent-side
+# writes to that file — the memory tool with target="memory", and write_file /
+# patch aimed at memories/MEMORY.md — and point the model at inject_knowledge
+# (L1 knowledge) or target="user" (the user profile) instead.
+#
+# Policy values:
+#   manual — init_framework only reports whether the guard is missing (default:
+#            the host agent's config belongs to the user)
+#   auto   — init_framework installs or repairs the guard on its own
+#   off    — never mentioned
+#
+# Set it in <home>/config.yaml:
+#
+#     write_guard: auto
+#
+# or via the env var (same name, highest priority after the constructor arg):
+#
+#     LAYERED_MEMORY_WRITE_GUARD=auto
+#
+# The deployed plugin also reads LAYERED_MEMORY_WRITE_GUARD as a runtime kill
+# switch: "off" disables blocking without uninstalling anything.
+#
+# Install/remove from an agent session:
+#     integrate_agent(action="install_guard")   # deploy + enable + silence nudge
+#     integrate_agent(action="remove_guard")    # uninstall + restore nudge
+# =============================================================================

@@ -1821,6 +1821,29 @@ async def init_framework() -> str:
             from .dashboard_plugin import check_dashboard_plugin_status
             dashboard_plugin_info = check_dashboard_plugin_status(agent_info["home_dir"])
 
+        # v3.3.0: MEMORY.md write guard. Always detected; installed only under
+        # the "auto" policy. The default is "manual" because the host agent's
+        # config belongs to the user — a third-party install must not edit it
+        # unasked. Without the guard, index_only mode still lets the agent write
+        # straight into MEMORY.md; compaction only moves the bloat afterwards.
+        write_guard_info = None
+        guard_policy = getattr(config, "write_guard", "manual")
+        if agent_info["agent_type"] == "hermes" and agent_info["home_dir"] and guard_policy != "off":
+            from .write_guard import check_guard_status, ensure_guard_installed
+            guard_kwargs = {
+                "config_path": os.environ.get("HERMES_CONFIG_PATH") or None,
+                "state_path": config.home / "write_guard_state.json",
+            }
+            if guard_policy == "auto":
+                ensured = ensure_guard_installed(agent_info["home_dir"], **guard_kwargs)
+                write_guard_info = dict(ensured["status"])
+                write_guard_info["policy"] = guard_policy
+                if ensured.get("install"):
+                    write_guard_info["install"] = ensured["install"]
+            else:
+                write_guard_info = check_guard_status(agent_info["home_dir"], **guard_kwargs)
+                write_guard_info["policy"] = guard_policy
+
         result = {
             "success": True,
             "first_run": total == 0,
@@ -1832,6 +1855,9 @@ async def init_framework() -> str:
 
         if dashboard_plugin_info:
             result["dashboard_plugin"] = dashboard_plugin_info
+
+        if write_guard_info:
+            result["write_guard"] = write_guard_info
 
         if total == 0:
             # First run: create welcome file
@@ -1873,6 +1899,13 @@ async def integrate_agent(action: str = "status") -> str:
       - "inject_soul": inject rules into Hermes SOUL.md
       - "inject_memory": inject awareness snippet into MEMORY.md
       - "remove_soul": remove the injection block from SOUL.md
+      - "install_dashboard": deploy the Dashboard plugin
+      - "remove_dashboard": remove the Dashboard plugin
+      - "guard_status": report the MEMORY.md write-guard status
+      - "install_guard": deploy + enable the MEMORY.md write-guard plugin and
+        silence the periodic memory-review nudge (0), so the agent stops
+        writing facts into the framework-owned MEMORY.md
+      - "remove_guard": uninstall the guard and restore the previous nudge value
 
     Returns:
         JSON with the result of the action.
@@ -1933,6 +1966,22 @@ async def integrate_agent(action: str = "status") -> str:
                 return {"success": False, "error": "Hermes home directory not found."}
             from .dashboard_plugin import remove_dashboard_plugin
             return remove_dashboard_plugin(agent_info["home_dir"])
+
+        if action in ("guard_status", "install_guard", "remove_guard"):
+            if agent_info["agent_type"] != "hermes":
+                return {"success": False, "error": "MEMORY.md write guard is only supported for Hermes Agent."}
+            if not agent_info["home_dir"]:
+                return {"success": False, "error": "Hermes home directory not found."}
+            from .write_guard import check_guard_status, install_guard, remove_guard
+            guard_kwargs = {
+                "config_path": os.environ.get("HERMES_CONFIG_PATH") or None,
+                "state_path": config.home / "write_guard_state.json",
+            }
+            if action == "guard_status":
+                return check_guard_status(agent_info["home_dir"], **guard_kwargs)
+            if action == "install_guard":
+                return install_guard(agent_info["home_dir"], **guard_kwargs)
+            return remove_guard(agent_info["home_dir"], **guard_kwargs)
 
         return {"success": False, "error": f"Unknown action: {action}"}
 

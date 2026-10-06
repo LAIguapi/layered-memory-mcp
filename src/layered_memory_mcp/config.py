@@ -172,6 +172,40 @@ def _load_domain_keywords_from_yaml(home: Path) -> dict[str, list[str]]:
     return _coerce_domain_keywords(data.get("domain_keywords"))
 
 
+def _load_write_guard_from_yaml(home: Path) -> str | None:
+    """Read the ``write_guard`` knob from ``<home>/config.yaml``.
+
+    Returns the canonical policy string, or None when the file is missing,
+    unreadable, or has no such key. Never raises — a broken config.yaml must
+    not crash server start-up; it just means "use the default policy".
+
+    YAML 1.1 resolves bare ``off`` / ``on`` / ``yes`` / ``no`` to booleans, so
+    ``write_guard: off`` arrives here as ``False``. Without that coercion the
+    most natural spelling of "turn it off" would raise at start-up.
+    """
+    path = home / "config.yaml"
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = yaml.safe_load(fh)
+    except (OSError, yaml.YAMLError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    value = data.get("write_guard")
+    if value is None:
+        return None
+    if isinstance(value, bool):  # YAML 1.1 on/off, true/false
+        return "auto" if value else "off"
+    token = str(value).strip().lower()
+    if token in ("off", "false", "no", "0", "disabled", "none"):
+        return "off"
+    if token in ("on", "true", "yes", "1", "enabled"):
+        return "auto"
+    return token
+
+
 class MemoryConfig:
     """Runtime configuration for the memory server."""
     
@@ -213,6 +247,8 @@ class MemoryConfig:
         sem_merge_threshold: float | None = None,
         # v3.2.0 new field — agent-memory write mode
         memory_mode: str | None = None,
+        # v3.3.0 new field — MEMORY.md write-guard install policy
+        write_guard: str | None = None,
     ):
         self.home = Path(home) if home else default_home()
         self.knowledge_dir = Path(knowledge_dir) if knowledge_dir else default_knowledge_dir(self.home)
@@ -390,6 +426,35 @@ class MemoryConfig:
             raise ValueError(
                 f"Invalid memory_mode: {self.memory_mode!r}. "
                 "Must be 'pointers', 'index_only', or 'off'."
+            )
+
+        # v3.3.0: MEMORY.md write guard — install policy for the Hermes
+        # pre_tool_call plugin that keeps agent-side writes out of the
+        # framework-owned MEMORY.md:
+        #   "auto"   — init_framework installs/repairs it when missing
+        #   "manual" — init_framework only reports that it is missing
+        #              (default: the host agent's config is the user's, so a
+        #              third-party install must not edit it unasked)
+        #   "off"    — never mentioned
+        # Resolution priority (highest first):
+        #   1. constructor argument
+        #   2. LAYERED_MEMORY_WRITE_GUARD env var
+        #   3. `write_guard:` key of <home>/config.yaml
+        #   4. "manual"
+        # The deployed plugin reads the same variable as a runtime kill switch
+        # ("off" disables blocking without uninstalling).
+        _wg = (
+            write_guard
+            if write_guard is not None
+            else os.environ.get("LAYERED_MEMORY_WRITE_GUARD")
+            or _load_write_guard_from_yaml(self.home)
+            or "manual"
+        )
+        self.write_guard: str = str(_wg).strip().lower()
+        if self.write_guard not in ("auto", "manual", "off"):
+            raise ValueError(
+                f"Invalid write_guard: {self.write_guard!r}. "
+                "Must be 'auto', 'manual', or 'off'."
             )
 
         # v2.10.1: Domain classification table for the auto-extractor. The

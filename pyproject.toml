@@ -1,6 +1,6 @@
 [project]
 name = "layered-memory-mcp"
-version = "3.2.2"
+version = "3.3.0"
 description = "Layered Memory MCP Server — Extend AI agent memory beyond token limits with a 4-tier knowledge architecture"
 readme = "README.md"
 license = "MIT"
@@ -52,6 +52,7 @@ packages = ["src/layered_memory_mcp"]
 artifacts = [
     "src/layered_memory_mcp/dashboard_plugin/dist/*",
     "src/layered_memory_mcp/dashboard_plugin/*.json",
+    "src/layered_memory_mcp/write_guard/plugin/*",
 ]
 
 [tool.hatch.build.targets.sdist]
@@ -67,3 +68,8 @@ asyncio_mode = "auto"
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
+# Run the suite against the working tree, not against whatever copy of the
+# package happens to be installed in the active interpreter. Without this the
+# suite silently tested an older site-packages snapshot and could not even see
+# newly added modules.
+pythonpath = ["src"]
