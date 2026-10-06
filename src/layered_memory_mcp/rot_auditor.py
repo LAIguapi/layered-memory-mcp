@@ -64,14 +64,14 @@ _HEADING_RE = re.compile(r"^(#{2,3})\s+(.+)$", re.MULTILINE)
 
 # Heading noise stripped before comparing two headings as "the same topic" (P4b):
 # parenthetical qualifiers, dates, 期号/版次, versions and bare years/ids.
-_HEADING_NOISE_RE = re.compile(
-    r"[（(][^）)]*[）)]"                     # （2026-07-16，含实证）
-    r"|20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}"     # 2026-10-01
-    r"|\d{1,2}[-/.]\d{1,2}"                 # 10-01
-    r"|第\s*\d+\s*[期版次]"                  # 第 3 期 / 第 2 版
-    r"|v?\d+\.\d+(?:\.\d+)?"                # v3.3.1 / 1.2.0
-    r"|\b\d{3,4}\b"                         # bare years, issue ids
+# Heading normalisation lives in one place: the read side (this module) and the
+# write side (injector) must agree on what "the same topic, logged again" means.
+from .heading import (  # noqa: F401 — re-exported for backwards compatibility
+    HEADING_NOISE_RE,
+    heading_skeleton as _heading_skeleton,
 )
+
+_HEADING_NOISE_RE = HEADING_NOISE_RE
 
 
 def audit_rot(config: "MemoryConfig") -> dict:
@@ -324,21 +324,6 @@ def _length_gate(la: int, lb: int) -> bool:
     if la <= 0 or lb <= 0:
         return False
     return (2 * min(la, lb)) / (la + lb) >= CROSS_DUP_SIMILARITY
-
-
-def _heading_skeleton(heading: str) -> str:
-    """Collapse a heading to its bare topic (drops dates, versions, qualifiers).
-
-    Two sections in one file whose headings agree after this stripping are the
-    same topic logged twice — the usual cause being a date/measurement suffix
-    like ``（2026-10-01 实测）``, or a second, shorter copy of the same section.
-    """
-    if not heading:
-        return ""
-    text = _HEADING_NOISE_RE.sub(" ", heading)
-    # \w keeps CJK (Python 3), so this drops whitespace and punctuation only.
-    text = re.sub(r"[\W_]+", "", text)
-    return text.lower()
 
 
 def _normalize(text: str) -> str:

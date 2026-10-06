@@ -121,3 +121,21 @@ def _guard_production_paths(monkeypatch):
 
     monkeypatch.setattr(builtins, "open", guarded_open)
     yield
+
+
+@pytest.fixture(autouse=True)
+def _isolate_server_config():
+    """Snapshot and restore the server's module-level config singleton.
+
+    ``layered_memory_mcp.server._config`` is a lazily-built singleton, and this
+    suite has a long-standing habit of assigning to it directly and setting it
+    back to ``None`` by hand. A test that raises before its own cleanup then
+    leaks its tmp config into every later test — the same class of leak that
+    once wrote test fixtures into production memory. Restoring it centrally
+    makes isolation the default instead of something every test must remember.
+    """
+    from layered_memory_mcp import server
+
+    sentinel = getattr(server, "_config", None)
+    yield
+    server._config = sentinel

@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.3.6] - 2026-10-06
+
+### Fixed
+
+- **The suite is fully green for the first time.** `test_search_sessions_by_keyword_json`
+  called `asyncio.get_event_loop().run_until_complete(...)`; once an earlier test
+  had closed the ambient loop, `get_event_loop()` raised ``RuntimeError: There is
+  no current event loop in thread 'MainThread'`` — which is why the test passed
+  when run alone and failed in the full suite. It now uses `asyncio.run()`.
+  Result: 383 passed, 0 failed (previously 1 order-dependent failure).
+- **Test isolation: the server config singleton can no longer leak between
+  tests.** `layered_memory_mcp.server._config` is a lazily-built module-level
+  singleton that this suite has long assigned to directly and reset by hand; a
+  test raising before its own cleanup left its tmp config behind for every later
+  test. An autouse fixture now snapshots and restores it, the same way the
+  production-path guard already covers files.
+
+### Changed
+
+- **Heading normalisation has one home** (`heading.py`): the read side
+  (`audit_rot`) and the write side both need to agree on what "the same topic,
+  logged again" means — a read-side detector that flags a family the writer keeps
+  appending to is only half a mechanism. `rot_auditor._heading_skeleton` and
+  `rot_auditor._HEADING_NOISE_RE` remain as aliases of the shared objects, so
+  existing imports keep working and no behaviour changes.
+
 ## [3.3.5] - 2026-10-06
 
 ### Fixed

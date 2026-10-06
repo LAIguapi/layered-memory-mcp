@@ -708,7 +708,7 @@ class TestJsonSessionFormat:
         result = scan_sessions(mixed_sessions_dir, days=30)
         assert result["total_sessions"] >= 2  # JSONL + JSON session
 
-    def test_search_sessions_by_keyword_json(self, tmp_path):
+    def test_search_sessions_by_keyword_json(self, tmp_path, monkeypatch):
         """search_sessions_by_keyword should find matches in .json session files."""
         sdir = tmp_path / "sessions"
         sdir.mkdir()
@@ -722,19 +722,24 @@ class TestJsonSessionFormat:
         }
         (sdir / "k8s.json").write_text(json.dumps(session_data), encoding="utf-8")
 
-        import layered_memory_mcp.server as srv
-        srv._config = MemoryConfig(sessions_dir=str(sdir))
-
-        # Run async test
         import asyncio
-        result_json = asyncio.get_event_loop().run_until_complete(
+
+        import layered_memory_mcp.server as srv
+
+        # monkeypatch, not ``srv._config = ... / = None``: the singleton is
+        # restored automatically even if an assertion below fails.
+        monkeypatch.setattr(srv, "_config", MemoryConfig(sessions_dir=str(sdir)))
+
+        # asyncio.run, not get_event_loop().run_until_complete(): the latter
+        # raises "There is no current event loop in thread 'MainThread'" once an
+        # earlier test has closed the ambient loop — which is why this test
+        # passed alone and failed in the full suite.
+        result_json = asyncio.run(
             srv.search_sessions_by_keyword(keyword="kubernetes", days=30)
         )
         result = json.loads(result_json)
         assert result["success"] is True
         assert result["matched_sessions"] >= 1
-
-        srv._config = None
 
 
 # ---------------------------------------------------------------------------
