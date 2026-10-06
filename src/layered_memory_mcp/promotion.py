@@ -49,6 +49,17 @@ _TITLE_STOPWORDS = {
     "配置", "说明", "笔记", "记录", "数据", "方案", "问题", "总结",
 }
 
+# Pure-digit tokens (years, dates, counts) are temporal noise, never a topic
+# name. The tokenizer splits "2026-07-30" into "2026" / "07" / "30", and a year
+# repeated across many headings used to win the frequency vote outright —
+# suggesting a domain literally named "2026.md".
+_NOISE_TOKEN_RE = re.compile(r"^\d+$")
+
+
+def _is_noise_token(token: str) -> bool:
+    """True for tokens that cannot name a topic (bare numbers/dates)."""
+    return bool(_NOISE_TOKEN_RE.match(token))
+
 
 def detect_promotion_candidate(
     config: "MemoryConfig",
@@ -236,14 +247,14 @@ def _suggest_domain_name(headings: list[str]) -> str:
     first_tokens = {toks[0] for toks in tokenized}
     if len(first_tokens) == 1:
         candidate = next(iter(first_tokens))
-        if candidate and candidate not in _TITLE_STOPWORDS:
+        if candidate and candidate not in _TITLE_STOPWORDS and not _is_noise_token(candidate):
             return candidate
 
     # Strategy 2: most frequent non-stopword token across all headings.
     freq: dict[str, int] = {}
     for toks in tokenized:
         for tok in toks:
-            if tok in _TITLE_STOPWORDS:
+            if tok in _TITLE_STOPWORDS or _is_noise_token(tok):
                 continue
             freq[tok] = freq.get(tok, 0) + 1
     if freq:

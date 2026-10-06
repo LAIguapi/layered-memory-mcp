@@ -49,6 +49,15 @@ _PENDING_MARKERS = [
     "TODO", "FIXME", "PENDING",
 ]
 
+# A promise that was already discharged cannot be overdue. Lines that record a
+# completion ("…TODO dd1eb34c 已完成") carry both a pending marker and a past
+# date, but they are history — flagging them was the last false-positive class
+# left after v3.3.3.
+_COMPLETED_MARKERS = [
+    "已完成", "已解决", "已闭环", "已生效", "已修复", "已归档", "已发布",
+    "已交付", "已核实", "已确认",
+]
+
 # Date patterns to detect expired content (P3)
 _DATE_RE = re.compile(r"(20\d{2})[-/年.](\d{1,2})[-/月.](\d{1,2})")
 _HEADING_RE = re.compile(r"^(#{2,3})\s+(.+)$", re.MULTILINE)
@@ -136,6 +145,10 @@ def audit_rot(config: "MemoryConfig") -> dict:
             # The shape that survives all three is "下次执行 2026-08-01".
             stale_hit: tuple[str, str] | None = None
             for line in (heading, *body.split("\n")[:2]):
+                # A line that records the discharge of its own promise is
+                # history, not rot ("…TODO dd1eb34c 已完成（2026-07-26）").
+                if any(cm in line for cm in _COMPLETED_MARKERS):
+                    continue
                 marker_hit = next((mk for mk in _PENDING_MARKERS if mk in line), None)
                 if not marker_hit:
                     continue

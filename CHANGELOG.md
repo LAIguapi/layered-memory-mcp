@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.3.4] - 2026-10-06
+
+### Fixed
+
+- **Stale detection: a discharged promise is history, not rot.** A line such as
+  `… TODO dd1eb34c 已完成（2026-07-26）` carries both a pending marker and a past
+  date, so v3.3.3 still flagged it — the last false-positive class in the live
+  library. Lines recording a completion (`已完成`, `已解决`, `已闭环`, `已生效`,
+  …) are now skipped. `尚未完成` is deliberately unaffected: it contains 完成 but
+  not `已完成`, so a genuinely open item is still reported.
+- **Promotion hint no longer suggests a domain named after a year.** The
+  suggested name came back as `2026.md`: the heading tokenizer splits
+  `2026-07-30` into `2026` / `07` / `30`, and a year repeated across dated
+  headings won the frequency vote outright (it also won strategy 1 whenever
+  every heading started with it). Pure-digit tokens are now excluded from both
+  naming strategies, so the hint falls through to a real topic word — or to
+  `topic` when nothing repeats, which is the honest answer.
+
 ## [3.3.3] - 2026-10-06
 
 ### Fixed
