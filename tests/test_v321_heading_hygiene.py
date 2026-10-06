@@ -6,7 +6,7 @@ Two real bugs found in the wild (knowledge base health_score had decayed to
   Bug 1  _suggest_migration cleaned headings with an ALLOW-LIST regex
          (``[^a-zA-Z0-9\\u4e00-\\u9fff\\s\\-]``, then ``[^\\w\\s\\-·‧...]``).
          It deleted ':' '/' '.' and every CJK punctuation mark, so
-         "/root/.hermes/cache/documents/" became "roothermescachedocuments"
+         "/var/cache/documents/" became "varcachedocuments"
          and Chinese clauses welded into one unbroken run — precisely the
          P2 "garbled_heading" pathology the rot auditor kept reporting.
 
@@ -35,8 +35,8 @@ class TestHeadingPreservesContent:
         "entry,must_contain",
         [
             (
-                "[L0] infra: 用户上传的文件缓存在 /root/.hermes/cache/documents/",
-                "/root/.hermes/cache/documents",
+                "[L0] infra: 用户上传的文件缓存在 /var/cache/documents/",
+                "/var/cache/documents",
             ),
             (
                 "[L0] dev: DB 选型：PG:5432 vs Redis:6379",
@@ -59,9 +59,9 @@ class TestHeadingPreservesContent:
     def test_path_is_not_welded_into_one_run(self):
         """The exact regression: separators stripped -> unreadable run."""
         section = _suggest_migration(
-            "[L0] infra: 用户上传的文件缓存在 /root/.hermes/cache/documents/"
+            "[L0] infra: 用户上传的文件缓存在 /var/cache/documents/"
         )["section"]
-        assert "roothermescachedocuments" not in section
+        assert "varcachedocuments" not in section
 
     def test_markdown_structure_chars_are_still_stripped(self):
         """Heading-breaking characters must not leak into an ATX heading."""
@@ -115,7 +115,7 @@ class TestNoFabricatedHeadings:
     @pytest.mark.parametrize(
         "entry",
         [
-            "用户上传的文件缓存在 /root/.hermes/cache/documents/，读取时走这个路径",
+            "用户上传的文件缓存在 /var/cache/documents/，读取时走这个路径",
             "Configure the proxy server for deployment",
             "Something completely unrelated to anything at all",
         ],
@@ -141,8 +141,8 @@ class TestNoFabricatedHeadings:
 
     def test_reworded_duplicates_no_longer_mint_rival_stubs(self):
         """Two rewordings of one fact previously produced two stub headings."""
-        a = _suggest_migration("缓存目录配置在 /root/.hermes/cache 下面，注意权限")
-        b = _suggest_migration("缓存目录的配置位于 /root/.hermes/cache，需要注意权限问题")
+        a = _suggest_migration("缓存目录配置在 /var/cache/documents 下面，注意权限")
+        b = _suggest_migration("缓存目录的配置位于 /var/cache/documents，需要注意权限问题")
         assert a["needs_title"] and b["needs_title"]
         assert a["section"] == b["section"] == ""
 

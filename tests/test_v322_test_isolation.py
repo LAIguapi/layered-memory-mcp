@@ -15,9 +15,12 @@ import pytest
 
 from layered_memory_mcp.config import MemoryConfig
 
-# The real production paths this suite must never touch.
-_REAL_MEMORY = "/root/.hermes/memories/MEMORY.md"
-_REAL_L1 = "/root/.layered-memory"
+# The real production paths this suite must never touch. Derived from the real
+# home, captured at import time before any fixture redirects HOME (conftest.py
+# relies on the same ordering), so this file carries no machine-specific path.
+_REAL_HOME = os.path.expanduser("~")
+_REAL_MEMORY = os.path.join(_REAL_HOME, ".hermes", "memories", "MEMORY.md")
+_REAL_L1 = os.path.join(_REAL_HOME, ".layered-memory")
 
 
 class TestPathIsolation:
@@ -35,8 +38,9 @@ class TestPathIsolation:
 
     def test_home_is_redirected(self):
         """Path.home() must be sandboxed for code that bypasses config."""
-        assert not str(Path.home()).startswith("/root/.hermes")
-        assert str(Path.home()) == os.environ["HOME"]
+        sandbox_home = str(Path.home())
+        assert sandbox_home == os.environ["HOME"]
+        assert not sandbox_home.startswith(os.path.join(_REAL_HOME, ".hermes"))
 
     def test_sandbox_paths_are_writable(self):
         """Isolation must not break legitimate writes."""

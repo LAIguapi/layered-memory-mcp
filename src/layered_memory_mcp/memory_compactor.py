@@ -37,8 +37,8 @@ MAX_SECTION_TITLE_CHARS = 40
 # Characters that genuinely break a markdown ATX heading or the section parser.
 # Everything else — ':' '/' '.' '（）' '，' '、' '×' etc. — is CONTENT and must
 # survive. The pre-3.2.1 code used an allow-list regex that deleted every one
-# of those, turning "/root/.hermes/cache/documents/" into
-# "roothermescachedocuments" and welding CJK clauses into one unbroken run
+# of those, turning "/var/cache/documents/" into
+# "varcachedocuments" and welding CJK clauses into one unbroken run
 # (the P2 "garbled_heading" pathology the rot auditor kept reporting).
 _HEADING_STRIP_RE = re.compile(r"[#*`_\[\]\r\n]+")
 
