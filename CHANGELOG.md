@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.3.2] - 2026-10-06
+
+### Fixed
+
+- **`audit_rot` no longer times out on a large store.** The same-file duplicate
+  scan was an O(n²) loop calling `SequenceMatcher.ratio()` on every pair of
+  section bodies; on a 791-section library (~312k pairs) the MCP call hit the
+  60s client timeout every time, leaving the health score unobtainable. The
+  comparison is now ordered cheapest-first: an exact length-ratio bound
+  (`ratio() <= 2*min/(la+lb)`, so it can never discard a real match), then the
+  O(1)/O(n) `real_quick_ratio` / `quick_ratio` upper bounds, and only then
+  `ratio()`.
+- **`audit_rot` now finds re-appended shorter copies of a section.** Body
+  similarity alone misses a second copy that is much shorter than the original
+  (it falls below the threshold). Same-file section pairs whose headings agree
+  after stripping dates, versions and parenthetical qualifiers are now reported
+  too, with `reason: "same heading skeleton"`. Restricted to same-file pairs —
+  across files an identical generic heading is usually legitimate.
+- **One malformed L1 file no longer breaks L0 index generation.**
+  `l0_manager._generate_hermes_index` called `gd.get("keywords", "").strip()` on
+  an optional regex group; a line with no `→ keywords` part yields `None` (the
+  default applies only to a *missing* key), so a single stray knowledge file
+  crashed index generation for `inject_knowledge` / `create_knowledge_file` /
+  `update_knowledge_file` / `sync_l0_index` alike — while the L1 write had
+  already landed, making it look like nothing was written.
+
 ## [3.3.1] - 2026-10-06
 
 ### Fixed

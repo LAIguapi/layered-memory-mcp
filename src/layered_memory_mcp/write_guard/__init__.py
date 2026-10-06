@@ -40,7 +40,7 @@ logger = logging.getLogger("layered_memory_mcp.write_guard")
 
 # Plugin identity — the directory name doubles as the `plugins.enabled` key.
 GUARD_PLUGIN_NAME = "layered-memory-guard"
-GUARD_VERSION = "3.3.1"
+GUARD_VERSION = "3.3.2"
 
 # Files that make up the deployed plugin (source dir → plugin dir).
 PLUGIN_FILES = ("plugin.yaml", "__init__.py", "guard.py")

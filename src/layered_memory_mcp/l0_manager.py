@@ -397,9 +397,13 @@ def _generate_hermes_index(knowledge_dir: str, l1_files: dict, config=None) -> l
         if not m:
             continue
         gd = m.groupdict()
-        filename = gd.get("file", "").strip()
-        title = gd.get("title", "").strip()
-        keywords = gd.get("keywords", "").strip()
+        # These groups are optional in the pattern, and .get(key, default) only
+        # applies its default when the KEY is missing — a present-but-None group
+        # (a line with no '→ keywords' part) came back as None and blew up on
+        # .strip(), taking the whole L0 index generation with it.
+        filename = (gd.get("file") or "").strip()
+        title = (gd.get("title") or "").strip()
+        keywords = (gd.get("keywords") or "").strip()
 
         # Derive domain from filename (strip .md)
         domain = filename.removesuffix(".md")

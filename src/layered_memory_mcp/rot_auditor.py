@@ -45,6 +45,17 @@ _TRANSIENT_MARKERS = [
 _DATE_RE = re.compile(r"(20\d{2})[-/年.](\d{1,2})[-/月.](\d{1,2})")
 _HEADING_RE = re.compile(r"^(#{2,3})\s+(.+)$", re.MULTILINE)
 
+# Heading noise stripped before comparing two headings as "the same topic" (P4b):
+# parenthetical qualifiers, dates, 期号/版次, versions and bare years/ids.
+_HEADING_NOISE_RE = re.compile(
+    r"[（(][^）)]*[）)]"                     # （2026-07-16，含实证）
+    r"|20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}"     # 2026-10-01
+    r"|\d{1,2}[-/.]\d{1,2}"                 # 10-01
+    r"|第\s*\d+\s*[期版次]"                  # 第 3 期 / 第 2 版
+    r"|v?\d+\.\d+(?:\.\d+)?"                # v3.3.1 / 1.2.0
+    r"|\b\d{3,4}\b"                         # bare years, issue ids
+)
+
 
 def audit_rot(config: "MemoryConfig") -> dict:
     """Scan all L1 knowledge files and report decay signals.
@@ -135,32 +146,70 @@ def audit_rot(config: "MemoryConfig") -> dict:
                     "file": name,
                     "heading": heading[:50],
                     "norm": _normalize(body),
+                    "skeleton": _heading_skeleton(heading),
                 })
 
     # P4 — near-duplicate sections, split into cross-file and same-file.
     # Same-file duplicates are the classic "append but never merge" rot
     # (e.g. dual-write leaving two copies of the same section); cross-file
     # duplicates mean the same knowledge lives in more than one file.
+    #
+    # Two detection routes, because they catch different shapes:
+    #   a) body similarity — ordered cheapest-first. A naive O(n²) loop calling
+    #      ratio() on every pair is what pushed this audit past the 60s MCP
+    #      client timeout on a ~800-section store. The length-ratio bound is
+    #      exact (ratio() <= 2*min/(la+lb)), then come the O(1)/O(n)
+    #      SequenceMatcher upper bounds, and only then the real ratio().
+    #   b) same heading skeleton — identical title once dates/versions/
+    #      parentheticals are stripped. A re-appended copy is often much shorter
+    #      than the original, so body similarity alone misses it; same-file
+    #      same-skeleton pairs are rot regardless of body length. Restricted to
+    #      same-file pairs: across files an identical generic heading is often
+    #      legitimate.
     cross_dup: list[dict] = []
     same_file_dup: list[dict] = []
+
     for a in range(len(sections)):
+        sa = sections[a]
+        na = sa["norm"]
+        la = len(na)
         for b in range(a + 1, len(sections)):
-            sa, sb = sections[a], sections[b]
-            sim = SequenceMatcher(None, sa["norm"], sb["norm"]).ratio()
-            if sim < CROSS_DUP_SIMILARITY:
+            sb = sections[b]
+            nb = sb["norm"]
+
+            sim: float | None = None
+            if _length_gate(la, len(nb)):
+                matcher = SequenceMatcher(None, na, nb)
+                if (matcher.real_quick_ratio() >= CROSS_DUP_SIMILARITY
+                        and matcher.quick_ratio() >= CROSS_DUP_SIMILARITY):
+                    ratio = matcher.ratio()
+                    if ratio >= CROSS_DUP_SIMILARITY:
+                        sim = ratio
+
+            same_file = sa["file"] == sb["file"]
+            skeleton_hit = bool(sa["skeleton"]) and same_file and sa["skeleton"] == sb["skeleton"]
+            if sim is None and not skeleton_hit:
                 continue
+
+            if sim is None:
+                reason = "same heading skeleton"
+            elif skeleton_hit:
+                reason = "near-identical body + same heading skeleton"
+            else:
+                reason = "near-identical body"
             entry = {
-                "similarity": round(sim, 2),
+                "similarity": round(sim, 2) if sim is not None else None,
+                "reason": reason,
                 "a": {"file": sa["file"], "heading": sa["heading"]},
                 "b": {"file": sb["file"], "heading": sb["heading"]},
             }
-            if sa["file"] == sb["file"]:
+            if same_file:
                 same_file_dup.append(entry)
             else:
                 cross_dup.append(entry)
 
-    cross_dup.sort(key=lambda x: x["similarity"], reverse=True)
-    same_file_dup.sort(key=lambda x: x["similarity"], reverse=True)
+    cross_dup.sort(key=lambda x: x["similarity"] or 0.0, reverse=True)
+    same_file_dup.sort(key=lambda x: x["similarity"] or 0.0, reverse=True)
 
     # Promotion candidates (v2.10.0) — same-topic clusters in watched catch-all
     # domains that deserve extraction into their own L1 file. Advisory only.
@@ -232,6 +281,35 @@ def _detect_promotion_candidates(config: "MemoryConfig", files: dict[str, str]) 
         if hit is not None:
             candidates.append(hit)
     return candidates
+
+
+def _length_gate(la: int, lb: int) -> bool:
+    """Exact upper bound on SequenceMatcher.ratio() for two lengths.
+
+    ``ratio() = 2*M/T`` with ``M <= min(la, lb)`` and ``T = la + lb``, so
+    ``2*min/(la+lb)`` can never be exceeded. When that bound is already below
+    the threshold, no comparison of these two lengths can match and the
+    expensive work is skipped — this is what keeps the audit inside the MCP
+    client timeout on a large store.
+    """
+    if la <= 0 or lb <= 0:
+        return False
+    return (2 * min(la, lb)) / (la + lb) >= CROSS_DUP_SIMILARITY
+
+
+def _heading_skeleton(heading: str) -> str:
+    """Collapse a heading to its bare topic (drops dates, versions, qualifiers).
+
+    Two sections in one file whose headings agree after this stripping are the
+    same topic logged twice — the usual cause being a date/measurement suffix
+    like ``（2026-10-01 实测）``, or a second, shorter copy of the same section.
+    """
+    if not heading:
+        return ""
+    text = _HEADING_NOISE_RE.sub(" ", heading)
+    # \w keeps CJK (Python 3), so this drops whitespace and punctuation only.
+    text = re.sub(r"[\W_]+", "", text)
+    return text.lower()
 
 
 def _normalize(text: str) -> str:
