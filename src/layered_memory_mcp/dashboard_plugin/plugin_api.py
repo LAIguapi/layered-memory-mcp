@@ -467,14 +467,24 @@ async def update_todo_endpoint(req: UpdateTodoRequest):
 
     def _update():
         todo_store = _get_todo_store()
-        todo_store.update(req.todo_id, status=req.status)
-        return True
+        # Return the store's verdict instead of discarding it (v3.4.6): this endpoint
+        # used to answer "TODO updated successfully." even when the id matched no row.
+        return todo_store.update(req.todo_id, status=req.status)
 
-    await asyncio.to_thread(_update)
+    result = await asyncio.to_thread(_update)
+    if not result.get("success"):
+        return {
+            "dry_run": False,
+            "todo_id": req.todo_id,
+            "status": req.status,
+            "success": False,
+            "message": result.get("error", "TODO update failed."),
+        }
     return {
         "dry_run": False,
         "todo_id": req.todo_id,
         "status": req.status,
+        "success": True,
         "message": "TODO updated successfully.",
     }
 

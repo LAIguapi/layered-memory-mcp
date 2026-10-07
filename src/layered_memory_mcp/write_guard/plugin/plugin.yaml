@@ -1,5 +1,5 @@
 name: layered-memory-guard
-version: "3.4.5"
+version: "3.4.6"
 description: "Write guard for the layered-memory framework — keeps agent-side writes out of the framework-owned MEMORY.md (blocks the memory tool with target=memory and direct write_file/patch edits of memories/MEMORY.md), and points the model at inject_knowledge (L1) or target='user' instead."
 
 provides_hooks:

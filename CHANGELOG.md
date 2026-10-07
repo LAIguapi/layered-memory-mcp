@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.4.6] - 2026-10-07
+
+### Fixed
+
+- **`update_todo` / `delete_todo` answered "success" for an id that matched no
+  row.** Both paths ran the statement and returned `{"success": true, "id": …}`
+  without ever looking at the result, so a mistyped or fabricated id was
+  indistinguishable from an applied edit. This is not a theoretical slip: an
+  agent hand-typed a UUID (once with one character corrupted, once invented
+  outright, because it had only seen a truncated id) and both calls reported
+  success while the row stayed untouched — the mistake only surfaced on a later
+  read-back, as stale content. Silent success on a write is worse than a loud
+  failure: it makes the caller's own audit unverifiable. `update()` and
+  `delete()` now check `rowcount` and return `{"success": false, "error": "TODO
+  not found: <id>"}` (SQLite reports `rowcount == 1` for a no-op edit that
+  matched the row, so idempotent updates still succeed). The dashboard
+  `/update-todo` endpoint, which discarded the store's verdict and always
+  answered "TODO updated successfully.", now propagates it.
+- **An unknown `status` / `priority` was written as-is.** `status="banana"`
+  stored garbage *and* skipped the terminal-timestamp machine, leaving a row
+  that was neither open nor finished and had no stamp of either kind. Both
+  values are now validated against `TodoStatus` / `TodoPriority`.
+
 ## [3.4.5] - 2026-10-07
 
 ### Added

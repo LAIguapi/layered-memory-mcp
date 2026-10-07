@@ -8,6 +8,12 @@ from .models import TodoEntry, TodoStatus, TodoPriority
 # Beijing timezone: UTC+8
 _BEIJING_TZ = timezone(timedelta(hours=8))
 
+# Whitelists for caller-supplied enum-ish fields (v3.4.6). Before this, any string
+# went straight into the row: status="banana" stored garbage *and* skipped the whole
+# terminal-timestamp machine below, so the row silently had no completed_at either.
+_VALID_STATUSES = {s.value for s in TodoStatus}
+_VALID_PRIORITIES = {p.value for p in TodoPriority}
+
 
 class TodoStore:
     def __init__(self, db_path: Path):
@@ -107,6 +113,16 @@ class TodoStore:
         if not updates:
             return {"success": False, "error": "No valid fields"}
 
+        # Reject unknown enum values instead of writing them (v3.4.6).
+        if "status" in updates and updates["status"] not in _VALID_STATUSES:
+            return {"success": False,
+                    "error": f"Invalid status: {updates['status']!r} "
+                             f"(expected one of {sorted(_VALID_STATUSES)})"}
+        if "priority" in updates and updates["priority"] not in _VALID_PRIORITIES:
+            return {"success": False,
+                    "error": f"Invalid priority: {updates['priority']!r} "
+                             f"(expected one of {sorted(_VALID_PRIORITIES)})"}
+
         if "blocked_by" in updates and isinstance(updates["blocked_by"], list):
             updates["blocked_by"] = json.dumps(updates["blocked_by"])
 
@@ -131,12 +147,21 @@ class TodoStore:
         set_clause = ", ".join(f"{k}=?" for k in updates)
         values = list(updates.values()) + [todo_id]
         with sqlite3.connect(str(self.db_path)) as conn:
-            conn.execute(f"UPDATE todos SET {set_clause} WHERE id=?", values)
+            cursor = conn.execute(f"UPDATE todos SET {set_clause} WHERE id=?", values)
+            changed = cursor.rowcount
+        if not changed:
+            # A typo'd or fabricated id used to return {"success": True}: the caller had
+            # no way to tell a real edit from a silent no-op, so a mistyped id looked
+            # applied forever (v3.4.6). rowcount is 1 even when the values are unchanged.
+            return {"success": False, "error": f"TODO not found: {todo_id}"}
         return {"success": True, "id": todo_id}
 
     def delete(self, todo_id: str) -> dict:
         with sqlite3.connect(str(self.db_path)) as conn:
-            conn.execute("DELETE FROM todos WHERE id=?", (todo_id,))
+            cursor = conn.execute("DELETE FROM todos WHERE id=?", (todo_id,))
+            changed = cursor.rowcount
+        if not changed:
+            return {"success": False, "error": f"TODO not found: {todo_id}"}
         return {"success": True, "id": todo_id}
 
     def stats(self) -> dict:
