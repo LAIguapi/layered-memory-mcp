@@ -76,6 +76,24 @@ def _env_bool(name: str, default: bool) -> bool:
     return default
 
 
+def _coerce_bool(value: object, default: bool) -> bool:
+    """Coerce a YAML scalar to bool.
+
+    YAML 1.1 resolves bare ``on``/``off``/``yes``/``no`` to booleans before this
+    code ever sees them, so strings and bools both have to be accepted.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    token = str(value).strip().lower()
+    if token in ("1", "true", "yes", "on", "enabled"):
+        return True
+    if token in ("0", "false", "no", "off", "disabled", "none"):
+        return False
+    return default
+
+
 def _env_float(name: str, default: float) -> float:
     """Read a float from an environment variable."""
     val = os.environ.get(name)
@@ -248,6 +266,39 @@ def _load_session_scan_from_yaml(home: Path) -> dict:
     if not isinstance(data, dict):
         return {}
     section = data.get("session_scan")
+    return section if isinstance(section, dict) else {}
+
+
+def _load_consolidate_from_yaml(home: Path) -> dict:
+    """Read the ``consolidate`` section from ``<home>/config.yaml``.
+
+    Shape (all keys optional)::
+
+        consolidate:
+          enabled: true        # kill switch for the same-skeleton family gate
+          min_family: 2        # members at which a write must go through the gate
+          size_ceiling: 0.7    # write-back must shrink the family below this
+
+    These are the tuning knobs of the write-path gate. They belong next to the
+    operator's other policy (``write_guard``, ``session_scan``) rather than in
+    this package because "how much compaction is enough" is a judgement about
+    *their* knowledge base, not a framework constant — and a knob that can only
+    be moved by editing the library, or by adding an env var to a systemd unit,
+    is the kind of policy that silently stays at its default forever (which is
+    exactly what happened to the 0.9 ceiling). Never raises: a broken config.yaml
+    must not crash server start-up, it just means "use the defaults".
+    """
+    path = home / "config.yaml"
+    if not path.exists():
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = yaml.safe_load(fh)
+    except (OSError, yaml.YAMLError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    section = data.get("consolidate")
     return section if isinstance(section, dict) else {}
 
 
@@ -549,29 +600,37 @@ class MemoryConfig:
             )
 
         # v3.3.7: same-skeleton family consolidation (the write side of the
-        # v3.3.2 read detector). Precedence: constructor → env → default.
+        # v3.3.2 read detector). Precedence: constructor → env → config.yaml →
+        # default; `consolidate:` in the operator's config.yaml is the intended
+        # home for these three knobs (see _load_consolidate_from_yaml).
         # `consolidate_enabled` is the kill switch: with it off, an upsert that
         # would add another member to a same-topic family writes as it always
         # did (the auditor will still report the family afterwards).
+        _consolidate_yaml = _load_consolidate_from_yaml(self.home)
+        _env_consolidate_enabled = os.environ.get("LAYERED_MEMORY_CONSOLIDATE_ENABLED")
         self.consolidate_enabled: bool = (
             bool(consolidate_enabled)
             if consolidate_enabled is not None
-            else _env_bool("LAYERED_MEMORY_CONSOLIDATE_ENABLED", True)
+            else (
+                _env_bool("LAYERED_MEMORY_CONSOLIDATE_ENABLED", True)
+                if _env_consolidate_enabled is not None
+                else _coerce_bool(_consolidate_yaml.get("enabled"), True)
+            )
         )
-        _cmf = (
-            consolidate_min_family
-            if consolidate_min_family is not None
-            else os.environ.get("LAYERED_MEMORY_CONSOLIDATE_MIN_FAMILY")
-        )
+        _cmf = consolidate_min_family
+        if _cmf is None:
+            _cmf = os.environ.get("LAYERED_MEMORY_CONSOLIDATE_MIN_FAMILY")
+        if _cmf is None:
+            _cmf = _consolidate_yaml.get("min_family")
         try:
             self.consolidate_min_family: int = int(_cmf) if _cmf is not None else 2
         except (TypeError, ValueError):
             self.consolidate_min_family = 2
-        _csc = (
-            consolidate_size_ceiling
-            if consolidate_size_ceiling is not None
-            else os.environ.get("LAYERED_MEMORY_CONSOLIDATE_SIZE_CEILING")
-        )
+        _csc = consolidate_size_ceiling
+        if _csc is None:
+            _csc = os.environ.get("LAYERED_MEMORY_CONSOLIDATE_SIZE_CEILING")
+        if _csc is None:
+            _csc = _consolidate_yaml.get("size_ceiling")
         try:
             self.consolidate_size_ceiling: float = (
                 float(_csc) if _csc is not None else 0.9

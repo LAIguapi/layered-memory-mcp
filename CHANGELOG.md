@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.4.5] - 2026-10-07
+
+### Added
+
+- **The consolidation knobs are now readable from the operator's config.yaml**
+  (`consolidate: {enabled, min_family, size_ceiling}`). Precedence is
+  constructor → env → config.yaml → default, matching `write_guard` and
+  `session_scan`. Why it matters: `consolidate_size_ceiling` could previously
+  only be moved by editing this package or by adding an env var to a systemd
+  unit, so on a deployed host it sat at its 0.9 default — a recommended
+  tightening to 0.7 stayed "recommended" for a week while every write-back kept
+  being judged against 0.9. A tuning knob whose only local spelling is "patch the
+  library" is a knob that never moves; "how much compaction is enough" is a
+  judgement about the operator's knowledge base, not a framework constant.
+
 ## [3.4.4] - 2026-10-07
 
 ### Fixed
