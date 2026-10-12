@@ -219,9 +219,9 @@ backend:
 # So a projection write needs an explicit target or an explicit opt-in:
 #
 #     agent_memory:
-#       path: /root/.hermes/memories/MEMORY.md   # explicit target (recommended)
-#       allow_auto_detect_write: false           # or opt back into auto-detect
-#       separator: null                          # override the adapter's separator
+#       path: /home/example/.hermes/memories/MEMORY.md   # explicit target (recommended)
+#       allow_auto_detect_write: false                  # or opt back into auto-detect
+#       separator: null                                 # override the adapter's separator
 #
 # Env equivalents (highest priority):
 #     LAYERED_MEMORY_AGENT_MEMORY_PATH=/path/to/MEMORY.md
@@ -237,7 +237,7 @@ backend:
 #     "agent_memory_write": {
 #       "status": "skipped",
 #       "reason": "unsafe_auto_detect_write",
-#       "detected_path": "/root/.hermes/memories/MEMORY.md",
+#       "detected_path": "/home/example/.hermes/memories/MEMORY.md",
 #       "hint": "Set agent_memory.path ..."
 #     }
 #

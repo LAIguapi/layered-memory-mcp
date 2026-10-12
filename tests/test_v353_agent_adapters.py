@@ -594,12 +594,12 @@ class TestRegistry:
 
     def test_claims_path_identifies_a_product_by_layout(self):
         hermes = HermesEnvironment()
-        assert hermes.claims_path("/root/.hermes/memories/MEMORY.md")
+        assert hermes.claims_path("/home/example/.hermes/memories/MEMORY.md")
         assert hermes.claims_path("/anywhere/MEMORY.md")
         assert hermes.claims_path("/anywhere/USER.md")
-        assert not hermes.claims_path("/root/.claude/CLAUDE.md")
+        assert not hermes.claims_path("/home/example/.claude/CLAUDE.md")
         assert not hermes.claims_path(None)
-        assert ClaudeCodeEnvironment().claims_path("/root/.claude/CLAUDE.md")
+        assert ClaudeCodeEnvironment().claims_path("/home/example/.claude/CLAUDE.md")
         # The generic adapter claims nothing — that is what makes it the safe
         # fallback for an unknown id.
-        assert not env_mod.GenericEnvironment().claims_path("/root/.hermes/x")
+        assert not env_mod.GenericEnvironment().claims_path("/home/example/.hermes/x")
