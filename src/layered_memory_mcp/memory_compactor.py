@@ -723,7 +723,7 @@ def _pointer_domain_matches(entry: str, domain: str, config=None) -> bool:
     return label == domain
 
 
-def dedup_l1_file(filepath: "Path") -> dict:
+def dedup_l1_file(filepath: "Path", config: "MemoryConfig | None" = None) -> dict:
     """De-duplicate a single L1 knowledge file in place.
 
     Removes exact-duplicate non-heading lines within each ## section while
@@ -734,6 +734,10 @@ def dedup_l1_file(filepath: "Path") -> dict:
     write path slips a verbatim duplicate through, this reaps it on the next
     maintenance pass — keeping the self-maintenance responsibility *inside*
     the framework rather than relying on external cron.
+
+    With ``config`` the pre-dedup backup goes under
+    ``<home>/data/backups/knowledge`` (v3.4.7); without it, the legacy
+    adjacent ``.bak`` is kept for direct callers.
     """
     try:
         raw = filepath.read_text(encoding="utf-8")
@@ -762,8 +766,17 @@ def dedup_l1_file(filepath: "Path") -> dict:
 
     new_text = "\n".join(out)
     try:
-        bak = filepath.with_suffix(filepath.suffix + ".bak")
-        bak.write_text(raw, encoding="utf-8")
+        if config is not None:
+            from .backups import backup_knowledge_file
+
+            backup = backup_knowledge_file(config, filepath, raw)
+            if "error" in backup:
+                # No backup, no destructive rewrite.
+                return {"file": filepath.name, "action": "error",
+                        "reason": f"backup failed: {backup['error']}"}
+        else:
+            bak = filepath.with_suffix(filepath.suffix + ".bak")
+            bak.write_text(raw, encoding="utf-8")
         filepath.write_text(new_text, encoding="utf-8")
     except OSError as e:
         return {"file": filepath.name, "action": "error", "reason": str(e)}
@@ -810,7 +823,7 @@ def dedup_l1_knowledge(config: "MemoryConfig", min_dup_lines: int = 20) -> dict:
                     else:
                         seen.add(s)
                 if dup >= min_dup_lines:
-                    res = dedup_l1_file(fp)
+                    res = dedup_l1_file(fp, config)
                     if res.get("action") == "deduped":
                         report["files_deduped"].append(res)
     except Exception as e:  # noqa: BLE001 — maintenance must not raise

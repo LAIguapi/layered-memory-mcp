@@ -40,6 +40,8 @@ from .session_scanner import (
 from .l0_manager import sync_l0_index, auto_sync_if_enabled, manage_entry, check_l0_l1_consistency
 from .injector import inject_knowledge, sync_to_vector_store, remove_from_vector_store, reindex_vector_store, vector_store_needs_reindex, calibrate_thresholds
 from .promotion import scan_split_candidates, scan_cross_domain_duplicates
+from .backups import backup_knowledge_file
+from .governance import post_write_governance, build_validation_extras
 from .agent_integrator import (
     detect_agent_type,
     is_soul_injected,
@@ -741,7 +743,11 @@ async def create_knowledge_file(filename: str, content: str) -> str:
             result["l0_sync"] = sync_report
         if dual_write:
             result["dual_write"] = dual_write
-        return json.dumps(result)
+        # v3.4.7: advisory lifecycle checks on what was just written.
+        result["governance"] = await asyncio.to_thread(
+            post_write_governance, config, domain, filepath, content, "create"
+        )
+        return json.dumps(result, ensure_ascii=False)
     except Exception as e:
         logger.error("Failed to create %s: %s", filename, e)
         return json.dumps({"success": False, "error": str(e)})
@@ -768,13 +774,10 @@ async def update_knowledge_file(filename: str, content: str) -> str:
 
     try:
         old_size = filepath.stat().st_size
-        # v0.6.0: Create .bak backup before overwriting
-        try:
-            old_content = await asyncio.to_thread(filepath.read_text, "utf-8")
-            bak_path = filepath.with_suffix(filepath.suffix + ".bak")
-            await asyncio.to_thread(bak_path.write_text, old_content, "utf-8")
-        except Exception:
-            pass  # Non-critical — backup failure shouldn't block updates
+        # v0.6.0: back up before overwriting. v3.4.7: under
+        # <home>/data/backups/knowledge, not as a .bak beside the live file.
+        # Never raises — a backup failure shouldn't block updates.
+        backup = await asyncio.to_thread(backup_knowledge_file, config, filepath)
         await asyncio.to_thread(filepath.write_text, content, "utf-8")
         new_size = len(content.encode("utf-8"))
         logger.info("Updated knowledge file: %s (%d → %d bytes)", filename, old_size, new_size)
@@ -829,7 +832,12 @@ async def update_knowledge_file(filename: str, content: str) -> str:
             result["l0_sync"] = sync_report
         if dual_write:
             result["dual_write"] = dual_write
-        return json.dumps(result)
+        result["backup"] = backup
+        # v3.4.7: advisory lifecycle checks on what was just written.
+        result["governance"] = await asyncio.to_thread(
+            post_write_governance, config, domain, filepath, content, "update"
+        )
+        return json.dumps(result, ensure_ascii=False)
     except Exception as e:
         logger.error("Failed to update %s: %s", filename, e)
         return json.dumps({"success": False, "error": str(e)})
@@ -858,7 +866,8 @@ async def delete_knowledge_file(filename: str) -> str:
         await asyncio.to_thread(filepath.unlink)
         logger.info("Deleted knowledge file: %s (%d bytes)", filename, old_size)
 
-        # Clean up .bak backup if it exists
+        # Clean up a legacy adjacent .bak if one exists (new writes no longer
+        # create them; the backup under data/backups is left as a recovery copy).
         bak_path = filepath.with_suffix(filepath.suffix + ".bak")
         try:
             if bak_path.exists():
@@ -1302,6 +1311,10 @@ async def validate_knowledge(
             report["overall_health"] = "fair"
         else:
             report["overall_health"] = "poor"
+
+        # v3.4.7: rot + state-marker visibility. Informational only — it does
+        # not feed overall_health, and a failure degrades to an *_error key.
+        report.update(build_validation_extras(config))
 
         return report
 

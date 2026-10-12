@@ -255,7 +255,7 @@ def _write_consolidated(
 ) -> dict:
     """Collapse every same-skeleton section into one, in the first member's slot.
 
-    Called under the file lock, after ``_do_write`` has already written ``.bak``.
+    Called under the file lock, after ``_do_write`` has already written the backup.
     """
     skeleton = heading_skeleton(section)
     preamble, sections = _split_raw(raw)
@@ -1444,7 +1444,10 @@ def _execute_write(
     try:
         with lock:
             try:
-                result = _do_write(filepath, filename, section, content, action, provenance)
+                result = _do_write(
+                    filepath, filename, section, content, action, provenance,
+                    config=config,
+                )
             except Exception as e:
                 logger.error("Write error for %s: %s", filename, e)
                 result = {"success": False, "error": str(e)}
@@ -1468,6 +1471,7 @@ def _do_write(
     content: str,
     action: str,
     provenance: str,
+    config=None,
 ) -> dict:
     """Core write logic — must be called within file lock."""
     # If file doesn't exist, create with action-appropriate content
@@ -1485,12 +1489,19 @@ def _do_write(
     # File exists — backup then modify
     raw = filepath.read_text(encoding="utf-8")
 
-    # v0.6.0: Create .bak backup before modification
-    try:
-        bak_path = filepath.with_suffix(filepath.suffix + ".bak")
-        bak_path.write_text(raw, encoding="utf-8")
-    except Exception as e:
-        logger.debug("Failed to create .bak for %s: %s", filename, e)
+    # v0.6.0: back up before modification. v3.4.7: under
+    # <home>/data/backups/knowledge when the config is known, so the live
+    # knowledge dir no longer collects .md.bak siblings.
+    if config is not None:
+        from .backups import backup_knowledge_file
+
+        backup_knowledge_file(config, filepath, raw)
+    else:
+        try:
+            bak_path = filepath.with_suffix(filepath.suffix + ".bak")
+            bak_path.write_text(raw, encoding="utf-8")
+        except Exception as e:
+            logger.debug("Failed to create .bak for %s: %s", filename, e)
 
     # v3.3.7: consolidation write-back — collapse the whole same-skeleton family
     # into a single section, in the first member's slot. Runs here (under the

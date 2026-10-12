@@ -69,6 +69,13 @@ def _isolate_memory_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(fake_home))
     monkeypatch.setenv("USERPROFILE", str(fake_home))  # Windows equivalent
 
+    # Vector models are read-only large artifacts, not writable test data.
+    # Keep the production cache visible after HOME is redirected so vector tests
+    # do not try to bootstrap-download the embedding model in offline CI/dev.
+    real_model_dir = os.path.join(_REAL_HOME, ".layered-memory", "models")
+    if os.path.exists(real_model_dir):
+        monkeypatch.setenv("LAYERED_MEMORY_MODEL_DIR", real_model_dir)
+
     # Drop inherited overrides so a developer's shell env can't leak in and
     # re-point a write at real data.
     for var in _REDIRECTED_ENV_VARS:
