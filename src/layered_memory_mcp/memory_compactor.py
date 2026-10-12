@@ -495,8 +495,11 @@ def compact_memory(
     ``fingerprint: None`` when nothing was blocked. It is a property of the
     set's content (order- and time-independent), which is what lets
     :func:`auto_maintain_after_write` recognise "the same blocked entries
-    again" and stop re-running a pass that cannot move anything. An explicit
-    call like this one always runs.
+    again" and stop re-running a pass that cannot move anything. Next to it,
+    ``classifier_inputs_hash`` identifies the classifier that produced the set:
+    two blocked sets are only comparable under the same hash, because the same
+    entries classify differently after a marker-vocabulary or domain-rule
+    change. An explicit call like this one always runs.
     """
     path = _resolve_memory_path(memory_path, config)
 
@@ -830,6 +833,14 @@ def compact_memory(
         # blocked. Always present, so advisory callers can see the empty set
         # rather than guess at a missing key.
         "blocked_set": blocked_set,
+        # Which classifier produced that set: a digest over the routing
+        # vocabulary, thresholds, domain keywords and index tag (see
+        # routing.classifier_inputs). A blocked set is only comparable against
+        # another one taken under the same hash — the same file classifies
+        # differently after a marker or domain-rule change. `None` when the
+        # router could not be described, which no caller may read as
+        # "unchanged".
+        "classifier_inputs_hash": _classifier_inputs_hash(config),
         "routing_notes": routing_notes,
         **buckets,
         "cleaned_memory": cleaned_content,
@@ -866,14 +877,55 @@ def compact_memory(
 # v2.3.0: Auto-maintain — write-triggered self-maintenance
 # ---------------------------------------------------------------------------
 
-def _last_compact_marker(config: "MemoryConfig") -> Path:
-    """Path to the timestamp marker recording the last auto-compact pass."""
-    return Path(config.home) / ".last_auto_compact"
+# --- cadence markers --------------------------------------------------------
+#
+# Three distinct cadences, three markers under ``<home>``. They used to be one
+# file, which meant "a pass ran", "a pass was considered" and "L1 was deduped"
+# could not be told apart — and under routing mode 'enforce' they genuinely
+# differ: a lazy pass that can only block the same entries again is considered
+# and not run. Writing ``.last_auto_compact`` for it would postpone the next
+# *real* pass by a whole interval; not writing anything made the interval
+# trigger ask again on the very next write, and dragged the L1 dedup step
+# (which read the same marker) along for the ride every single time.
+
+#: Last auto-compaction pass that actually ran. Unchanged semantics and
+#: unchanged filename, so an existing install's cadence survives the upgrade.
+MARKER_LAST_COMPACT = ".last_auto_compact"
+
+#: Last lazy auto-maintain *decision*, including one that backed off. Throttles
+#: the interval trigger only (see ``auto_maintain_after_write``); it is never
+#: read as "a compaction happened".
+MARKER_LAST_ATTEMPT = ".last_auto_compact_attempt"
+
+#: Last L1/vector-store dedup scan. Its own cadence as of 3.5.7: the dedup step
+#: is not a compaction pass and must neither be suppressed by a backoff nor
+#: re-run on every write because a backoff left the compact marker alone.
+MARKER_LAST_L1_DEDUP = ".last_l1_dedup"
 
 
-def _read_last_compact_time(config: "MemoryConfig") -> float:
-    """Return the epoch seconds of the last auto-compact, or 0.0 if never."""
-    marker = _last_compact_marker(config)
+def _marker_path(config: "MemoryConfig", name: str) -> Path:
+    return Path(config.home) / name
+
+
+def _iso(epoch: float | None) -> str | None:
+    """A marker's epoch seconds as UTC ISO-8601, for reports. None stays None.
+
+    The markers hold epoch seconds (cheap to compare); a report is read by a
+    person or an agent, and ``0.0`` reads as "never", not as 1970.
+    """
+    if not epoch:
+        return None
+    from datetime import datetime, timezone
+
+    try:
+        return datetime.fromtimestamp(float(epoch), tz=timezone.utc).isoformat()
+    except (OSError, OverflowError, TypeError, ValueError):
+        return None
+
+
+def _read_marker_time(config: "MemoryConfig", name: str) -> float:
+    """Epoch seconds recorded in marker ``name``, or 0.0 when absent/unusable."""
+    marker = _marker_path(config, name)
     try:
         if marker.exists():
             return float(marker.read_text(encoding="utf-8").strip())
@@ -882,13 +934,100 @@ def _read_last_compact_time(config: "MemoryConfig") -> float:
     return 0.0
 
 
-def _write_last_compact_time(config: "MemoryConfig") -> None:
-    """Record the current time as the last auto-compact pass."""
+def _write_marker_time(config: "MemoryConfig", name: str) -> float | None:
+    """Stamp marker ``name`` with now; returns the time written, or None."""
     import time
+
+    now = time.time()
     try:
-        _last_compact_marker(config).write_text(str(time.time()), encoding="utf-8")
+        _marker_path(config, name).write_text(str(now), encoding="utf-8")
+        return now
     except OSError as e:
-        logger.warning("Failed to write last-compact marker: %s", e)
+        logger.warning("Failed to write %s marker: %s", name, e)
+        return None
+
+
+def _last_compact_marker(config: "MemoryConfig") -> Path:
+    """Path to the timestamp marker recording the last auto-compact pass."""
+    return _marker_path(config, MARKER_LAST_COMPACT)
+
+
+def _read_last_compact_time(config: "MemoryConfig") -> float:
+    """Return the epoch seconds of the last auto-compact, or 0.0 if never."""
+    return _read_marker_time(config, MARKER_LAST_COMPACT)
+
+
+def _write_last_compact_time(config: "MemoryConfig") -> None:
+    """Record the current time as the last auto-compact pass.
+
+    Only a pass that actually ran may call this. A backed-off decision records
+    :func:`_write_last_attempt_time` instead — claiming a compaction that did
+    not happen would push the next real pass a full interval into the future.
+    """
+    _write_marker_time(config, MARKER_LAST_COMPACT)
+
+
+def _read_last_attempt_time(config: "MemoryConfig") -> float:
+    """Epoch seconds of the last lazy auto-maintain decision, or 0.0."""
+    return _read_marker_time(config, MARKER_LAST_ATTEMPT)
+
+
+def _write_last_attempt_time(config: "MemoryConfig") -> float | None:
+    """Record that the lazy path reached a decision (ran it or backed off)."""
+    return _write_marker_time(config, MARKER_LAST_ATTEMPT)
+
+
+def _attempt_interval_seconds(config: "MemoryConfig") -> float:
+    """How long the interval trigger stays quiet after a decision.
+
+    ``auto_maintain_attempt_interval_hours`` (default 1), clamped two ways: a
+    negative or unreadable value disables the throttle rather than inverting
+    it, and the result never exceeds ``auto_maintain_interval_days`` — a
+    throttle that outlived the interval it throttles could delay a real pass by
+    more than the interval the operator configured.
+    """
+    try:
+        hours = float(getattr(config, "auto_maintain_attempt_interval_hours", 1.0) or 0.0)
+    except (TypeError, ValueError):
+        hours = 1.0
+    seconds = max(0.0, hours) * 3600.0
+    try:
+        interval_s = float(getattr(config, "auto_maintain_interval_days", 7.0) or 0.0) * 86400.0
+    except (TypeError, ValueError):
+        interval_s = 7.0 * 86400.0
+    return min(seconds, interval_s) if interval_s > 0 else seconds
+
+
+def _memory_untouched_since(path: Path, since: float) -> bool:
+    """Has the agent memory file stood still since epoch ``since``?
+
+    The attempt throttle rests on this: re-deriving a decision is only
+    pointless if the input it read has not moved. A file whose mtime cannot be
+    read, or which is as new as the marker itself, counts as *touched* — the
+    throttle must never be the reason new bloat waits.
+    """
+    if not since:
+        return False
+    try:
+        return path.stat().st_mtime < since
+    except OSError:
+        return False
+
+
+def _read_last_l1_dedup_time(config: "MemoryConfig") -> float:
+    """Epoch seconds of the last L1 dedup scan.
+
+    Falls back to ``.last_auto_compact`` while the dedup marker is absent,
+    which is what an install upgrading from the shared marker looks like: its
+    dedup cadence then continues from where the old marker left it instead of
+    firing one extra scan on the next write.
+    """
+    own = _read_marker_time(config, MARKER_LAST_L1_DEDUP)
+    return own if own else _read_last_compact_time(config)
+
+
+def _write_last_l1_dedup_time(config: "MemoryConfig") -> None:
+    _write_marker_time(config, MARKER_LAST_L1_DEDUP)
 
 
 # ---------------------------------------------------------------------------
@@ -907,6 +1046,16 @@ def _write_last_compact_time(config: "MemoryConfig") -> None:
 #: `status` reported when a lazy pass is skipped for an unchanged blocked set.
 BLOCKED_SET_UNCHANGED = "blocked_set_unchanged"
 
+#: `status` reported when the classifier inputs could not be hashed at all, so
+#: no recorded blocked set can be trusted and the pass runs.
+CLASSIFIER_INPUTS_UNAVAILABLE = "classifier_inputs_unavailable"
+
+#: Reason code hoisted into the backoff report when the recorded blocked set
+#: belongs to a different classifier configuration than the current one. Not a
+#: skip and not a run on its own: it only closes the byte-identity shortcut, so
+#: the decision has to re-classify before it may back off again.
+CLASSIFIER_INPUTS_CHANGED = "classifier_inputs_changed"
+
 #: Hint attached to every backoff report — the way out is to place the blocked
 #: entries, not to wait.
 _BACKOFF_HINT = (
@@ -920,6 +1069,28 @@ _BACKOFF_HINT = (
 
 def _auto_compaction_state(config: "MemoryConfig") -> AutoCompactionState:
     return AutoCompactionState(_auto_compaction_state_path(config))
+
+
+def _classifier_inputs_hash(config: "MemoryConfig") -> str | None:
+    """Digest of everything the classifier reads, or ``None`` if unavailable.
+
+    The byte-identity shortcut below says "the memory file has not changed, and
+    classification is deterministic". The second half of that sentence is only
+    true for a *fixed classifier*: edit ``routing.extra_skill_markers``,
+    ``routing.disabled_markers``, ``domain_keywords`` or ``l0_tag`` and the
+    identical file classifies differently. ``routing.classifier_inputs_hash``
+    is the identity of those inputs; a mismatch closes the shortcut.
+
+    ``None`` (router unavailable, unexpected error) is deliberately *not*
+    treated as "unchanged": it resolves to running the pass.
+    """
+    try:
+        from .routing import classifier_inputs_hash
+
+        return classifier_inputs_hash(config)
+    except Exception as e:  # noqa: BLE001 — the caller fails open
+        logger.warning("classifier inputs hash unavailable (non-critical): %s", e)
+        return None
 
 
 def _pending_l1_work(report: dict) -> tuple[int, int]:
@@ -952,14 +1123,15 @@ def _auto_compaction_decision(
     Two ways to establish that, cheapest first:
 
     1. the memory file is byte-identical to the one the recorded pass left
-       behind — classification is deterministic, so the outcome is too;
+       behind **and** the classifier inputs still hash the same — classification
+       is deterministic for a fixed classifier, so the outcome is too;
     2. otherwise a dry run (classification only: no L1 write, no backup, no
        rewrite of the memory file) re-derives the blocked set and compares
        fingerprints.
 
-    Anything unexpected — no recorded state, a changed fingerprint, a failed
-    probe — resolves to ``skip: False``. The backoff may delay noise; it may
-    never delay work.
+    Anything unexpected — no recorded state, a changed fingerprint, classifier
+    inputs that cannot be described, a failed probe — resolves to
+    ``skip: False``. The backoff may delay noise; it may never delay work.
     """
     routing_enabled, mode, _notes = _resolve_routing_mode(config, None)
     if mode != "enforce":
@@ -976,9 +1148,32 @@ def _auto_compaction_decision(
         previous.get("routing_mode") == mode
         and previous.get("routing_enabled") == routing_enabled
     )
+    current_inputs = _classifier_inputs_hash(config)
+    # A recorded `None` can never equal a real hash, so a record written
+    # without a describable classifier keeps the shortcut closed by itself.
+    classifier_changed = (
+        current_inputs is None or previous.get("classifier_inputs_hash") != current_inputs
+    )
 
-    def _skip(detail: str, *, probe: str, blocked_set: dict, refresh: str | None) -> dict:
-        record = store.note_skipped_pass(key, source_digest=refresh) or previous
+    def _skip(
+        detail: str,
+        *,
+        probe: str,
+        blocked_set: dict,
+        refresh: str | None,
+        inputs_changed: bool = False,
+    ) -> dict:
+        # A skip reached under changed classifier inputs re-pins them: the
+        # probe just proved this blocked set is what the *current* classifier
+        # produces, so the next decision may use the cheap path again.
+        record = (
+            store.note_skipped_pass(
+                key,
+                source_digest=refresh,
+                classifier_inputs_hash=current_inputs if inputs_changed else None,
+            )
+            or previous
+        )
         return {
             "skip": True,
             "status": BLOCKED_SET_UNCHANGED,
@@ -988,6 +1183,10 @@ def _auto_compaction_decision(
             "probe": probe,
             "blocked_set": blocked_set,
             "migratable_l1_candidates": 0,
+            # True when this skip had to re-classify because the recorded
+            # blocked set belonged to a different classifier configuration.
+            CLASSIFIER_INPUTS_CHANGED: bool(inputs_changed),
+            "classifier_inputs_hash": record.get("classifier_inputs_hash"),
             "first_seen_at": record.get("first_seen_at"),
             "last_attempt_at": record.get("last_attempt_at"),
             "skipped_passes": record.get("skipped_passes"),
@@ -1000,12 +1199,24 @@ def _auto_compaction_decision(
         return {"skip": False, "status": "no_recorded_blocked_set", "routing_mode": mode}
     if not same_routing:
         return {"skip": False, "status": "routing_changed", "routing_mode": mode}
+    if current_inputs is None:
+        # Fail open. Not knowing what the classifier reads is not evidence that
+        # it still agrees with the recorded blocked set.
+        return {
+            "skip": False,
+            "status": CLASSIFIER_INPUTS_UNAVAILABLE,
+            "routing_mode": mode,
+            "detail": (
+                "could not hash the classifier inputs, so the recorded blocked "
+                "set cannot be shown to still hold — running the pass"
+            ),
+        }
 
-    if digest and previous.get("source_digest") == digest:
+    if digest and previous.get("source_digest") == digest and not classifier_changed:
         return _skip(
             "agent memory is byte-identical to the file the last enforced pass "
-            "left behind, and classification is deterministic — another pass "
-            "would block the same entries and migrate nothing",
+            "left behind and the classifier inputs are unchanged, so another "
+            "pass would block the same entries and migrate nothing",
             probe="source_unchanged",
             blocked_set=previous.get("blocked_set") or {},
             refresh=None,
@@ -1040,6 +1251,7 @@ def _auto_compaction_decision(
             "blocked_set": blocked_set,
             "recorded_fingerprint": recorded_fingerprint,
             "migratable_l1_candidates": migratable,
+            CLASSIFIER_INPUTS_CHANGED: classifier_changed,
         }
     if migratable or needs_title:
         return {
@@ -1049,17 +1261,25 @@ def _auto_compaction_decision(
             "blocked_set": blocked_set,
             "migratable_l1_candidates": migratable,
             "needs_title_count": needs_title,
+            CLASSIFIER_INPUTS_CHANGED: classifier_changed,
         }
 
     return _skip(
         "the blocked set is unchanged and no entry is migratable to L1, so a "
-        "pass would rewrite agent memory without moving anything",
+        "pass would rewrite agent memory without moving anything"
+        + (
+            " — re-derived under the current classifier inputs, which no longer "
+            "match the ones the recorded set was produced with"
+            if classifier_changed
+            else ""
+        ),
         probe="dry_run_classification",
         blocked_set=blocked_set,
         # The file changed (a new pointer, a reformat) without changing the
         # blocked set — remember the new bytes so the next write takes the
         # cheap path instead of classifying again.
         refresh=digest,
+        inputs_changed=classifier_changed,
     )
 
 
@@ -1104,6 +1324,12 @@ def _record_auto_compaction_state(
             routing_mode=compact_result.get("routing_mode"),
             routing_enabled=compact_result.get("routing_enabled"),
             source_digest=_memory_source_digest(path) if clean_pass else None,
+            # Which classifier produced this blocked set — taken from the pass
+            # itself, so the record cannot claim inputs the pass never used.
+            # None (router unavailable) records honestly as "unknown", and an
+            # unknown never matches a later hash, so the next decision
+            # re-classifies instead of shortcutting.
+            classifier_inputs_hash=compact_result.get("classifier_inputs_hash"),
         )
         if record is None:
             return {
@@ -1117,9 +1343,11 @@ def _record_auto_compaction_state(
             "count": record["blocked_set"]["count"],
             "by_surface": record["blocked_set"]["by_surface"],
             "first_seen_at": record.get("first_seen_at"),
-            # The backoff is armed either way; this says whether the next
+            # The backoff is armed either way; these say whether the next
             # decision can take the byte-identity shortcut or has to classify.
+            # Both pins must hold: the same file *and* the same classifier.
             "source_pinned": bool(record.get("source_digest")),
+            "classifier_inputs_hash": record.get("classifier_inputs_hash"),
             "memory_target": key,
             "state_file": str(store.path),
         }
@@ -1549,10 +1777,20 @@ def auto_maintain_after_write(
     fingerprint and triggers a pass on the next write; an explicit
     ``compact_memory`` call is never backed off.
 
+    Three cadences, three markers under ``<home>`` (see ``MARKER_*``): a pass
+    that ran stamps ``.last_auto_compact``, a *decision* — including one that
+    backed off — stamps ``.last_auto_compact_attempt``, and the L1 dedup scan
+    stamps ``.last_l1_dedup``. The attempt marker throttles the interval
+    trigger only: it stops a backed-off decision from being re-derived on every
+    write without ever claiming a compaction happened, so the next real pass is
+    not postponed and the dedup scan keeps its own schedule.
+
     Returns a report dict; ``{"skipped": True, ...}`` when auto-maintain is off.
     ``report["compact"]["status"]`` is one of ``not_triggered`` / ``migrated``
     (entries reached L1) / ``blocked_only`` (the pass ran and only blocked
-    non-L1 entries) / ``no_changes`` / ``backed_off`` / ``error``.
+    non-L1 entries) / ``no_changes`` / ``backed_off`` / ``error``. A
+    ``not_triggered`` report carries ``throttled`` when the interval trigger
+    was the only candidate and the attempt marker is still fresh.
     """
     if not getattr(config, "auto_maintain", True):
         return {"skipped": True, "reason": "auto_maintain disabled"}
@@ -1608,6 +1846,7 @@ def auto_maintain_after_write(
         bloat = detect_memory_bloat(memory_path=path, config=config)
         should_compact = False
         reason = None
+        throttled: dict | None = None
 
         if bloat.get("success"):
             total_chars = bloat["stats"]["total_chars"]
@@ -1622,13 +1861,49 @@ def auto_maintain_after_write(
                     should_compact = True
                     reason = f"usage {round(usage_ratio * 100, 1)}% >= threshold {round(threshold * 100)}%"
 
-            # Trigger B: interval elapsed (and there's bloat to move)
+            # Trigger B: interval elapsed (and there's bloat to move).
+            # Throttled by the attempt marker, but only while the memory file
+            # has not moved since that decision: elapsed time over an unchanged
+            # file says nothing new, so re-deriving the same answer on every
+            # write (or every maintenance tick) is pure overhead. Everything
+            # that could change the answer still gets one — a new blocked
+            # entry, a new L1 candidate, any edit at all to the file — as do
+            # the usage-ratio and critical triggers, which are never throttled.
             if not should_compact and has_bloat:
                 interval_s = getattr(config, "auto_maintain_interval_days", 7.0) * 86400
                 elapsed = time.time() - _read_last_compact_time(config)
                 if elapsed >= interval_s:
-                    should_compact = True
-                    reason = f"interval elapsed ({round(elapsed / 86400, 1)}d >= {interval_s / 86400}d)"
+                    attempt_interval_s = _attempt_interval_seconds(config)
+                    last_attempt = _read_last_attempt_time(config)
+                    attempt_elapsed = time.time() - last_attempt
+                    if attempt_elapsed >= attempt_interval_s or not _memory_untouched_since(
+                        path, last_attempt
+                    ):
+                        should_compact = True
+                        reason = f"interval elapsed ({round(elapsed / 86400, 1)}d >= {interval_s / 86400}d)"
+                    else:
+                        throttled = {
+                            "trigger": "interval",
+                            "reason": (
+                                f"interval elapsed ({round(elapsed / 86400, 1)}d >= "
+                                f"{interval_s / 86400}d), but the last lazy decision "
+                                f"was {round(attempt_elapsed / 60, 1)}min ago "
+                                f"(< {round(attempt_interval_s / 60, 1)}min)"
+                            ),
+                            "marker": MARKER_LAST_ATTEMPT,
+                            "last_attempt_at": _iso(last_attempt),
+                            "attempt_interval_hours": round(
+                                attempt_interval_s / 3600.0, 4
+                            ),
+                            "retry_after": _iso(last_attempt + attempt_interval_s),
+                            "note": (
+                                "agent memory has not changed since that decision. "
+                                "Any edit to it lifts this throttle at once, the "
+                                "usage-ratio and critical triggers are never "
+                                "throttled, and an explicit compact_memory call "
+                                "always runs"
+                            ),
+                        }
 
             # Trigger C: hard safety net — memory critically full, compact NOW
             # regardless of interval. Prevents the "silently over the real
@@ -1691,31 +1966,66 @@ def auto_maintain_after_write(
                     "blocked_from_l1": blocked_from_l1,
                     "blocked_set": compact_result.get("blocked_set"),
                     "backoff_decision": decision.get("status"),
+                    "classifier_inputs_changed": decision.get(
+                        CLASSIFIER_INPUTS_CHANGED
+                    ),
                 }
                 # Remember this blocked set (or forget the last one), so the
                 # next write can tell "same entries again" from "new bloat".
                 state = _record_auto_compaction_state(config, path, compact_result)
                 if state.get("action") != "not_applicable":
                     report["compact"]["blocked_set_state"] = state
+
+            # The lazy path reached a decision, so stamp the attempt marker —
+            # for a backoff *and* for a real pass, which is also a decision.
+            # This is the one cadence a backed-off pass may record:
+            # `.last_auto_compact` would read as "compacted" and push the next
+            # real pass a whole interval out. Stamped *after* the action, so a
+            # pass that rewrote agent memory never leaves the file looking
+            # newer than the decision that wrote it.
+            attempt_marker = {
+                "marker": MARKER_LAST_ATTEMPT,
+                "recorded_at": _iso(_write_last_attempt_time(config)),
+                "attempt_interval_hours": round(
+                    _attempt_interval_seconds(config) / 3600.0, 4
+                ),
+                "throttles": "interval_trigger",
+            }
+            report["compact"]["attempt_marker"] = attempt_marker
+            if isinstance(report.get("auto_compaction_backoff"), dict):
+                # Same dict as report["compact"]["backoff"] — one assignment.
+                report["auto_compaction_backoff"]["attempt_marker"] = attempt_marker
         else:
             report["compact"] = {"triggered": False, "status": "not_triggered"}
+            if throttled is not None:
+                # Nothing fired, but one trigger was *held*: say so rather than
+                # letting a throttle look like "memory is fine".
+                report["compact"]["throttled"] = throttled
     except Exception as e:  # noqa: BLE001 — maintenance must not raise
         logger.warning("Auto-maintain compaction failed: %s", e)
         report["compact"] = {"triggered": False, "status": "error", "error": str(e)}
 
     # --- 3. L1 / vector-store dedup guard (v2.8.0) ---
     # The framework now owns L1 de-bloat too, not just MEMORY.md compaction.
-    # Runs on the same cadence as lazy compaction (interval-gated) so it's a
-    # cheap no-op on clean stores but reaps any append-duplicates that slipped
-    # through the write-path guards. Self-contained — never breaks the write.
+    # Interval-gated, so it's a cheap no-op on clean stores but reaps any
+    # append-duplicates that slipped through the write-path guards.
+    # Self-contained — never breaks the write.
+    #
+    # Its own marker as of 3.5.7. It used to read `.last_auto_compact`, which
+    # tied an L1-side scan to agent-memory compaction in both directions: a
+    # backed-off pass leaves that marker alone (correctly — nothing was
+    # compacted), and this step then re-ran a full scan of every knowledge file
+    # plus the vector-store prune on *every single write*. The dedup cadence is
+    # now independent of both the compaction and the attempt marker.
     try:
         import time as _time
 
         interval_s = getattr(config, "auto_maintain_interval_days", 7.0) * 86400
-        elapsed = _time.time() - _read_last_compact_time(config)
+        elapsed = _time.time() - _read_last_l1_dedup_time(config)
         # Trigger if the compaction step already fired, or the interval lapsed.
         if report.get("compact", {}).get("triggered") or elapsed >= interval_s:
-            report["l1_dedup"] = dedup_l1_knowledge(config)
+            report["l1_dedup"] = {"triggered": True, **dedup_l1_knowledge(config)}
+            _write_last_l1_dedup_time(config)
         else:
             report["l1_dedup"] = {"triggered": False}
     except Exception as e:  # noqa: BLE001 — maintenance must not raise

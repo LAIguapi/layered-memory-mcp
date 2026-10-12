@@ -483,6 +483,9 @@ class TestStateFile:
             "routing_mode",
             "routing_enabled",
             "source_digest",
+            # v3.5.7: byte identity alone never proved the outcome would
+            # repeat — the classifier it was taken under is the other half.
+            "classifier_inputs_hash",
             "first_seen_at",
             "recorded_at",
             "last_attempt_at",

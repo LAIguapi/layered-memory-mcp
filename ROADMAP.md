@@ -190,7 +190,7 @@ ja/ko files use Japanese and Korean marker strings (`保持理由`, `手順書`,
 annotated in-line as extending the built-in vocabulary, which remains English +
 Chinese only.
 
-## 6. Lazy auto-compaction re-trigger under `enforce` — done, with two gaps
+## 6. Lazy auto-compaction re-trigger under `enforce` — done
 
 **Done.** `compact_memory` reports `blocked_set: {count, fingerprint,
 by_surface}` — a sorted hash over each blocked entry's whitespace-normalised
@@ -207,30 +207,54 @@ best-effort) and skips a lazy pass that could only repeat itself, reporting
 `skipped_passes`, `hint`).
 
 The decision is deliberately cheap and deliberately conservative: first a
-byte-identity check against the file the recorded pass left behind, otherwise a
-dry-run classification — never a full write pass to learn nothing changed — and
-*anything* unexpected (no record, changed fingerprint, changed routing config,
-failed probe, a migratable entry, an entry refused for want of a heading)
-resolves to "run". The backoff may delay noise; it may never delay work.
+byte-identity check against the file the recorded pass left behind *plus* a
+classifier-inputs check (see below), otherwise a dry-run classification — never
+a full write pass to learn nothing changed — and *anything* unexpected (no
+record, changed fingerprint, changed routing config, classifier inputs that
+cannot be described, failed probe, a migratable entry, an entry refused for
+want of a heading) resolves to "run". The backoff may delay noise; it may never
+delay work.
 `compact.status` now separates the three outcomes that used to look alike
 (`migrated` / `blocked_only` / `backed_off`), advisory mode neither reads nor
 writes the state, and an explicit `compact_memory` call is never backed off.
 `tests/test_v356_auto_compaction_backoff.py` locks all of it; README (en /
 zh-CN / ja / ko) carries the behaviour matrix.
 
-**Gap 1 — the interval trigger is not reset on a backoff.** A skipped pass
-leaves `<home>/.last_auto_compact` alone on purpose (writing it would postpone
-the *next real* pass by a whole interval), so Trigger B keeps firing and the
-decision keeps answering it. That is cheap — a byte comparison on the hot path —
-but it is still a decision per write, and the L1 dedup step that rides on the
-same marker keeps running at its old frequency. Done when the dedup step has
-its own cadence marker, so a backed-off pass can record "attempted" without
-being read as "compacted".
+**Both gaps are closed** (`tests/test_v357_auto_compaction_backoff_gaps.py`).
 
-**Gap 2 — classification is assumed deterministic for a given file.** The
-byte-identity shortcut compares the memory file plus `routing.mode` /
-`routing.enabled`; it does not notice a changed marker vocabulary or changed
-domain rules. Such a change can therefore take until the next memory-file edit
-to show up in the blocked set. Done when the fingerprint also covers the
-classifier inputs (a hash of the routing vocabulary would do), or when the
-state is dropped on any config change.
+*The marker that meant three things.* `<home>/.last_auto_compact` recorded "a
+pass ran" and was read as both "the interval has elapsed" and "the dedup scan
+is due". There are now three markers: `.last_auto_compact` (unchanged name and
+meaning, so an install's cadence survives the upgrade),
+`.last_auto_compact_attempt` (the lazy path reached a *decision*, backoff
+included) and `.last_l1_dedup`. The attempt marker throttles the interval
+trigger only, and only while agent memory has not changed since it
+(`auto_maintain_attempt_interval_hours`, default 1, clamped to at most one
+`auto_maintain_interval_days`, `0` to disable) — so a backed-off decision is no
+longer re-derived on every write, while new bloat, a new L1 candidate, any edit
+to the file, the usage-ratio trigger and the critical safety net all still
+reach a decision at once. A held trigger is reported, not silent:
+`compact.status: "not_triggered"` plus `throttled: {...}`. The coupling in Gap 1
+was real and worse than recorded: because a backoff leaves the compact marker
+alone, the dedup step re-ran a full scan of every knowledge file plus the
+vector-store prune on *every write* once an install had been backing off for a
+while. Its own marker ends that, falling back to the old one while absent.
+
+*The other half of "classification is deterministic".* `routing.classifier_inputs_hash`
+digests the marker vocabulary as compiled for the config (so
+`routing.extra_*_markers` / `disabled_markers` are folded in, and a rule set
+added to `RoutingRules` later is covered automatically), the routing switches,
+the scoring thresholds and tie-break order, `domain_keywords` and `l0_tag` —
+normalised so order never matters, with no timestamp, path or memory content in
+it. The state record pins it (`schema_version: 2`; a v1 document is ignored
+rather than migrated, costing one pass), a mismatch closes the byte shortcut
+and re-derives the blocked set with a dry run reporting
+`classifier_inputs_changed: true`, a skip under changed inputs re-pins them,
+and an unavailable hash fails open (`classifier_inputs_unavailable`).
+
+Left as deliberate behaviour, not a gap: a classifier-config edit on an install
+whose *only* live trigger is the interval one can wait out the attempt throttle
+(≤ 1h by default) before it is noticed. Every other path — any memory write,
+the usage-ratio trigger, the critical trigger, an explicit `compact_memory` —
+sees it immediately, and the alternative (reading the state file and hashing
+the config on the trigger hot path) buys nothing a 7-day interval cares about.

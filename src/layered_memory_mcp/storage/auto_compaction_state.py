@@ -25,7 +25,7 @@ SHAPE
 One small JSON document under ``<home>/data/auto_compaction_state.json``::
 
     {
-      "schema_version": 1,
+      "schema_version": 2,
       "kind": "auto_compaction_backoff",
       "updated_at": "2026-10-12T09:00:00+00:00",
       "targets": {
@@ -35,6 +35,7 @@ One small JSON document under ``<home>/data/auto_compaction_state.json``::
           "routing_mode": "enforce",
           "routing_enabled": true,
           "source_digest": "sha256:…" | null,
+          "classifier_inputs_hash": "sha256:…" | null,
           "first_seen_at": "…", "recorded_at": "…", "last_attempt_at": "…",
           "skipped_passes": 2
         }
@@ -46,6 +47,13 @@ under one home cannot overwrite each other's state, and the document carries no
 absolute path, so it can be quoted in a report or a log without leaking where
 the user's memory file lives. Entry content is likewise present only as a hash —
 this file stores no memory text.
+
+``source_digest`` answers "is the memory file still the one that produced this
+blocked set"; ``classifier_inputs_hash`` (schema 2) answers the other half,
+"would the classifier still agree". Byte-identity alone was never enough: the
+same file classifies differently after a marker-vocabulary or domain-rule
+change, so a shortcut taken on bytes only would have gone on matching a stale
+blocked set until somebody happened to edit the memory file.
 """
 
 from __future__ import annotations
@@ -63,7 +71,13 @@ logger = logging.getLogger("layered_memory.auto_compaction_state")
 
 #: Bumped whenever a field changes meaning. A document written by another
 #: version is ignored rather than guessed at (see :meth:`AutoCompactionState.load`).
-SCHEMA_VERSION = 1
+#:
+#: 2 — added ``classifier_inputs_hash``. No migration is written for derived
+#: state: a version-1 document is simply ignored, which costs the install one
+#: extra compaction pass per memory file and then re-records itself. Reading a
+#: v1 record as if it carried a classifier hash is the one outcome worth
+#: avoiding — it would be a shortcut taken on an input nobody checked.
+SCHEMA_VERSION = 2
 
 #: Self-describing marker, so a stray file is identifiable without this module.
 STATE_KIND = "auto_compaction_backoff"
@@ -210,6 +224,7 @@ class AutoCompactionState:
         routing_mode: str | None,
         routing_enabled: bool | None,
         source_digest: str | None = None,
+        classifier_inputs_hash: str | None = None,
     ) -> dict | None:
         """Remember the blocked set an enforce pass just left behind.
 
@@ -217,6 +232,11 @@ class AutoCompactionState:
         passed when that pass was a clean no-op (no errors, nothing refused for
         want of a heading). It enables the cheap "file is byte-identical"
         check; omitting it just means the next decision classifies again.
+
+        ``classifier_inputs_hash`` is the classifier that produced this blocked
+        set (``routing.classifier_inputs_hash``). ``None`` means the caller
+        could not describe it, and a stored ``None`` can never match a later
+        hash — so the shortcut stays closed rather than opening on an unknown.
 
         ``first_seen_at`` survives a re-record of the same fingerprint, so the
         report can say how long this set has been sitting there.
@@ -237,6 +257,7 @@ class AutoCompactionState:
             "routing_mode": routing_mode,
             "routing_enabled": routing_enabled,
             "source_digest": source_digest,
+            "classifier_inputs_hash": classifier_inputs_hash,
             "first_seen_at": previous.get("first_seen_at", now) if same_set else now,
             "recorded_at": now,
             "last_attempt_at": now,
@@ -245,12 +266,25 @@ class AutoCompactionState:
         document["targets"][str(key)] = record
         return record if self._save(document) else None
 
-    def note_skipped_pass(self, key: str, *, source_digest: str | None = None) -> dict | None:
+    def note_skipped_pass(
+        self,
+        key: str,
+        *,
+        source_digest: str | None = None,
+        classifier_inputs_hash: str | None = None,
+    ) -> dict | None:
         """Count one backed-off pass against an existing record.
 
         Also refreshes ``source_digest`` when the caller recomputed it (the
         memory file changed in a way that did not change the blocked set — a
-        new L0 pointer, say), so the next decision can take the cheap path.
+        new L0 pointer, say), so the next decision can take the cheap path. A
+        ``classifier_inputs_hash`` is refreshed on the same terms: the caller
+        re-classified under the new inputs and got the same blocked set, so the
+        record now belongs to that classifier.
+
+        Both are only written when passed. ``None`` means "I did not recompute
+        it", never "it is unknown" — a skip must not quietly erase the pins the
+        next shortcut is checked against.
         """
         document = self.load()
         record = document["targets"].get(str(key))
@@ -260,6 +294,8 @@ class AutoCompactionState:
         record["skipped_passes"] = int(record.get("skipped_passes") or 0) + 1
         if source_digest is not None:
             record["source_digest"] = source_digest
+        if classifier_inputs_hash is not None:
+            record["classifier_inputs_hash"] = classifier_inputs_hash
         document["targets"][str(key)] = record
         return record if self._save(document) else None
 

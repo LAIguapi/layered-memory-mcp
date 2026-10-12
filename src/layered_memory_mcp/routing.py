@@ -68,6 +68,8 @@ product. Any such mapping belongs in an adapter (see ``adapters/base.py``).
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from enum import Enum
 from typing import Any, Iterable, Literal, Sequence
@@ -838,6 +840,173 @@ def _apply_capability(
 
 
 # ---------------------------------------------------------------------------
+# Classifier input identity
+# ---------------------------------------------------------------------------
+#
+# WHY A HASH OF THE INPUTS EXISTS
+# -------------------------------
+# Callers that cache a classification outcome (``auto_maintain_after_write``'s
+# backoff state is the first) need to know when "the same file classifies the
+# same way" stops being true. The content side of that is theirs to fingerprint;
+# the *classifier* side is this module's to describe, because only this module
+# knows what it reads.
+#
+# So: one digest over every input that can change where an item routes —
+# the marker vocabulary as actually compiled for this config, the scoring
+# thresholds, the tie-break order, the routing switches, the domain keyword
+# table and the index tag that decides which entries reach the classifier at
+# all. Change any of them and the digest changes, which is a cache-invalidation
+# signal, not a security boundary.
+#
+# Deliberately NOT in here: anything volatile (timestamps, counters), any
+# absolute path (``agent_extensions.root`` and the per-surface ``path``: they
+# move where an extension *would* be written, never which surface an item
+# routes to), and of course no memory content.
+
+#: Bumped when a *code* change alters classification without changing any
+#: config-visible input — a rule weight, a structure regex, the tie-break
+#: order. Without it, an upgrade could leave a cached blocked set looking valid
+#: under a classifier that no longer agrees with it.
+CLASSIFIER_INPUTS_HASH_VERSION = 1
+
+
+def _marker_vocabulary(config: Any | None) -> dict[str, list[str]]:
+    """``{rule set: sorted markers}`` as compiled for ``config``.
+
+    Read off the compiled :class:`RoutingRules` rather than off the module
+    constants, for two reasons: it already folds ``routing.extra_*_markers`` and
+    ``routing.disabled_markers`` into the shipped vocabulary, and a rule set
+    added to that class later is covered here without anyone remembering to.
+
+    Sorted (not left in compile order) because ``_merge_markers`` orders by
+    length and is stable, so two configs listing the same extra markers in a
+    different order would otherwise hash differently.
+    """
+    rules = rules_from_config(config)
+    return {
+        name: sorted({str(marker) for marker, _rx in compiled})
+        for name, compiled in sorted(vars(rules).items())
+        if not name.startswith("_")
+    }
+
+
+def _domain_keyword_inputs(config: Any | None) -> dict[str, list[str]]:
+    """``config.domain_keywords`` normalised to ``{domain: sorted keywords}``.
+
+    Order-insensitive on both levels, and tolerant of the shapes a hand-edited
+    ``config.yaml`` produces (a bare string for one keyword, a tuple, a set).
+    An unusable value for one domain drops that domain rather than the table.
+    """
+    raw = getattr(config, "domain_keywords", None) if config is not None else None
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, list[str]] = {}
+    for domain, keywords in raw.items():
+        if isinstance(keywords, str):
+            values = [keywords]
+        elif isinstance(keywords, (list, tuple, set, frozenset)):
+            values = [str(k) for k in keywords]
+        else:
+            continue
+        out[str(domain)] = sorted(set(values))
+    return out
+
+
+def _decision_schema_version() -> int:
+    """The ``RoutingDecision.schema_version`` default, or -1 if unreadable.
+
+    Part of the digest so a bump to the decision shape invalidates a cached
+    outcome. ``-1`` only ever costs one extra invalidation.
+    """
+    try:
+        return int(RoutingDecision.model_fields["schema_version"].default)
+    except Exception:  # noqa: BLE001 — never raise from an input description
+        return -1
+
+
+def classifier_inputs(config: Any | None = None) -> dict[str, Any]:
+    """Every classifier input for ``config``, normalised for hashing.
+
+    Never raises: each section degrades to the shipped default on a malformed
+    config rather than failing, because a half-written ``routing:`` section
+    breaks classification the same way for every item — stably, which is what a
+    cache key has to describe.
+
+    Returned as a plain dict (not just a digest) so a report or a test can say
+    *which* input moved, not only that something did.
+    """
+    enabled, mode = routing_settings(config)
+    try:
+        markers = _marker_vocabulary(config)
+    except Exception:  # noqa: BLE001 — a broken marker section is still stable
+        markers = _marker_vocabulary(None)
+    try:
+        extensions = agent_extension_settings(config)
+    except Exception:  # noqa: BLE001
+        extensions = agent_extension_settings(None)
+
+    return {
+        "hash_version": CLASSIFIER_INPUTS_HASH_VERSION,
+        "decision_schema_version": _decision_schema_version(),
+        "routing": {
+            "enabled": bool(enabled),
+            "mode": mode,
+            # Gates an explicit inject_knowledge rather than compaction's own
+            # injection (which passes direct_write=False), so it cannot move a
+            # blocked set. Included anyway: over-invalidating costs one extra
+            # pass, under-invalidating costs suppressed work.
+            "enforce_direct_writes": bool(
+                direct_write_settings(config)["enforce_direct_writes"]
+            ),
+        },
+        "markers": markers,
+        "thresholds": {
+            "score_floor": SCORE_FLOOR,
+            "min_chars_for_fallback": MIN_CHARS_FOR_FALLBACK,
+            "log_shape_ratio": LOG_SHAPE_RATIO,
+        },
+        "tie_break": [s.value for s in _TIE_BREAK],
+        "domain_keywords": _domain_keyword_inputs(config),
+        # Not a router input, but it decides which entries a compaction pass
+        # even hands to the classifier (an L0-tagged line is an index pointer,
+        # not a candidate), so a changed tag changes the outcome.
+        "l0_tag": str(getattr(config, "l0_tag", "") or ""),
+        "agent_extensions": {
+            "enabled": bool(extensions["enabled"]),
+            "mode": extensions["mode"],
+            "adapter": extensions["adapter"],
+            "surfaces": {
+                name: {
+                    "enabled": bool(entry.get("enabled")),
+                    "handler": entry.get("handler"),
+                }
+                for name, entry in sorted((extensions["surfaces"] or {}).items())
+            },
+        },
+    }
+
+
+def classifier_inputs_hash(config: Any | None = None) -> str | None:
+    """``"sha256:<32 hex>"`` over :func:`classifier_inputs`, or ``None``.
+
+    ``None`` means "could not describe the classifier", and every caller must
+    read it as *invalidate*, never as *unchanged*: a cache that keeps matching
+    while the classifier is unknown is exactly the failure this digest exists
+    to prevent.
+    """
+    try:
+        payload = json.dumps(
+            classifier_inputs(config),
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    except Exception:  # noqa: BLE001 — the caller fails open on None
+        return None
+    return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
+
+
+# ---------------------------------------------------------------------------
 # Classification
 # ---------------------------------------------------------------------------
 
@@ -1429,6 +1598,7 @@ def surface_capabilities(config: Any | None = None) -> MemorySurfaceCapabilities
 __all__ = [
     "AgentAction",
     "ApplicationMode",
+    "CLASSIFIER_INPUTS_HASH_VERSION",
     "ConfidenceBasis",
     "CORE_SURFACES",
     "EXTENSION_SURFACES",
@@ -1443,6 +1613,8 @@ __all__ = [
     "SurfaceCapability",
     "SurfaceOwnership",
     "agent_extension_settings",
+    "classifier_inputs",
+    "classifier_inputs_hash",
     "classify_memory_item",
     "direct_write_settings",
     "extension_readiness",

@@ -138,6 +138,8 @@ layered-memory-mcp --verbose
 | `LAYERED_MEMORY_L0_FORMAT` | L0インデックス形式：`hermes`または`generic` | `hermes` |
 | `LAYERED_MEMORY_NAMESPACE` | マルチエージェント分離用の名前空間 | `shared` |
 | `LAYERED_MEMORY_PROMOTION_WATCH_PATTERNS` | 保守スキャン用の雑多ファイルglobパターン（カンマ区切り） | 内蔵の英語＋中国語リスト |
+| `LAYERED_MEMORY_AUTO_MAINTAIN_INTERVAL_DAYS` | 自動圧縮の最小間隔（日） | `7` |
+| `LAYERED_MEMORY_AUTO_MAINTAIN_ATTEMPT_INTERVAL_HOURS` | *周期トリガー*による遅延判定の最小間隔（時間、`0` で無効） | `1` |
 | `LAYERED_MEMORY_ROUTING_ENABLED` | 内容を分類し、書き込み結果にルーティング情報を注記 | `true` |
 | `LAYERED_MEMORY_ROUTING_MODE` | `advisory`（助言）または `enforce`（強制）— `compact_memory` にのみ作用 | `advisory` |
 | `LAYERED_MEMORY_ROUTING_ENFORCE_DIRECT_WRITES` | 明示的な `inject_knowledge` が非L1内容を書こうとしたら拒否 | `false` |
@@ -625,16 +627,22 @@ enforceモードはL1の外には何も書きません。止められた項目�
 | 状況 | 遅延パスの挙動 |
 |------|------|
 | 項目を止めた最初のenforce圧縮 | 実行し、指紋を記録し、`compact.status: "blocked_only"` を報告 |
-| 同じ集合で、移行できる項目もない | **スキップ** — `compact.status: "backed_off"` に加えて `auto_compaction_backoff: {status: "blocked_set_unchanged", probe, blocked_set, skipped_passes, first_seen_at, hint}` |
+| 同じ集合で、移行できる項目もない | **スキップ** — `compact.status: "backed_off"` に加えて `auto_compaction_backoff: {status: "blocked_set_unchanged", probe, blocked_set, classifier_inputs_changed, skipped_passes, first_seen_at, attempt_marker, hint}` |
 | 止められる項目が増えた（指紋が変わった） | 次の書き込みで即座に実行；`backoff_decision: "blocked_set_changed"` |
 | L1へ移行できる項目が増えた | 止められた集合が変わったかどうかに関係なく実行して移行；`backoff_decision: "l1_work_pending"` |
+| 分類器の入力が変わり、ファイルは同じ | バイトを信じるのをやめて再分類します：`classifier_inputs_changed: true`、`probe: "dry_run_classification"`。止められた集合が動いていれば実行し、動いていなければバックオフして新しい入力を記録し直します |
 | 止められた項目が別の場所に置かれた | 実行し、記録は消去されるので、次の冗長な項目は即座に発火する |
+| *周期*トリガーだけが期限に達し、ファイルは無変更 | 前回の判定から `auto_maintain_attempt_interval_hours`（既定1時間）が経つまで保留します：`compact.status: "not_triggered"` に加えて `throttled: {trigger: "interval", last_attempt_at, retry_after, …}` |
 | `advisory` モード | 変更なし — このモードでは何も止められないのでバックオフする対象がなく、状態ファイルも書かれません |
 | 明示的な `compact_memory(...)` | 必ず実行されます。バックオフは便乗で走る遅延パスだけのもので、明示的な呼び出しはあなたの意思表示です |
 
 `compact.status` は、以前は見分けがつかなかった三つの結果を分けます：`migrated`（項目がL1に入った）、`blocked_only`（実行したが非L1項目を止めることしかできなかった）、`backed_off`（実行せず、その理由を述べる）— ほかに `no_changes`、`not_triggered`、`error` があります。
 
-状態ファイルは派生した運用状態です：バージョン付き（`schema_version`）で、記憶ファイルのパスのハッシュをキーにし、記憶本文や絶対パスではなくハッシュと件数だけを持ちます。ナレッジでもなく `MEMORY_CHANGELOG` の来歴でもないので、削除してもコストは空振りの圧縮が一回増えるだけです。知っておく価値のある細部が二つあります：判定はまず記憶ファイルが記録時のものとバイト単位で同一かを見て、違う場合にのみdry runで再分類します（つまりバックオフ自体が安く、完全な圧縮には決してなりません）。そして見出しが決められずに拒否された項目（`refused_needs_title`）は未処理の作業として数えられます — 拒否はバックオフで黙らされることなく、報告され続けます。
+状態ファイルは派生した運用状態です：バージョン付き（`schema_version`）で、記憶ファイルのパスのハッシュをキーにし、記憶本文や絶対パスではなくハッシュと件数だけを持ちます。ナレッジでもなく `MEMORY_CHANGELOG` の来歴でもないので、削除してもコストは空振りの圧縮が一回増えるだけです。見出しが決められずに拒否された項目（`refused_needs_title`）は未処理の作業として数えられます — 拒否はバックオフで黙らされることなく、報告され続けます。
+
+**留めるべき釘は一本ではなく二本です。** 安い経路が使えるのは、記憶ファイルが記録時のものとバイト単位で同一であり、**かつ**分類器のハッシュも変わっていないときだけです。そうでなければdry runで再分類します（完全な圧縮には決してなりません）。`classifier_inputs_hash` は分類結果を動かしうるすべての入力のダイジェストです — あなたの設定でコンパイルされたマーカー語彙（`routing.extra_*_markers`、`routing.disabled_markers`）、routingの各スイッチ、スコアのしきい値、`domain_keywords`、そして `l0_tag` — タイムスタンプもパスも含みません。どれか一つでも編集すれば、次の遅延判定は古い分類器が作った集合に照合するのではなく、止められた集合を作り直します。ハッシュがまったく計算できない場合は*無効*として扱い、圧縮を実行します。
+
+**`<home>` 配下の三つのカデンスマーカー。** `.last_auto_compact` は従来どおり「圧縮が実行された」を意味し、周期トリガーが測るのもこれです。`.last_auto_compact_attempt` は遅延パスが*判定に到達した*こと（バックオフを含む）を記録します — 抑えるのは周期トリガーだけで、しかもエージェントの記憶がそれ以降変わっていない間だけです。だからバックオフの判定が書き込みごとに再計算されることはなく、新しい冗長項目・新しいL1候補・ファイルへのどんな編集も即座に判定を受けます。`.last_l1_dedup` はL1／ベクトルストアの重複排除に独自のスケジュールを与えます。以前は圧縮マーカーを読んでいたため、長くバックオフしているインストールでは書き込みごとに全ナレッジファイルの再スキャンが走っていました。`auto_maintain_attempt_interval_hours: 0` にすれば、書き込みごとに判定する以前の挙動に戻ります。
 
 ### 派生データ：L0インデックスとベクトル
 

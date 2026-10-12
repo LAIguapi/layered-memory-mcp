@@ -155,6 +155,8 @@ layered-memory-mcp --verbose
 | `LAYERED_MEMORY_L0_FORMAT` | L0 index format: `hermes` or `generic` | `hermes` |
 | `LAYERED_MEMORY_NAMESPACE` | Agent namespace for multi-agent isolation | `shared` |
 | `LAYERED_MEMORY_PROMOTION_WATCH_PATTERNS` | Comma-separated catch-all glob patterns for maintenance scans | built-in English + Chinese list |
+| `LAYERED_MEMORY_AUTO_MAINTAIN_INTERVAL_DAYS` | Days between automatic compaction passes | `7` |
+| `LAYERED_MEMORY_AUTO_MAINTAIN_ATTEMPT_INTERVAL_HOURS` | Minimum hours between two *interval-triggered* lazy decisions (`0` disables) | `1` |
 | `LAYERED_MEMORY_ROUTING_ENABLED` | Classify items and annotate write results | `true` |
 | `LAYERED_MEMORY_ROUTING_MODE` | `advisory` or `enforce` — gates `compact_memory` only | `advisory` |
 | `LAYERED_MEMORY_ROUTING_ENFORCE_DIRECT_WRITES` | Refuse an explicit `inject_knowledge` write of non-L1 content | `false` |
@@ -643,16 +645,22 @@ The pass now fingerprints what it blocked (`blocked_set: {count, fingerprint, by
 | Situation | What the lazy pass does |
 |-----------|-------------------------|
 | First enforced pass that blocks entries | runs, records the fingerprint, reports `compact.status: "blocked_only"` |
-| Same blocked set, nothing migratable | **skipped** — `compact.status: "backed_off"` plus `auto_compaction_backoff: {status: "blocked_set_unchanged", probe, blocked_set, skipped_passes, first_seen_at, hint}` |
+| Same blocked set, nothing migratable | **skipped** — `compact.status: "backed_off"` plus `auto_compaction_backoff: {status: "blocked_set_unchanged", probe, blocked_set, classifier_inputs_changed, skipped_passes, first_seen_at, attempt_marker, hint}` |
 | A new blocked entry (fingerprint changed) | runs on the very next write; `backoff_decision: "blocked_set_changed"` |
 | A new L1-migratable entry | runs and migrates it, whether or not the blocked set changed; `backoff_decision: "l1_work_pending"` |
+| Changed classifier inputs, same file | re-classifies instead of trusting the bytes: `classifier_inputs_changed: true`, `probe: "dry_run_classification"`. Runs if the blocked set moved; backs off and re-pins the inputs if it did not |
 | The blocked entries get placed elsewhere | runs; the record is cleared, so the next bloat entry triggers immediately |
+| Only the *interval* trigger is due, over an untouched file | held until `auto_maintain_attempt_interval_hours` (default 1) has passed since the last decision: `compact.status: "not_triggered"` plus `throttled: {trigger: "interval", last_attempt_at, retry_after, …}` |
 | `advisory` mode | unchanged — nothing is ever blocked, so there is nothing to back off, and no state file is written |
 | Explicit `compact_memory(...)` | always runs. The backoff is for the lazy ride-along only; an explicit call is you stating intent |
 
 `compact.status` separates the three outcomes that used to look alike: `migrated` (entries reached L1), `blocked_only` (the pass ran and could only block non-L1 entries), `backed_off` (it did not run, and says why) — plus `no_changes`, `not_triggered` and `error`.
 
-The state file is derived operational state: versioned (`schema_version`), keyed by a hash of the memory file path, and carrying hashes and counts rather than memory text or absolute paths. It is neither knowledge nor `MEMORY_CHANGELOG` provenance, and deleting it costs exactly one extra no-op pass. Two details worth knowing: the decision first checks whether the memory file is byte-identical to the one the recorded pass left behind and only otherwise re-classifies with a dry run (so backing off is cheap, never a full pass), and an entry refused for want of a heading (`refused_needs_title`) counts as pending work — a refusal keeps being reported instead of being backed off into silence.
+The state file is derived operational state: versioned (`schema_version`), keyed by a hash of the memory file path, and carrying hashes and counts rather than memory text or absolute paths. It is neither knowledge nor `MEMORY_CHANGELOG` provenance, and deleting it costs exactly one extra no-op pass. An entry refused for want of a heading (`refused_needs_title`) counts as pending work — a refusal keeps being reported instead of being backed off into silence.
+
+**Two pins, not one.** The cheap path only applies when the memory file is byte-identical to the one the recorded pass left behind **and** the classifier still hashes the same; otherwise the decision re-classifies with a dry run (never a full pass). `classifier_inputs_hash` is a digest over everything that can move a classification — the marker vocabulary as compiled for your config (`routing.extra_*_markers`, `routing.disabled_markers`), the routing switches, the scoring thresholds, `domain_keywords` and `l0_tag` — with no timestamps and no paths in it. Edit any of them and the next lazy decision re-derives the blocked set instead of matching a set the old classifier produced. A hash that cannot be computed at all reads as *invalidate*: the pass runs.
+
+**Three cadence markers under `<home>`.** `.last_auto_compact` still means "a pass ran" and is still what the interval trigger measures. `.last_auto_compact_attempt` records that the lazy path *reached a decision*, backoff included — it throttles the interval trigger only, and only while agent memory has not changed since, so a backed-off decision is not re-derived on every write while new bloat, a new L1 candidate or any edit to the file still gets a decision at once. `.last_l1_dedup` gives the L1/vector-store dedup scan its own schedule; it used to read the compaction marker, which meant a long-running backoff re-ran a full scan of every knowledge file on every write. Set `auto_maintain_attempt_interval_hours: 0` to go back to deciding on every write.
 
 ### Derived Data: L0 Index and Vectors
 

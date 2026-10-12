@@ -138,6 +138,8 @@ layered-memory-mcp --verbose
 | `LAYERED_MEMORY_L0_FORMAT` | L0 索引格式：`hermes` 或 `generic` | `hermes` |
 | `LAYERED_MEMORY_NAMESPACE` | Agent 命名空间，用于多 Agent 隔离 | `shared` |
 | `LAYERED_MEMORY_PROMOTION_WATCH_PATTERNS` | 维护扫描使用的杂项文件 glob 模式（逗号分隔） | 内置中英文列表 |
+| `LAYERED_MEMORY_AUTO_MAINTAIN_INTERVAL_DAYS` | 自动压实之间的最小间隔天数 | `7` |
+| `LAYERED_MEMORY_AUTO_MAINTAIN_ATTEMPT_INTERVAL_HOURS` | 两次*周期触发*的懒判断之间的最小小时数（`0` 关闭） | `1` |
 | `LAYERED_MEMORY_ROUTING_ENABLED` | 分类内容并为写入结果加注路由信息 | `true` |
 | `LAYERED_MEMORY_ROUTING_MODE` | `advisory`（建议）或 `enforce` —— 只作用于 `compact_memory` | `advisory` |
 | `LAYERED_MEMORY_ROUTING_ENFORCE_DIRECT_WRITES` | 显式 `inject_knowledge` 写入非 L1 内容时直接拒绝 | `false` |
@@ -626,16 +628,22 @@ enforce 模式不会往 L1 之外写任何东西，被拦下的条目只被报�
 | 情形 | 懒触发的行为 |
 |------|------|
 | 第一次拦下条目的 enforce 压实 | 照常运行，记录指纹，报告 `compact.status: "blocked_only"` |
-| 集合没变，也没有可迁移的条目 | **跳过** —— `compact.status: "backed_off"`，并附上 `auto_compaction_backoff: {status: "blocked_set_unchanged", probe, blocked_set, skipped_passes, first_seen_at, hint}` |
+| 集合没变，也没有可迁移的条目 | **跳过** —— `compact.status: "backed_off"`，并附上 `auto_compaction_backoff: {status: "blocked_set_unchanged", probe, blocked_set, classifier_inputs_changed, skipped_passes, first_seen_at, attempt_marker, hint}` |
 | 新增一条被拦条目（指纹变了） | 下一次写入立刻重跑；`backoff_decision: "blocked_set_changed"` |
 | 新增一条可进 L1 的条目 | 照常运行并迁移它，无论被拦集合有没有变；`backoff_decision: "l1_work_pending"` |
+| 分类器输入变了，文件没变 | 不再相信字节，而是重新分类：`classifier_inputs_changed: true`、`probe: "dry_run_classification"`。被拦集合变了就照常运行；没变就退避，并把新的输入重新钉住 |
 | 被拦条目已被安置到别处 | 照常运行；记录被清除，于是下一条冗余内容会立刻触发 |
+| 只有*周期*触发到点，而文件一动没动 | 压住，直到距上一次判断超过 `auto_maintain_attempt_interval_hours`（默认 1 小时）：`compact.status: "not_triggered"`，并附上 `throttled: {trigger: "interval", last_attempt_at, retry_after, …}` |
 | `advisory` 模式 | 行为不变 —— 这个模式下不会拦下任何条目，也就无从退避，状态文件也不会被写出 |
 | 显式调用 `compact_memory(...)` | 一定会执行。退避只针对顺带跑的懒触发；显式调用是你在表达意图 |
 
 `compact.status` 把过去长得一样的三种结果分开了：`migrated`（有条目进了 L1）、`blocked_only`（跑过了，但只能拦下非 L1 条目）、`backed_off`（没跑，并说明原因），另外还有 `no_changes`、`not_triggered` 和 `error`。
 
-状态文件是派生的运行状态：带版本号（`schema_version`），以记忆文件路径的哈希为键，里面只有哈希和计数，不存记忆正文，也不存绝对路径。它既不是知识，也不是 `MEMORY_CHANGELOG` 溯源；删掉它的代价正好是多跑一次空压实。两个值得知道的细节：判断时先看记忆文件是否与上次记录的那份逐字节相同，只有不同才用一次 dry run 重新分类（所以退避本身很便宜，绝不会是一整轮压实）；而因为无法确定标题而被拒的条目（`refused_needs_title`）算作待办工作 —— 拒绝会继续被报告，不会被退避消音。
+状态文件是派生的运行状态：带版本号（`schema_version`），以记忆文件路径的哈希为键，里面只有哈希和计数，不存记忆正文，也不存绝对路径。它既不是知识，也不是 `MEMORY_CHANGELOG` 溯源；删掉它的代价正好是多跑一次空压实。因为无法确定标题而被拒的条目（`refused_needs_title`）算作待办工作 —— 拒绝会继续被报告，不会被退避消音。
+
+**要钉住的是两件事，不是一件。** 便宜的那条路只在记忆文件与上次记录的那份逐字节相同、**并且**分类器的哈希也没变时才成立；否则就用一次 dry run 重新分类（绝不会变成一整轮压实）。`classifier_inputs_hash` 是对所有能改变分类结果的输入算出的摘要 —— 按你的配置编译出来的标记词表（`routing.extra_*_markers`、`routing.disabled_markers`）、routing 的各个开关、打分阈值、`domain_keywords` 以及 `l0_tag` —— 里面没有时间戳，也没有任何路径。改了其中任何一项，下一次懒判断就会重新推导被拦集合，而不是去匹配旧分类器算出来的那一份。完全算不出哈希时按*失效*处理：照常跑压实。
+
+**`<home>` 下的三个节奏标记。** `.last_auto_compact` 仍然表示“跑过一轮压实”，周期触发量的也仍然是它。`.last_auto_compact_attempt` 记录懒路径*做出过判断*（含退避）—— 它只压周期触发，而且只在 agent 记忆自那以后没变过时才压；于是退避的判断不会在每次写入时重算，而新的冗余条目、新的 L1 候选、乃至对文件的任何改动，都仍然立刻拿到一次判断。`.last_l1_dedup` 让 L1 / 向量库去重有了自己的节奏；它过去读的是压实标记，于是一个长期退避的装置会在每次写入时把所有知识文件重扫一遍。把 `auto_maintain_attempt_interval_hours` 设为 0 就回到“每次写入都判断”。
 
 ### 派生数据：L0 索引与向量
 

@@ -138,6 +138,8 @@ layered-memory-mcp --verbose
 | `LAYERED_MEMORY_L0_FORMAT` | L0 색인 형식: `hermes` 또는 `generic` | `hermes` |
 | `LAYERED_MEMORY_NAMESPACE` | 멀티 에이전트 격리용 네임스페이스 | `shared` |
 | `LAYERED_MEMORY_PROMOTION_WATCH_PATTERNS` | 유지보수 스캔에 쓰이는 잡동사니 파일 glob 패턴 (쉼표 구분) | 내장 영어 + 중국어 목록 |
+| `LAYERED_MEMORY_AUTO_MAINTAIN_INTERVAL_DAYS` | 자동 압축 사이의 최소 일수 | `7` |
+| `LAYERED_MEMORY_AUTO_MAINTAIN_ATTEMPT_INTERVAL_HOURS` | *주기 트리거* 지연 판단 사이의 최소 시간(시간 단위, `0`이면 해제) | `1` |
 | `LAYERED_MEMORY_ROUTING_ENABLED` | 콘텐츠를 분류하고 쓰기 결과에 라우팅 정보를 주석으로 덧붙임 | `true` |
 | `LAYERED_MEMORY_ROUTING_MODE` | `advisory`(제안) 또는 `enforce`(강제) — `compact_memory`에만 작용 | `advisory` |
 | `LAYERED_MEMORY_ROUTING_ENFORCE_DIRECT_WRITES` | 명시적 `inject_knowledge`가 비-L1 콘텐츠를 쓰려 하면 거부 | `false` |
@@ -625,16 +627,22 @@ enforce 모드는 L1 밖으로는 아무것도 쓰지 않습니다. 막힌 항�
 | 상황 | 지연 패스의 동작 |
 |------|------|
 | 항목을 막은 첫 enforce 압축 | 실행하고, 지문을 기록하고, `compact.status: "blocked_only"`로 보고 |
-| 같은 집합이고 옮길 항목도 없음 | **건너뜀** — `compact.status: "backed_off"`와 함께 `auto_compaction_backoff: {status: "blocked_set_unchanged", probe, blocked_set, skipped_passes, first_seen_at, hint}` |
+| 같은 집합이고 옮길 항목도 없음 | **건너뜀** — `compact.status: "backed_off"`와 함께 `auto_compaction_backoff: {status: "blocked_set_unchanged", probe, blocked_set, classifier_inputs_changed, skipped_passes, first_seen_at, attempt_marker, hint}` |
 | 막히는 항목이 새로 생김(지문이 바뀜) | 바로 다음 쓰기에서 실행; `backoff_decision: "blocked_set_changed"` |
 | L1로 옮길 수 있는 항목이 새로 생김 | 막힌 집합이 바뀌었는지와 무관하게 실행하고 옮김; `backoff_decision: "l1_work_pending"` |
+| 분류기 입력이 바뀌고 파일은 그대로 | 바이트를 믿는 대신 다시 분류합니다: `classifier_inputs_changed: true`, `probe: "dry_run_classification"`. 막힌 집합이 움직였으면 실행하고, 그대로면 백오프하면서 새 입력을 다시 고정합니다 |
 | 막힌 항목들이 다른 곳에 놓임 | 실행하고, 기록이 지워지므로 다음 비대 항목이 즉시 발동시킴 |
+| *주기* 트리거만 때가 되었고 파일은 그대로 | 지난 판단으로부터 `auto_maintain_attempt_interval_hours`(기본 1시간)가 지날 때까지 보류합니다: `compact.status: "not_triggered"`와 함께 `throttled: {trigger: "interval", last_attempt_at, retry_after, …}` |
 | `advisory` 모드 | 그대로 — 이 모드에서는 아무것도 막히지 않으므로 백오프할 대상이 없고, 상태 파일도 쓰이지 않습니다 |
 | 명시적 `compact_memory(...)` | 항상 실행됩니다. 백오프는 곁따라 도는 지연 패스만의 것이고, 명시적 호출은 당신이 의도를 밝히는 일입니다 |
 
 `compact.status`는 예전에는 구분되지 않던 세 결과를 갈라 줍니다: `migrated`(항목이 L1에 들어감), `blocked_only`(돌았지만 비L1 항목을 막는 것밖에 못 함), `backed_off`(돌지 않았고, 그 이유를 말함) — 그리고 `no_changes`, `not_triggered`, `error`가 있습니다.
 
-상태 파일은 파생된 운영 상태입니다: 버전이 있고(`schema_version`), 메모리 파일 경로의 해시를 키로 쓰며, 메모리 본문이나 절대 경로가 아니라 해시와 개수만 담습니다. 지식도 아니고 `MEMORY_CHANGELOG` 내력도 아니어서, 지워도 비용은 빈 압축 한 번이 늘어나는 것뿐입니다. 알아 둘 만한 두 가지: 판단은 먼저 메모리 파일이 기록된 그때와 바이트 단위로 같은지 보고, 다를 때만 dry run으로 다시 분류합니다(그래서 백오프 자체가 싸고, 전체 압축이 되는 일은 결코 없습니다). 그리고 제목을 정할 수 없어 거부된 항목(`refused_needs_title`)은 남은 작업으로 셉니다 — 거부는 백오프에 묻혀 조용해지지 않고 계속 보고됩니다.
+상태 파일은 파생된 운영 상태입니다: 버전이 있고(`schema_version`), 메모리 파일 경로의 해시를 키로 쓰며, 메모리 본문이나 절대 경로가 아니라 해시와 개수만 담습니다. 지식도 아니고 `MEMORY_CHANGELOG` 내력도 아니어서, 지워도 비용은 빈 압축 한 번이 늘어나는 것뿐입니다. 제목을 정할 수 없어 거부된 항목(`refused_needs_title`)은 남은 작업으로 셉니다 — 거부는 백오프에 묻혀 조용해지지 않고 계속 보고됩니다.
+
+**고정해야 할 못은 하나가 아니라 둘입니다.** 싼 경로는 메모리 파일이 기록된 그때와 바이트 단위로 같고 **또한** 분류기 해시도 그대로일 때만 쓰입니다. 그렇지 않으면 dry run으로 다시 분류합니다(전체 압축이 되는 일은 결코 없습니다). `classifier_inputs_hash`는 분류 결과를 움직일 수 있는 모든 입력에 대한 다이제스트입니다 — 당신의 설정으로 컴파일된 마커 어휘(`routing.extra_*_markers`, `routing.disabled_markers`), routing 스위치들, 점수 임계값, `domain_keywords`, 그리고 `l0_tag` — 타임스탬프도 경로도 들어가지 않습니다. 그중 하나라도 바꾸면 다음 지연 판단은 옛 분류기가 만든 집합에 맞춰 보는 대신 막힌 집합을 다시 도출합니다. 해시를 아예 계산할 수 없으면 *무효*로 읽고 압축을 실행합니다.
+
+**`<home>` 아래 세 개의 케이던스 마커.** `.last_auto_compact`는 여전히 "패스가 돌았다"를 뜻하고, 주기 트리거가 재는 것도 이것입니다. `.last_auto_compact_attempt`는 지연 패스가 *판단에 도달했다*는 사실(백오프 포함)을 기록합니다 — 억제하는 것은 주기 트리거뿐이고, 그것도 에이전트 메모리가 그 뒤로 변하지 않은 동안만입니다. 그래서 백오프 판단이 쓰기마다 다시 계산되지 않으면서도, 새 비대 항목·새 L1 후보·파일에 대한 어떤 수정도 즉시 판단을 받습니다. `.last_l1_dedup`은 L1/벡터 스토어 중복 제거에 자기 일정을 줍니다. 예전에는 압축 마커를 읽었기 때문에, 오래 백오프 중인 설치에서는 쓰기마다 모든 지식 파일을 전부 다시 훑었습니다. `auto_maintain_attempt_interval_hours: 0`으로 두면 쓰기마다 판단하는 이전 동작으로 돌아갑니다.
 
 ### 파생 데이터: L0 색인과 벡터
 

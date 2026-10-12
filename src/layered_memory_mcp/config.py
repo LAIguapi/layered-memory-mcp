@@ -459,6 +459,9 @@ class MemoryConfig:
         # v2.3.0 new fields — auto-maintain (write-triggered self-maintenance)
         auto_maintain: bool | None = None,
         auto_maintain_interval_days: float | None = None,
+        # Unreleased — throttle for the *interval* auto-compaction trigger when
+        # the previous lazy decision could not act (see memory_compactor).
+        auto_maintain_attempt_interval_hours: float | None = None,
         # v2.7.0 new fields — critical safety-net + explicit memory limit
         compact_critical_threshold: float | None = None,
         memory_char_limit: int | None = None,
@@ -628,6 +631,21 @@ class MemoryConfig:
         self.auto_maintain_interval_days: float = (
             auto_maintain_interval_days if auto_maintain_interval_days is not None
             else _env_float("LAYERED_MEMORY_AUTO_MAINTAIN_INTERVAL_DAYS", 7.0)
+        )
+        # Unreleased: minimum hours between two *interval-triggered* lazy
+        # compaction decisions (default 1). The interval trigger above fires on
+        # elapsed time alone, and under routing.mode 'enforce' the decision it
+        # reaches can be "nothing to do, the same entries are still blocked" —
+        # which would then be re-derived on every single write. This throttles
+        # that one trigger only: the usage-ratio and critical triggers are
+        # unaffected, and new bloat still runs a pass immediately because it
+        # changes the blocked-set fingerprint. 0 disables the throttle (the
+        # pre-3.5.7 behaviour: decide on every write). Never delays a pass by
+        # more than one `auto_maintain_interval_days`, see memory_compactor.
+        self.auto_maintain_attempt_interval_hours: float = (
+            auto_maintain_attempt_interval_hours
+            if auto_maintain_attempt_interval_hours is not None
+            else _env_float("LAYERED_MEMORY_AUTO_MAINTAIN_ATTEMPT_INTERVAL_HOURS", 1.0)
         )
 
         # v2.7.0: Critical safety-net threshold (0–1, default 0.95). When agent

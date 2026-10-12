@@ -235,6 +235,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   work and runs regardless; placing the blocked entries clears the record; and
   `advisory` mode neither reads nor writes any of it. This is derived
   operational state — not L1 knowledge, and **not** a `MEMORY_CHANGELOG` event.
+- **`routing.classifier_inputs_hash(config)`** — a digest over every input that
+  can move a classification, so a cached classification outcome can be
+  invalidated when the classifier changes rather than only when the content
+  does. Covers the marker vocabulary *as compiled for this config* (so
+  `routing.extra_*_markers` and `routing.disabled_markers` are folded in, and a
+  rule set added later is covered without anyone remembering to), the routing
+  switches, the scoring thresholds and tie-break order, `domain_keywords`, and
+  `l0_tag` — which decides which entries reach the classifier at all.
+  Normalised before hashing (lists are sets, dict order is irrelevant), with no
+  timestamp, no absolute path and no memory content in it, so two installs with
+  the same rules agree and a cosmetic config edit does not invalidate anything.
+  `routing.classifier_inputs(config)` returns the same payload unhashed, for
+  reports and tests. A malformed section degrades to the shipped defaults; only
+  an unexpected failure returns `None`, which every caller must read as
+  *invalidate*, never as *unchanged*.
+- **Three auto-maintenance cadence markers under `<home>`**, where there was
+  one. `.last_auto_compact` keeps its name and its meaning — a compaction pass
+  ran — so an existing install's cadence survives the upgrade.
+  `.last_auto_compact_attempt` records that the lazy path *reached a decision*,
+  a backoff included; it throttles the interval trigger only, and only while
+  agent memory has not changed since
+  (`auto_maintain_attempt_interval_hours`, default 1,
+  `LAYERED_MEMORY_AUTO_MAINTAIN_ATTEMPT_INTERVAL_HOURS`; `0` restores the
+  previous "decide on every write" behaviour, and the value is clamped to at
+  most one `auto_maintain_interval_days`). `.last_l1_dedup` gives the L1 /
+  vector-store dedup scan its own schedule. A held interval trigger is visible:
+  `compact.status: "not_triggered"` plus `throttled: {trigger: "interval",
+  reason, marker, last_attempt_at, attempt_interval_hours, retry_after, note}`.
 
 ### Changed
 
@@ -357,6 +385,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `triggered` and every pre-existing key keep their meaning. Compaction
   candidates additionally carry `entry_hash`, so a caller can follow one entry
   across passes without storing its text.
+- **The backoff's byte-identity shortcut now needs two pins, not one.** It
+  compared the memory file against the one the recorded pass left behind and
+  called classification deterministic — true only for a *fixed* classifier, so
+  a changed marker vocabulary or domain table went unnoticed until somebody
+  happened to edit the memory file. The decision (and the state record, hence
+  `auto_compaction_state.json` `schema_version: 2`) now also carries
+  `classifier_inputs_hash`; a mismatch closes the shortcut and re-derives the
+  blocked set with a dry run, reporting `classifier_inputs_changed: true` and
+  re-pinning the inputs so the next decision can be cheap again. An
+  unavailable hash fails open with `status: "classifier_inputs_unavailable"`.
+  `compact_memory` reports `classifier_inputs_hash` next to `blocked_set`, so
+  an external caller can compare two blocked sets on the same terms. Being
+  derived state, a `schema_version: 1` document is ignored rather than
+  migrated: one extra pass per memory file, then it re-records itself.
+- **The L1 dedup step no longer rides the compaction marker.** It read
+  `.last_auto_compact`, which a backed-off pass correctly leaves alone — so on
+  an install that had been backing off for a while, *every write* re-ran a full
+  scan of every knowledge file plus the vector-store prune to find nothing. It
+  now has `.last_l1_dedup`, falling back to the old marker while that file is
+  absent so an upgrading install continues its existing cadence instead of
+  firing one extra scan. `report["l1_dedup"]` gained `triggered: true` when it
+  runs (it already reported `{"triggered": false}` when it did not).
 - **Docs corrected.** README (en / zh-CN / ja / ko), the package docstring, the
   `cognitive_decision_prompt`, and `init_framework`'s welcome text no longer
   present skills as an "L2" tier beneath L1. They describe the common core, the
