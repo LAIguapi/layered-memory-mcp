@@ -71,11 +71,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the full `deferred_fusion` handshake (`needs_fusion`, `expected_hash`,
   `fusion`, `reason`) for batched items, so batching cannot be the one path
   where an update is silently lost.
-- **`compact_memory` reports what it may be misfiling.** Its rule has always
-  been structural ("not an L0 pointer" → L1), which is not a classification.
-  Each migrated entry now carries `routing`, and the report lists, under
-  `routing_advisory`, the entries the router would have sent elsewhere. The
-  migration behaviour itself is unchanged in this release.
+- **`compact_memory` is routing-aware, and `enforce` stops the L1 dumping
+  ground.** Its rule has always been structural ("not an L0 pointer" → L1),
+  which is a statement about the source, not a classification of the content —
+  so runbooks, standing preferences and raw traces in the agent's memory file
+  all landed in L1. Every non-index entry is now classified, and the report
+  gains `routing_mode`, `routing_summary` (counts by surface and by ownership,
+  `l1_injected` / `l1_planned` / `blocked_from_l1`), `l1_candidates`,
+  `todo_candidates`, `agent_owned_candidates`, `rejected` and `routing_notes`.
+  In **advisory** mode (the default) migration behaviour is unchanged: every
+  non-index entry still goes to L1, and `routing_advisory` lists what the
+  router would have sent elsewhere. In **enforce** mode only `l1_knowledge`
+  entries are injected; TODO / skill / user-profile / agent-other / undecided /
+  ephemeral entries are left in agent memory untouched and returned as
+  candidates. Enforce writes nothing outside L1 — no TODO is created
+  (compaction has no TODO write contract) and no `agent_extensions` adapter is
+  invoked, even when one is configured — and never deletes a blocked entry.
+  Legacy fields (`migrated_count`, `migrated`, `errors`, `cleaned_memory`,
+  `stats`) keep their meaning in both modes.
+- **`compact_memory` takes an optional `routing_mode`.** Per-call override of
+  `routing.mode` (`"advisory"` / `"enforce"`), on the MCP tool and the module
+  function; an unknown value is ignored with a note rather than failing. Omit it
+  to use the configured mode, so existing calls behave exactly as before. With
+  `routing.enabled: false`, `enforce` degrades to advisory — enforcing on
+  classifications the config forbids computing would block every entry.
 - **Docs corrected.** README (en / zh-CN / ja / ko), the package docstring, the
   `cognitive_decision_prompt`, and `init_framework`'s welcome text no longer
   present skills as an "L2" tier beneath L1. They describe the common core, the

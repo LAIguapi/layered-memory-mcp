@@ -185,7 +185,7 @@ routing:
   disabled_markers: ["script"]                 # drop a default that is noise for you
 ```
 
-`mode: advisory` is the default and the only mode the write path acts on today: routing reports its opinion alongside the normal result and changes nothing about what a write does. `enforce` is recognised by the schema and reported in the decision, but no write path gates on it yet — a classifier that started rejecting writes on upgrade would be a data-loss event, not a feature.
+`mode: advisory` is the default: routing reports its opinion alongside the normal result and changes nothing about what a write does. A classifier that started rejecting writes on upgrade would be a data-loss event, not a feature, so `enforce` is opt-in — and today exactly one path gates on it, `compact_memory` (see [Routing on the Compaction Path](#routing-on-the-compaction-path)). `inject_knowledge` still writes L1 in either mode and says so in its `routing_warning`.
 
 Omit a key to keep the defaults. If you set `watch_patterns`, your list replaces the built-in pattern list. Set it to `[]` to turn pattern matching off.
 
@@ -420,7 +420,39 @@ The same pass also reports **procedure contamination**: sections that read as ac
 
 `inject_knowledge` writes L1 — that is its contract, and routing does not change it. What routing adds is visibility: every result carries a `routing` block, and a write the classifier would have sent elsewhere also carries a `routing_warning` saying so. The write still happens, with the same `action` it always had. Batched writes expose the same per-item `routing`, and a batched `deferred_fusion` carries its full handshake (`needs_fusion`, `expected_hash`, `fusion`) — batching is a convenience, never a quieter write path.
 
-`compact_memory` reports the same way. Its migration rule has always been structural ("not an L0 pointer" → L1), which is not a classification; the report now lists, under `routing_advisory`, the entries the classifier would have routed elsewhere. They are still migrated — this release is advisory — but you can see what was misfiled.
+### Routing on the Compaction Path
+
+`compact_memory` is routing-aware. Its migration rule has always been structural ("not an L0 pointer" → L1), which is a statement about the *source*, not a classification of the content — so a runbook, a standing user preference or a raw trace sitting in the agent's memory file all became L1 knowledge. Every non-index entry is now classified, and the mode decides what that classification is worth:
+
+| Mode | What happens |
+|------|--------------|
+| `advisory` (default) | Unchanged migration: every non-index entry still goes to L1. The report adds `routing` per entry, `routing_advisory` for the entries the classifier would have sent elsewhere, and `routing_summary` counts by surface and ownership, so you can see what was misfiled and move it afterwards |
+| `enforce` | Only `l1_knowledge` entries are injected. TODO, skill, user-profile, agent-other, undecided and ephemeral entries are **left in agent memory untouched** and returned as candidates for you to place |
+
+Set it in `routing:` in config.yaml, or per call with `compact_memory(routing_mode="enforce")` — useful for previewing the split with `dry_run=True` before changing the config. Omitting the argument keeps the configured mode.
+
+Enforce mode writes nothing outside L1. Blocked entries are reported, never deleted:
+
+```json
+{
+  "routing_mode": "enforce",
+  "routing_summary": {
+    "by_surface": {"l1_knowledge": 1, "skill": 1, "todo": 1},
+    "by_ownership": {"framework": 2, "agent": 1},
+    "l1_injected": 1, "l1_planned": 1, "blocked_from_l1": 2
+  },
+  "l1_candidates": [{"surface": "l1_knowledge", "status": "migrated",
+                     "destination": "knowledge/infra.md#架构边界"}],
+  "todo_candidates": [{"surface": "todo", "status": "blocked_from_l1", "reason": "…"}],
+  "agent_owned_candidates": [{"surface": "skill", "status": "blocked_from_l1",
+                              "suggested_action": {"kind": "agent_native_write", "…": "…"}}],
+  "rejected": []
+}
+```
+
+Each candidate carries the entry preview, the routed surface and ownership, the rule-weight score, the reason, any warnings, its status and its destination when written — enough to audit the pass. Two deliberate limits: no TODO is created (compaction has no TODO write contract; `todo_candidates` is a report, and `add_todo` stays your call), and skill / user-profile / agent-other remain agent-owned — the `suggested_action` is handed back for you to apply, and compaction never invokes an `agent_extensions` adapter even when one is configured.
+
+The legacy fields (`migrated_count`, `migrated`, `errors`, `cleaned_memory`, `stats`) keep their meaning in both modes, so existing callers do not need to change.
 
 ### Derived Data: L0 Index and Vectors
 

@@ -168,7 +168,7 @@ routing:
   disabled_markers: ["脚本"]                   # 关闭对你来说是噪声的默认词
 ```
 
-`mode: advisory` 是默认值，也是当前写入路径唯一会采纳的模式：路由只在正常结果旁边附上它的判断，不改变写入行为。`enforce` 在 schema 和返回结果里是被承认的，但目前没有任何写入路径据此拦截 —— 升级后突然开始拒写，那是数据丢失事故，不是功能。
+`mode: advisory` 是默认值：路由只在正常结果旁边附上它的判断，不改变写入行为。升级后突然开始拒写，那是数据丢失事故，不是功能，所以 `enforce` 必须显式开启 —— 目前只有一条路径会据此拦截：`compact_memory`（见[压实路径上的路由](#压实路径上的路由)）。`inject_knowledge` 在两种模式下都照常写 L1，并在 `routing_warning` 里说明这一点。
 
 不写某个键就保持默认。如果设置了 `watch_patterns`，你的列表会替换内置模式列表；设为 `[]` 可关闭模式匹配。
 
@@ -403,7 +403,39 @@ L1 用来存放**长期知识**，也就是当前成立的规则和事实。未�
 
 `inject_knowledge` 写的是 L1，这一点路由不会改变。它增加的是可见性：每个结果都带一个 `routing` 块；如果分类器认为这条内容该去别处，还会带上 `routing_warning`。写入照常发生，`action` 与过去完全一致。批量写入同样逐条暴露 `routing`，批量里的 `deferred_fusion` 也会完整带上握手字段（`needs_fusion`、`expected_hash`、`fusion`）—— 批量只是省事，不是更安静的写入通道。
 
-`compact_memory` 以同样方式报告。它的迁移规则一直是结构性的（"不是 L0 指针" → L1），而那并不是一次分类；现在报告里的 `routing_advisory` 会列出分类器认为应该去别处的条目。它们仍然被迁移了（本版本只做建议），但你能看到哪些放错了地方。
+### 压实路径上的路由
+
+`compact_memory` 现在是路由感知的。它的迁移规则一直是结构性的（"不是 L0 指针" → L1），而那是关于**来源**的判断，不是对内容的分类 —— 于是放在 agent 记忆文件里的操作手册、长期用户偏好、原始日志统统变成了 L1 知识。现在每一条非索引条目都会被分类，而模式决定这个分类算不算数：
+
+| 模式 | 行为 |
+|------|------|
+| `advisory`（默认） | 迁移行为不变：所有非索引条目仍然进 L1。报告里新增逐条的 `routing`、列出分类器认为该去别处的 `routing_advisory`，以及按面与归属统计的 `routing_summary`，让你看到哪些放错了地方、事后再搬 |
+| `enforce` | 只有 `l1_knowledge` 会被写入 L1。TODO、技能、用户偏好、agent 自有、无法判定、一次性内容都**原样留在 agent 记忆里**，并作为候选项返回，由你来安置 |
+
+可以在 config.yaml 的 `routing:` 段设置，也可以单次调用时传 `compact_memory(routing_mode="enforce")` —— 配合 `dry_run=True` 可以先预览拆分结果再决定要不要改配置。不传这个参数就沿用配置里的模式。
+
+enforce 模式不会往 L1 之外写任何东西，被拦下的条目只被报告，绝不删除：
+
+```json
+{
+  "routing_mode": "enforce",
+  "routing_summary": {
+    "by_surface": {"l1_knowledge": 1, "skill": 1, "todo": 1},
+    "by_ownership": {"framework": 2, "agent": 1},
+    "l1_injected": 1, "l1_planned": 1, "blocked_from_l1": 2
+  },
+  "l1_candidates": [{"surface": "l1_knowledge", "status": "migrated",
+                     "destination": "knowledge/infra.md#架构边界"}],
+  "todo_candidates": [{"surface": "todo", "status": "blocked_from_l1", "reason": "…"}],
+  "agent_owned_candidates": [{"surface": "skill", "status": "blocked_from_l1",
+                              "suggested_action": {"kind": "agent_native_write", "…": "…"}}],
+  "rejected": []
+}
+```
+
+每个候选项都带上条目预览、路由到的面与归属、规则权重分、原因、警告、状态，以及真正写入时的目标位置 —— 足够复盘整次压实。两条刻意的边界：不会自动创建 TODO（压实本来就没有写 TODO 的契约，`todo_candidates` 只是报告，`add_todo` 由你决定），技能／用户偏好／agent 自有内容仍然归 agent 所有 —— `suggested_action` 交回给你执行，即使配置了 `agent_extensions` 适配器，压实也绝不会去调用它。
+
+旧字段（`migrated_count`、`migrated`、`errors`、`cleaned_memory`、`stats`）在两种模式下含义不变，已有调用方不需要改动。
 
 ### 派生数据：L0 索引与向量
 

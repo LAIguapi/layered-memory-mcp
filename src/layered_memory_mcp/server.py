@@ -2018,31 +2018,47 @@ def cognitive_decision_prompt() -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-async def compact_memory(dry_run: bool = True) -> str:
+async def compact_memory(
+    dry_run: bool = True, routing_mode: str | None = None
+) -> str:
     """Scan agent memory for non-index bloat and migrate to L1 knowledge files.
 
     Detects entries in the agent's memory that are not L0 index pointers,
     classifies them by domain, and either reports (dry_run) or automatically
     migrates them to appropriate L1 files.
 
-    Note the structural assumption: "not an L0 pointer" is treated as "belongs
-    in L1". That is not a classification, so each migrated entry now carries a
-    `routing` block, and `routing_advisory` lists the entries the persistence
-    router would have sent elsewhere (a runbook, a standing preference, a raw
-    trace). They are still migrated — this is advisory in this version — but you
-    can see what was misfiled and move it afterwards.
+    Routing-aware: "not an L0 pointer" is a statement about the *source*, not a
+    classification of the content, so every non-index entry is also classified
+    into a memory surface.
+
+      - `advisory` (default): behaviour is unchanged — every non-index entry
+        still migrates to L1 — but each entry carries a `routing` block and
+        `routing_advisory` lists what the router would have sent elsewhere (a
+        runbook, a standing preference, a raw trace), so you can see what was
+        misfiled and move it afterwards.
+      - `enforce`: only `l1_knowledge` entries reach L1. Everything else is left
+        in agent memory untouched and returned under `todo_candidates`,
+        `agent_owned_candidates` or `rejected` for you to place. The framework
+        writes nothing outside L1: no TODO is created, and skill / user_profile
+        / agent_other stay agent-owned unless an `agent_extensions` adapter is
+        configured and you invoke it.
 
     Args:
         dry_run: If True (default), only report what would be migrated.
                  If False, perform the migration and clean up memory.
+        routing_mode: Override `routing.mode` from config for this call:
+                 "advisory" or "enforce". None (default) uses the config value.
 
     Returns:
         JSON with migration plan or execution report, including
-        `routing_advisory`.
+        `routing_mode`, `routing_summary`, `routing_advisory`, `l1_candidates`,
+        `todo_candidates`, `agent_owned_candidates` and `rejected`.
     """
     config = _get_config()
     from .memory_compactor import compact_memory as _compact
-    result = await asyncio.to_thread(_compact, config=config, dry_run=dry_run)
+    result = await asyncio.to_thread(
+        _compact, config=config, dry_run=dry_run, routing_mode=routing_mode
+    )
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 

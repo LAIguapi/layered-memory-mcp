@@ -591,8 +591,10 @@ def _routing_advisory(
 
     What this must NOT do, and does not do:
       - change ``action`` / ``success`` / any existing field;
-      - block, redirect or drop a write (even in ``enforce`` mode — no write
-        path acts on routing yet, and the decision says so);
+      - block, redirect or drop a write (even in ``enforce`` mode — this entry
+        point's contract is "the caller named the target", and the decision
+        says so; ``compact_memory`` is where ``enforce`` gates, because there
+        the *framework* picked the target);
       - raise. A failure here is logged and the result is returned untouched.
     """
     if not isinstance(result, dict):
@@ -648,7 +650,8 @@ def _routing_advisory(
                 f"not L1 knowledge: {hint}. The write was NOT changed — routing "
                 f"mode is '{mode}' and advisory"
                 + (
-                    "; 'enforce' is not yet acted on by the write path"
+                    "; 'enforce' gates compact_memory, not this explicit write "
+                    "— you named the target, so the framework honours it"
                     if mode == "enforce"
                     else ""
                 )

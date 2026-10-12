@@ -22,6 +22,7 @@ nothing new, and advisory routing does not touch the existing write contracts.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from layered_memory_mcp.adapters import apply_agent_action, registry, resolve_adapter
 from layered_memory_mcp.config import MemoryConfig
@@ -448,15 +449,21 @@ class TestAdvisoryInject:
         assert "routing_warning" in res
         assert "NOT changed" in res["routing_warning"]
 
-    def test_enforce_mode_still_does_not_block_a_write(self, tmp_path):
-        """The schema knows 'enforce'; the write path does not act on it yet."""
+    def test_enforce_mode_still_does_not_block_an_explicit_write(self, tmp_path):
+        """`enforce` gates compaction, where the *framework* picks the target.
+
+        Here the caller named domain and section, so the write is honoured in
+        either mode — the warning says which one acted.
+        """
         cfg = _cfg(tmp_path, routing={"mode": "enforce"})
         res = inject_knowledge(
             config=cfg, domain="ops", section="发布流程", content=SKILL_TEXT
         )
         assert res["success"] is True
+        assert res["action"] in ("created", "updated", "appended")
         assert res["routing"]["mode"] == "enforce"
-        assert "not yet acted on" in res["routing_warning"]
+        assert "gates compact_memory" in res["routing_warning"]
+        assert "发布流程" in (cfg.knowledge_dir / "ops.md").read_text(encoding="utf-8")
 
     def test_routing_can_be_switched_off_entirely(self, tmp_path):
         cfg = _cfg(tmp_path, routing={"enabled": False})
@@ -673,7 +680,30 @@ class TestLegacyProcedureType:
         assert "pytest" in entry.content
 
 
-# --- I. compact_memory advisory ---------------------------------------------
+# --- I. compact_memory: advisory reports, enforce splits --------------------
+
+#: Entries carry a bracket tag so a section heading is derivable — otherwise
+#: compaction refuses them for `needs_title` before routing is even relevant.
+MIXED_MEMORY_ENTRIES = (
+    "[L0] infra: servers → knowledge/infra.md",
+    "[架构边界] " + KNOWLEDGE_TEXT,
+    "[发布流程] " + SKILL_TEXT,
+    "[用户偏好] " + PROFILE_TEXT,
+    "[待验证] " + TODO_TEXT,
+    "[扫描日志] " + LOG_TEXT,
+)
+
+
+def _write_mixed_memory(tmp_path, name: str = "MEMORY.md"):
+    """One agent memory file holding an entry per surface, plus an L0 pointer."""
+    mem = tmp_path / name
+    mem.write_text("\n§\n".join(MIXED_MEMORY_ENTRIES) + "\n", encoding="utf-8")
+    return mem
+
+
+def _enforce_cfg(tmp_path, **kwargs):
+    return _cfg(tmp_path, routing={"mode": "enforce"}, **kwargs)
+
 
 class TestCompactMemoryRoutingAdvisory:
     def test_non_l1_entries_are_reported_but_still_migrated(self, tmp_path):
@@ -694,3 +724,377 @@ class TestCompactMemoryRoutingAdvisory:
         assert advisory[0]["routed_surface"] == "skill"
         assert advisory[0]["ownership"] == "agent"
         assert "advisory" in advisory[0]["note"]
+
+    def test_advisory_summary_counts_every_classified_entry(self, tmp_path):
+        """Advisory stays a reporting layer — but a complete one."""
+        from layered_memory_mcp.memory_compactor import compact_memory
+
+        cfg = _cfg(tmp_path)
+        mem = _write_mixed_memory(tmp_path)
+
+        report = compact_memory(cfg, memory_path=mem, dry_run=True)
+        # Backwards compatible: every non-index entry still goes to L1.
+        assert report["migrated_count"] == 5
+        assert report["routing_mode"] == "advisory"
+
+        summary = report["routing_summary"]
+        assert summary["classified"] == 5
+        assert summary["by_surface"] == {
+            "l1_knowledge": 1,
+            "skill": 1,
+            "user_profile": 1,
+            "todo": 1,
+            "ephemeral": 1,
+        }
+        assert summary["by_ownership"] == {"framework": 2, "agent": 2, "none": 1}
+        assert summary["blocked_from_l1"] == 0
+        assert summary["l1_planned"] == 5
+        assert summary["l1_injected"] == 0          # dry run writes nothing
+        # Four of the five would not have belonged in L1.
+        assert len(report["routing_advisory"]) == 4
+        assert all(a["status"] == "migrated" for a in report["routing_advisory"])
+
+    def test_advisory_entries_carry_auditable_routing_metadata(self, tmp_path):
+        from layered_memory_mcp.memory_compactor import compact_memory
+
+        cfg = _cfg(tmp_path)
+        mem = _write_mixed_memory(tmp_path)
+
+        report = compact_memory(cfg, memory_path=mem, dry_run=True)
+        by_surface = {c["surface"]: c for c in report["l1_candidates"]}
+        assert set(by_surface) == {
+            "l1_knowledge", "skill", "user_profile", "todo", "ephemeral"
+        }
+        skill = by_surface["skill"]
+        assert skill["status"] == "planned"
+        assert skill["ownership"] == "agent"
+        assert 0.0 < skill["score"] <= 1.0
+        assert skill["routing_reason"]
+        assert skill["destination"].startswith("knowledge/")
+        assert skill["suggested_action"]["surface"] == "skill"
+        assert isinstance(skill["warnings"], list)
+        # The legacy per-entry block is still attached to `migrated`.
+        assert all(m["routing"]["surface"] for m in report["migrated"])
+
+
+class TestCompactMemoryEnforce:
+    def test_only_l1_knowledge_reaches_l1(self, tmp_path):
+        from layered_memory_mcp.memory_compactor import compact_memory
+
+        cfg = _enforce_cfg(tmp_path)
+        mem = _write_mixed_memory(tmp_path)
+
+        report = compact_memory(cfg, memory_path=mem, dry_run=False)
+        assert report["success"] is True
+        assert report["routing_mode"] == "enforce"
+        assert report["migrated_count"] == 1
+        assert report["error_count"] == 0
+
+        summary = report["routing_summary"]
+        assert summary["l1_injected"] == 1
+        assert summary["blocked_from_l1"] == 4
+
+        migrated = report["migrated"][0]
+        assert migrated["routing"]["surface"] == "l1_knowledge"
+        written = (cfg.knowledge_dir / f"{migrated['domain']}.md").read_text(
+            encoding="utf-8"
+        )
+        assert "routing.py 只做确定性的标记与结构匹配" in written
+        # …and only that entry: nothing agent-owned or ephemeral leaked in.
+        assert "发布流程（每次发版都按这个来）" not in written
+        assert "用户偏好" not in written
+        assert "vector sync failed" not in written
+
+    def test_procedure_is_returned_as_agent_owned_candidate(self, tmp_path):
+        from layered_memory_mcp.memory_compactor import compact_memory
+
+        cfg = _enforce_cfg(tmp_path)
+        mem = tmp_path / "MEMORY.md"
+        mem.write_text("[发布流程] " + SKILL_TEXT, encoding="utf-8")
+
+        report = compact_memory(cfg, memory_path=mem, dry_run=False)
+        assert report["migrated_count"] == 0
+        assert report["l1_candidates"] == []
+
+        candidates = report["agent_owned_candidates"]
+        assert len(candidates) == 1
+        c = candidates[0]
+        assert c["surface"] == "skill"
+        assert c["ownership"] == "agent"
+        assert c["status"] == "blocked_from_l1"
+        assert c["destination"] is None
+        assert c["reason"]
+        action = c["suggested_action"]
+        assert action["kind"] == "agent_native_write"
+        assert action["surface"] == "skill"
+        assert "steps" in action["shape_hint"]
+        # The framework authored nothing — the agent gets its own text back.
+        assert "pytest -q" in action["source_content"]
+
+        # No L1 file was created, and the source entry is still in memory.
+        assert list(cfg.knowledge_dir.glob("*.md")) == []
+        assert "pytest -q" in mem.read_text(encoding="utf-8")
+        assert "pytest -q" in report["cleaned_memory"]
+
+    def test_user_preference_is_returned_as_profile_candidate(self, tmp_path):
+        from layered_memory_mcp.memory_compactor import compact_memory
+
+        cfg = _enforce_cfg(tmp_path)
+        mem = tmp_path / "MEMORY.md"
+        mem.write_text("[用户偏好] " + PROFILE_TEXT, encoding="utf-8")
+
+        report = compact_memory(cfg, memory_path=mem, dry_run=False)
+        assert report["migrated_count"] == 0
+        c = report["agent_owned_candidates"][0]
+        assert c["surface"] == "user_profile"
+        assert c["ownership"] == "agent"
+        assert c["suggested_action"]["requires_user_confirmation"] is True
+        assert list(cfg.knowledge_dir.glob("*.md")) == []
+
+    def test_open_work_is_returned_as_todo_candidate_and_not_written(self, tmp_path):
+        from layered_memory_mcp.memory_compactor import compact_memory
+
+        cfg = _enforce_cfg(tmp_path)
+        mem = tmp_path / "MEMORY.md"
+        mem.write_text("[待验证] " + TODO_TEXT, encoding="utf-8")
+
+        report = compact_memory(cfg, memory_path=mem, dry_run=False)
+        assert report["migrated_count"] == 0
+        assert report["agent_owned_candidates"] == []
+        c = report["todo_candidates"][0]
+        assert c["surface"] == "todo"
+        assert c["ownership"] == "framework"
+        assert c["status"] == "blocked_from_l1"
+        # TODO is framework-owned, but compaction has no TODO write contract:
+        # the candidate is reported, never created.
+        assert c["suggested_action"] is None
+        assert not (Path(cfg.home) / "data" / "todos.db").exists()
+        assert list(cfg.knowledge_dir.glob("*.md")) == []
+        assert any("reported, not created" in n for n in report["routing_notes"])
+
+    def test_raw_trace_is_rejected(self, tmp_path):
+        from layered_memory_mcp.memory_compactor import compact_memory
+
+        cfg = _enforce_cfg(tmp_path)
+        mem = tmp_path / "MEMORY.md"
+        mem.write_text("[扫描日志] " + LOG_TEXT, encoding="utf-8")
+
+        report = compact_memory(cfg, memory_path=mem, dry_run=False)
+        assert report["migrated_count"] == 0
+        assert report["todo_candidates"] == []
+        assert report["agent_owned_candidates"] == []
+        c = report["rejected"][0]
+        assert c["surface"] in ("ephemeral", "undecided")
+        assert c["ownership"] == "none"
+        assert c["status"] == "blocked_from_l1"
+        assert list(cfg.knowledge_dir.glob("*.md")) == []
+
+    def test_blocked_entries_are_never_deleted(self, tmp_path):
+        """A blocked entry has nowhere to go yet — dropping it is data loss."""
+        from layered_memory_mcp.memory_compactor import compact_memory
+
+        cfg = _enforce_cfg(tmp_path)
+        mem = _write_mixed_memory(tmp_path)
+
+        compact_memory(cfg, memory_path=mem, dry_run=False)
+        after = mem.read_text(encoding="utf-8")
+        for fragment in ("pytest -q", "用户偏好", "阻塞状态", "vector sync failed"):
+            assert fragment in after
+
+    def test_l0_pointers_are_still_index_entries_under_enforce(self, tmp_path):
+        from layered_memory_mcp.memory_compactor import compact_memory
+
+        cfg = _enforce_cfg(tmp_path)
+        mem = tmp_path / "MEMORY.md"
+        original = (
+            "[L0] infra: servers → knowledge/infra.md\n§\n"
+            "[L0] dev: principles → knowledge/dev.md\n"
+        )
+        mem.write_text(original, encoding="utf-8")
+
+        report = compact_memory(cfg, memory_path=mem, dry_run=False)
+        assert report["migrated_count"] == 0
+        assert report["routing_summary"]["classified"] == 0   # never classified
+        assert report["routing_summary"]["blocked_from_l1"] == 0
+        assert report["l1_candidates"] == []
+        assert mem.read_text(encoding="utf-8").count("[L0]") == 2
+        assert list(cfg.knowledge_dir.glob("*.md")) == []
+
+    def test_oversized_l0_pointer_still_not_migrated_under_enforce(self, tmp_path):
+        from layered_memory_mcp.memory_compactor import compact_memory
+
+        cfg = _enforce_cfg(tmp_path)
+        mem = tmp_path / "MEMORY.md"
+        oversized = "[L0] infra: " + "超长摘要" * 60 + " → knowledge/infra.md"
+        mem.write_text(oversized, encoding="utf-8")
+
+        report = compact_memory(cfg, memory_path=mem, dry_run=False)
+        assert report["migrated_count"] == 0
+        assert report["routing_summary"]["classified"] == 0
+        cleaned = mem.read_text(encoding="utf-8")
+        assert cleaned.count("[L0]") == 1          # no nesting
+        assert not (cfg.knowledge_dir / "infra.md").exists()
+
+    def test_dry_run_enforce_writes_nothing_but_reports_the_split(self, tmp_path):
+        from layered_memory_mcp.memory_compactor import compact_memory
+
+        cfg = _enforce_cfg(tmp_path)
+        mem = _write_mixed_memory(tmp_path)
+        before = mem.read_text(encoding="utf-8")
+
+        report = compact_memory(cfg, memory_path=mem, dry_run=True)
+        assert report["routing_summary"]["l1_injected"] == 0
+        assert report["routing_summary"]["l1_planned"] == 1
+        assert report["routing_summary"]["blocked_from_l1"] == 4
+        assert mem.read_text(encoding="utf-8") == before
+        assert list(cfg.knowledge_dir.glob("*.md")) == []
+
+
+class TestCompactRoutingModeResolution:
+    def test_parameter_overrides_config(self, tmp_path):
+        from layered_memory_mcp.memory_compactor import compact_memory
+
+        cfg = _cfg(tmp_path)                       # advisory in config
+        mem = tmp_path / "MEMORY.md"
+        mem.write_text("[发布流程] " + SKILL_TEXT, encoding="utf-8")
+
+        report = compact_memory(
+            cfg, memory_path=mem, dry_run=True, routing_mode="enforce"
+        )
+        assert report["routing_mode"] == "enforce"
+        assert report["migrated_count"] == 0
+        assert report["agent_owned_candidates"][0]["surface"] == "skill"
+
+    def test_old_calls_keep_the_old_behavior(self, tmp_path):
+        """No routing_mode argument, no routing: section → advisory."""
+        from layered_memory_mcp.memory_compactor import compact_memory
+
+        cfg = _cfg(tmp_path)
+        mem = tmp_path / "MEMORY.md"
+        mem.write_text("[发布流程] " + SKILL_TEXT, encoding="utf-8")
+
+        report = compact_memory(cfg, memory_path=mem, dry_run=True)
+        assert report["routing_mode"] == "advisory"
+        assert report["migrated_count"] == 1
+
+    def test_unknown_mode_is_ignored_not_fatal(self, tmp_path):
+        from layered_memory_mcp.memory_compactor import compact_memory
+
+        cfg = _cfg(tmp_path)
+        mem = tmp_path / "MEMORY.md"
+        mem.write_text("[发布流程] " + SKILL_TEXT, encoding="utf-8")
+
+        report = compact_memory(
+            cfg, memory_path=mem, dry_run=True, routing_mode="block-everything"
+        )
+        assert report["success"] is True
+        assert report["routing_mode"] == "advisory"
+        assert report["migrated_count"] == 1
+        assert any("ignored unknown routing_mode" in n for n in report["routing_notes"])
+
+    def test_enforce_degrades_when_routing_is_disabled(self, tmp_path):
+        """Enforcing on classifications we may not compute would block all."""
+        from layered_memory_mcp.memory_compactor import compact_memory
+
+        cfg = _cfg(tmp_path, routing={"enabled": False, "mode": "enforce"})
+        mem = tmp_path / "MEMORY.md"
+        mem.write_text("[发布流程] " + SKILL_TEXT, encoding="utf-8")
+
+        report = compact_memory(cfg, memory_path=mem, dry_run=True)
+        assert report["routing_enabled"] is False
+        assert report["routing_mode"] == "advisory"
+        assert report["migrated_count"] == 1
+        assert report["routing_summary"]["classified"] == 0
+        assert any("'enforce' was ignored" in n for n in report["routing_notes"])
+
+    def test_tool_passes_the_mode_through(self, tmp_path, monkeypatch):
+        """The MCP tool is a pass-through; it resolves no memory path itself."""
+        import asyncio
+
+        from layered_memory_mcp import memory_compactor, server
+
+        captured: dict = {}
+
+        def _spy(config, memory_path=None, dry_run=False, routing_mode=None):
+            captured.update(dry_run=dry_run, routing_mode=routing_mode)
+            return {"success": True, "routing_mode": routing_mode}
+
+        monkeypatch.setattr(memory_compactor, "compact_memory", _spy)
+        server._config = _cfg(tmp_path)
+        try:
+            payload = json.loads(
+                asyncio.run(
+                    server.compact_memory(dry_run=True, routing_mode="enforce")
+                )
+            )
+        finally:
+            server._config = None
+        assert captured == {"dry_run": True, "routing_mode": "enforce"}
+        assert payload["routing_mode"] == "enforce"
+
+    def test_tool_defaults_to_config_mode(self, tmp_path, monkeypatch):
+        import asyncio
+
+        from layered_memory_mcp import memory_compactor, server
+
+        captured: dict = {}
+
+        def _spy(config, memory_path=None, dry_run=False, routing_mode=None):
+            captured.update(routing_mode=routing_mode)
+            return {"success": True}
+
+        monkeypatch.setattr(memory_compactor, "compact_memory", _spy)
+        server._config = _cfg(tmp_path)
+        try:
+            asyncio.run(server.compact_memory())
+        finally:
+            server._config = None
+        assert captured == {"routing_mode": None}   # config decides
+
+
+class TestEnforceWritesNothingOutsideL1:
+    def test_configured_adapter_is_not_invoked_by_compaction(self, tmp_path):
+        """Candidates are produced; applying them stays the caller's decision."""
+        from layered_memory_mcp.memory_compactor import compact_memory
+
+        calls: list[AgentAction] = []
+
+        class _SpyAdapter:
+            name = "spy"
+
+            def supports(self, surface) -> bool:
+                return True
+
+            def apply(self, action):
+                calls.append(action)
+                raise AssertionError("compaction must not apply agent actions")
+
+        cfg = _enforce_cfg(
+            tmp_path,
+            agent_extensions={
+                "enabled": True,
+                "mode": "apply",
+                "surfaces": {
+                    "skill": {"enabled": True, "handler": "spy"},
+                    "user_profile": {"enabled": True, "handler": "spy"},
+                },
+            },
+        )
+        mem = _write_mixed_memory(tmp_path)
+
+        registry.register(_SpyAdapter())
+        try:
+            report = compact_memory(cfg, memory_path=mem, dry_run=False)
+            # The adapter is fully wired — resolvable for both surfaces…
+            assert resolve_adapter(cfg, MemorySurface.SKILL) is not None
+            assert resolve_adapter(cfg, MemorySurface.USER_PROFILE) is not None
+        finally:
+            registry.unregister("spy")
+
+        # …and still untouched: compaction reports, the caller applies.
+        assert calls == []
+        surfaces = {c["surface"] for c in report["agent_owned_candidates"]}
+        assert surfaces == {"skill", "user_profile"}
+        assert all(
+            c["status"] == "blocked_from_l1" for c in report["agent_owned_candidates"]
+        )

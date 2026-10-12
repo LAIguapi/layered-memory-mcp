@@ -819,8 +819,10 @@ class MemoryConfig:
         # existing results and changes NOTHING about what a write does. That is
         # the only non-breaking default for an existing knowledge base — a
         # classifier that started rejecting writes on upgrade would be a data
-        # loss event, not a feature. "enforce" is recognised by the schema and
-        # surfaced in capability reflection; no write path acts on it yet.
+        # loss event, not a feature. "enforce" is opt-in, and exactly one path
+        # gates on it: compact_memory injects only L1_KNOWLEDGE into L1 and
+        # returns the other surfaces as candidates. inject_knowledge still
+        # writes L1 in either mode (and says so in its routing_warning).
         #
         # Precedence: constructor → env → `routing:` in config.yaml → default.
         # Malformed values fall back per key rather than raising: routing is an

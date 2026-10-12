@@ -301,15 +301,19 @@ def detect_memory_bloat(
     return result
 
 
-def _entry_routing(config: "MemoryConfig", entry: str, section: str | None) -> dict | None:
-    """Classify one memory entry before it is migrated. Advisory; never raises.
+def _entry_routing(config: "MemoryConfig", entry: str, section: str | None):
+    """Classify one memory entry. Never raises; ``None`` when unavailable.
 
     "Not an L0 pointer" is not the same as "durable L1 knowledge", but this
-    migration has always treated the two as identical: every non-index entry
-    goes to L1. That is a long-term pollution source — a runbook, a standing
-    user preference or a one-off trace in the agent's memory file all end up as
-    L1 knowledge. Until the enforce path exists, each migrated entry at least
-    carries the router's opinion, so the operator can see what was misfiled.
+    migration historically treated the two as identical: every non-index entry
+    went to L1. That is a long-term pollution source — a runbook, a standing
+    user preference or a one-off trace in the agent's memory file all ended up
+    as L1 knowledge. The classification is what lets ``compact_memory`` report
+    that (advisory mode) or refuse it (enforce mode).
+
+    Returns the :class:`~layered_memory_mcp.routing.RoutingDecision`, or ``None``
+    when routing is disabled in config or the router could not be consulted —
+    the caller then falls back to the legacy "everything goes to L1" behaviour.
     """
     try:
         from .routing import classify_memory_item, routing_settings
@@ -317,19 +321,100 @@ def _entry_routing(config: "MemoryConfig", entry: str, section: str | None) -> d
         enabled, _mode = routing_settings(config)
         if not enabled:
             return None
-        decision = classify_memory_item(
+        return classify_memory_item(
             entry, config=config, section=section, domain=None
         )
-        return decision.advisory_summary()
-    except Exception as e:  # noqa: BLE001 — advisory only
-        logger.warning("routing advisory failed during compact (non-critical): %s", e)
+    except Exception as e:  # noqa: BLE001 — classification must not break compaction
+        logger.warning("routing classification failed during compact (non-critical): %s", e)
         return None
+
+
+# --- routing-aware compaction ------------------------------------------------
+#
+# Surface names are compared as plain strings so the compaction loop never has
+# to import the router's enum (and never breaks when the router is
+# unavailable). Authoritative definition: ``routing.MemorySurface``.
+
+#: The only surface compaction may inject into an L1 knowledge file.
+_L1_SURFACE = "l1_knowledge"
+
+#: Non-L1 surfaces, grouped by the result bucket they are reported under.
+_TODO_SURFACE = "todo"
+_AGENT_OWNED_SURFACES = ("skill", "user_profile", "agent_other")
+
+
+def _candidate_bucket(surface: str | None) -> str:
+    """Which result bucket a non-L1 surface is reported under.
+
+    ``l0_index`` and ``memory_changelog`` land in ``rejected`` on purpose: both
+    are framework-owned *derived* surfaces, and user content must never be
+    written into them by a compaction pass.
+    """
+    if surface == _TODO_SURFACE:
+        return "todo_candidates"
+    if surface in _AGENT_OWNED_SURFACES:
+        return "agent_owned_candidates"
+    return "rejected"
+
+
+def _preview(entry: str, max_chars: int = 80) -> str:
+    return entry[:max_chars] + ("..." if len(entry) > max_chars else "")
+
+
+def _routing_fields(decision) -> dict | None:
+    """Per-entry routing block: the advisory summary plus any agent action."""
+    if decision is None:
+        return None
+    block = decision.advisory_summary()
+    action = getattr(decision, "suggested_action", None)
+    block["suggested_action"] = action.model_dump(mode="json") if action else None
+    return block
+
+
+def _resolve_routing_mode(
+    config: "MemoryConfig", routing_mode: str | None
+) -> tuple[bool, str, list[str]]:
+    """``(routing_enabled, effective_mode, notes)`` for this compaction pass.
+
+    Precedence: explicit ``routing_mode`` argument → ``config.routing_mode`` →
+    ``advisory``. An unknown value is ignored rather than fatal, and ``enforce``
+    degrades to ``advisory`` when routing is switched off in config — enforcing
+    on classifications we are not allowed to compute would block every entry.
+    """
+    notes: list[str] = []
+    try:
+        from .routing import routing_settings
+
+        enabled, mode = routing_settings(config)
+    except Exception as e:  # noqa: BLE001 — compaction predates routing
+        logger.warning("routing unavailable during compact (non-critical): %s", e)
+        return False, "advisory", [
+            "router unavailable — legacy advisory compaction (every non-index "
+            "entry is treated as L1 knowledge)"
+        ]
+
+    if routing_mode is not None:
+        candidate = str(routing_mode).strip().lower()
+        if candidate in ("advisory", "enforce"):
+            mode = candidate
+        else:
+            notes.append(
+                f"ignored unknown routing_mode {routing_mode!r}; using {mode!r}"
+            )
+    if not enabled and mode == "enforce":
+        mode = "advisory"
+        notes.append(
+            "routing.enabled=false, so 'enforce' was ignored: with no "
+            "classification available every entry would be blocked"
+        )
+    return enabled, mode, notes
 
 
 def compact_memory(
     config: "MemoryConfig",
     memory_path: str | Path | None = None,
     dry_run: bool = False,
+    routing_mode: str | None = None,
 ) -> dict:
     """Migrate bloat entries from agent memory to L1 knowledge files.
 
@@ -338,15 +423,34 @@ def compact_memory(
 
     For each non-index entry:
       1. Determine the best L1 domain/section
-      2. Classify it with the persistence router (advisory — see
-         ``_entry_routing``; the migration itself is unchanged)
-      3. Write the content to L1 via inject_knowledge
+      2. Classify it with the persistence router (see :func:`_entry_routing`)
+      3. Write the content to L1 via inject_knowledge — in ``enforce`` mode
+         only when step 2 called it durable L1 knowledge
       4. Generate an L0 pointer for it
 
-    Step 2 is why the report carries ``routing_advisory``: the "non-index → L1"
-    rule is a structural assumption, not a classification, and the entries it
-    gets wrong are the ones that need a human. Changing what the migration
-    *does* is deliberately out of scope here.
+    Step 2 exists because "not an L0 pointer" is a statement about the *source*,
+    not a classification of the content. Two modes:
+
+    ``advisory`` (default, backwards compatible)
+        Every non-index entry still migrates to L1, exactly as before. The
+        report gains ``routing`` per entry, ``routing_advisory`` for the entries
+        the router would have sent elsewhere, and ``routing_summary`` counts.
+
+    ``enforce``
+        Only ``l1_knowledge`` entries are injected. TODO / skill / profile /
+        agent-other / undecided / ephemeral entries are **left in agent memory
+        untouched** and returned under ``todo_candidates`` /
+        ``agent_owned_candidates`` / ``rejected`` so the calling agent can place
+        them. Nothing outside L1 is written: no TODO is created (compaction has
+        no TODO write contract) and no agent-owned store is touched (that needs
+        an explicit ``agent_extensions`` adapter, invoked by the caller).
+
+    Args:
+        config: the memory configuration.
+        memory_path: agent memory file; auto-detected from ``config`` if absent.
+        dry_run: report only; no L1 write and no memory file rewrite.
+        routing_mode: per-call override of ``config.routing_mode``
+            (``"advisory"`` / ``"enforce"``). ``None`` uses the config value.
 
     Returns a report of migrated entries and the cleaned memory content.
     The agent should then write the cleaned content back to its memory.
@@ -367,18 +471,103 @@ def compact_memory(
     # Load domain rules from config
     domain_rules = _get_domain_rules(config)
 
+    routing_enabled, mode, routing_notes = _resolve_routing_mode(config, routing_mode)
+    enforce = mode == "enforce"
+
     migrated = []
     kept = []
     errors = []
     routing_advisory = []
+    buckets: dict[str, list[dict]] = {
+        "l1_candidates": [],
+        "todo_candidates": [],
+        "agent_owned_candidates": [],
+        "rejected": [],
+    }
+    by_surface: dict[str, int] = {}
+    by_ownership: dict[str, int] = {}
+
+    def _record(
+        entry: str,
+        suggestion: dict,
+        routing: dict | None,
+        *,
+        bucket: str,
+        status: str,
+        reason: str = "",
+        destination: str | None = None,
+    ) -> dict:
+        """Append one auditable candidate record to ``bucket`` and return it."""
+        record = {
+            "entry_preview": _preview(entry),
+            "entry_length": len(entry),
+            "surface": routing["surface"] if routing else None,
+            "ownership": routing["ownership"] if routing else None,
+            "score": routing["score"] if routing else None,
+            "routing_reason": routing["reason"] if routing else "",
+            "warnings": list(routing["warnings"]) if routing else [],
+            "suggested_action": routing.get("suggested_action") if routing else None,
+            "status": status,
+            "reason": reason,
+            "destination": destination,
+            "suggested_domain": suggestion["domain"],
+            "suggested_section": suggestion["section"] or None,
+        }
+        buckets[bucket].append(record)
+        return record
 
     for entry in entries:
         if _is_index_entry(entry, config):
             kept.append(entry)
             continue
 
-        # This is a bloat entry — migrate to L1
+        # This is a bloat entry — candidate for migration to L1
         suggestion = _suggest_migration(entry, domain_rules=domain_rules, config=config)
+
+        decision = _entry_routing(config, entry, suggestion.get("section"))
+        routing = _routing_fields(decision)
+        surface = routing["surface"] if routing else None
+        if routing:
+            by_surface[surface] = by_surface.get(surface, 0) + 1
+            owner = routing["ownership"]
+            by_ownership[owner] = by_ownership.get(owner, 0) + 1
+
+        # --- enforce: L1 takes only what the router called L1 knowledge ----
+        # The source entry is deliberately left in agent memory: a blocked
+        # entry has nowhere else to go yet, and dropping it would be data loss.
+        if enforce and surface != _L1_SURFACE:
+            reason = (
+                routing["reason"]
+                if routing
+                else (
+                    "routing classification unavailable — enforce mode will not "
+                    "inject an unclassified entry into L1"
+                )
+            )
+            _record(
+                entry,
+                suggestion,
+                routing,
+                bucket=_candidate_bucket(surface),
+                status="blocked_from_l1",
+                reason=reason,
+            )
+            routing_advisory.append({
+                "entry_preview": _preview(entry),
+                "suggested_domain": suggestion["domain"],
+                "routed_surface": surface,
+                "ownership": routing["ownership"] if routing else None,
+                "score": routing["score"] if routing else None,
+                "reason": reason,
+                "status": "blocked_from_l1",
+                "note": (
+                    "NOT migrated — routing mode is 'enforce', so only "
+                    "l1_knowledge reaches L1. The entry was left in agent "
+                    "memory; place it on its own surface and re-run"
+                ),
+            })
+            kept.append(entry)
+            continue
 
         # v3.2.1 (Bug 2): the framework could not derive a trustworthy heading
         # for this entry. Previously it fabricated one from the body's first 40
@@ -395,36 +584,53 @@ def compact_memory(
                 ),
                 "needs_title": True,
                 "suggested_domain": suggestion["domain"],
+                "routing": routing,
             })
+            _record(
+                entry,
+                suggestion,
+                routing,
+                bucket="l1_candidates",
+                status="refused_needs_title",
+                reason="cannot derive a section heading; naming is the agent's job",
+            )
             kept.append(entry)  # leave the original untouched
             continue
 
-        # Classified only once the entry is actually going to move, so the
-        # advisory list describes migrations that happened, not ones refused
-        # for an unrelated reason.
-        routing = _entry_routing(config, entry, suggestion.get("section"))
-        if routing and routing.get("surface") != "l1_knowledge":
+        if routing and surface != _L1_SURFACE:
             routing_advisory.append({
-                "entry_preview": entry[:80] + ("..." if len(entry) > 80 else ""),
+                "entry_preview": _preview(entry),
                 "suggested_domain": suggestion["domain"],
-                "routed_surface": routing["surface"],
+                "routed_surface": surface,
                 "ownership": routing["ownership"],
                 "score": routing["score"],
                 "reason": routing["reason"],
+                "status": "migrated",
                 "note": (
-                    "migrated to L1 anyway — this pass is advisory; routing "
-                    "classification does not yet gate the compact migration"
+                    "migrated to L1 anyway — this pass is advisory; set routing "
+                    "mode 'enforce' (or pass routing_mode='enforce') to keep "
+                    "non-L1 surfaces out of L1"
                 ),
             })
 
+        destination = f"knowledge/{suggestion['domain']}.md#{suggestion['section']}"
+
         if dry_run:
             migrated.append({
-                "entry_preview": entry[:80] + ("..." if len(entry) > 80 else ""),
+                "entry_preview": _preview(entry),
                 "domain": suggestion["domain"],
                 "section": suggestion["section"],
                 "l0_pointer": suggestion["l0_pointer"],
                 "routing": routing,
             })
+            _record(
+                entry,
+                suggestion,
+                routing,
+                bucket="l1_candidates",
+                status="planned",
+                destination=destination,
+            )
             # In dry run, still generate the pointer
             kept.append(suggestion["l0_pointer"])
         else:
@@ -439,25 +645,50 @@ def compact_memory(
                 )
                 if result.get("success"):
                     migrated.append({
-                        "entry_preview": entry[:80] + ("..." if len(entry) > 80 else ""),
+                        "entry_preview": _preview(entry),
                         "domain": suggestion["domain"],
                         "section": suggestion["section"],
                         "l0_pointer": suggestion["l0_pointer"],
                         "l1_action": result.get("action"),
                         "routing": routing,
                     })
+                    _record(
+                        entry,
+                        suggestion,
+                        routing,
+                        bucket="l1_candidates",
+                        status="migrated",
+                        destination=destination,
+                    )
                     kept.append(suggestion["l0_pointer"])
                 else:
+                    error = result.get("error", "Unknown error")
                     errors.append({
                         "entry_preview": entry[:80],
-                        "error": result.get("error", "Unknown error"),
+                        "error": error,
                     })
+                    _record(
+                        entry,
+                        suggestion,
+                        routing,
+                        bucket="l1_candidates",
+                        status="error",
+                        reason=error,
+                    )
                     kept.append(entry)  # Keep the original on error
             except Exception as e:
                 errors.append({
                     "entry_preview": entry[:80],
                     "error": str(e),
                 })
+                _record(
+                    entry,
+                    suggestion,
+                    routing,
+                    bucket="l1_candidates",
+                    status="error",
+                    reason=str(e),
+                )
                 kept.append(entry)
 
     # Build cleaned memory content
@@ -465,17 +696,57 @@ def compact_memory(
     if kept:
         cleaned_content += "\n"
 
+    blocked = sum(
+        1
+        for records in buckets.values()
+        for r in records
+        if r["status"] == "blocked_from_l1"
+    )
+    if enforce and blocked:
+        routing_notes.append(
+            f"{blocked} entr{'y' if blocked == 1 else 'ies'} were blocked from L1 "
+            "and left in agent memory. Nothing was written outside L1: TODO "
+            "candidates are reported, not created, and agent-owned surfaces "
+            "(skill / user_profile / agent_other) stay with the agent unless an "
+            "agent_extensions adapter is configured and invoked explicitly."
+        )
+
     result = {
         "success": True,
         "dry_run": dry_run,
         "migrated_count": len(migrated),
-        "kept_count": len(kept) - len(migrated),  # Original index entries kept
+        # Entries left in agent memory that are not freshly generated pointers:
+        # original index entries, plus anything refused or (in enforce mode)
+        # blocked from L1.
+        "kept_count": len(kept) - len(migrated),
         "error_count": len(errors),
         "migrated": migrated,
         "errors": errors,
-        # Entries the router would NOT have sent to L1. Advisory: they were
-        # migrated anyway (see _entry_routing).
+        # Entries the router would NOT have sent to L1. In advisory mode they
+        # were migrated anyway; in enforce mode they were blocked.
         "routing_advisory": routing_advisory,
+        "routing_mode": mode,
+        "routing_enabled": routing_enabled,
+        "routing_summary": {
+            "mode": mode,
+            "enabled": routing_enabled,
+            "classified": sum(by_surface.values()),
+            "by_surface": by_surface,
+            "by_ownership": by_ownership,
+            # Written to L1 in this pass (always 0 on a dry run).
+            "l1_injected": sum(
+                1 for r in buckets["l1_candidates"] if r["status"] == "migrated"
+            ),
+            # Accepted for L1, including a dry run's plan.
+            "l1_planned": sum(
+                1
+                for r in buckets["l1_candidates"]
+                if r["status"] in ("migrated", "planned")
+            ),
+            "blocked_from_l1": blocked,
+        },
+        "routing_notes": routing_notes,
+        **buckets,
         "cleaned_memory": cleaned_content,
         "stats": {
             "before_entries": len(entries),
@@ -1027,6 +1298,12 @@ def auto_maintain_after_write(
                 "reason": reason,
                 "migrated_count": compact_result.get("migrated_count", 0),
                 "after_chars": compact_result.get("stats", {}).get("after_chars"),
+                # Under routing mode 'enforce' non-L1 entries stay in agent
+                # memory, so a non-zero count here explains why memory did not
+                # shrink as much as migrated_count suggests.
+                "blocked_from_l1": compact_result.get("routing_summary", {}).get(
+                    "blocked_from_l1", 0
+                ),
             }
         else:
             report["compact"] = {"triggered": False}
