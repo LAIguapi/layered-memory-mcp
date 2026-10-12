@@ -13,8 +13,8 @@ import sys
 from pathlib import Path
 
 
-def test_plugin_files_in_package():
-    """Test that plugin files exist in the installed package."""
+def check_plugin_files_in_package():
+    """Check that plugin files exist in the installed package."""
     import layered_memory_mcp
     
     pkg_dir = Path(layered_memory_mcp.__file__).parent
@@ -35,8 +35,13 @@ def test_plugin_files_in_package():
     return True
 
 
-def test_manifest_valid():
-    """Test that manifest.json is valid."""
+def test_plugin_files_in_package():
+    """Pytest wrapper for plugin file presence."""
+    assert check_plugin_files_in_package()
+
+
+def check_manifest_valid():
+    """Check that manifest.json is valid."""
     import layered_memory_mcp
     
     pkg_dir = Path(layered_memory_mcp.__file__).parent
@@ -55,8 +60,13 @@ def test_manifest_valid():
     return True
 
 
-def test_deploy_function():
-    """Test deploy function works."""
+def test_manifest_valid():
+    """Pytest wrapper for manifest validation."""
+    assert check_manifest_valid()
+
+
+def check_deploy_function():
+    """Check deploy function works."""
     from layered_memory_mcp.dashboard_plugin import (
         deploy_dashboard_plugin,
         check_dashboard_plugin_status,
@@ -79,8 +89,13 @@ def test_deploy_function():
     return True
 
 
-def test_backend_imports():
-    """Test that backend API imports work."""
+def test_deploy_function():
+    """Pytest wrapper for deployment status checks."""
+    assert check_deploy_function()
+
+
+def check_backend_imports():
+    """Check that backend API imports work."""
     try:
         from layered_memory_mcp.dashboard_plugin.plugin_api import router
         print(f"✓ plugin_api.router imported successfully")
@@ -103,16 +118,21 @@ def test_backend_imports():
         return True  # Not a failure — this is expected in some environments
 
 
+def test_backend_imports():
+    """Pytest wrapper for backend import checks."""
+    assert check_backend_imports()
+
+
 def main():
     print("=" * 60)
     print("Layered Memory Dashboard Plugin — Self-Test")
     print("=" * 60)
     
     tests = [
-        ("Plugin files in package", test_plugin_files_in_package),
-        ("Manifest valid JSON", test_manifest_valid),
-        ("Deploy function", test_deploy_function),
-        ("Backend imports", test_backend_imports),
+        ("Plugin files in package", check_plugin_files_in_package),
+        ("Manifest valid JSON", check_manifest_valid),
+        ("Deploy function", check_deploy_function),
+        ("Backend imports", check_backend_imports),
     ]
     
     passed = 0
