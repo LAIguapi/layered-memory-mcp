@@ -301,6 +301,31 @@ def detect_memory_bloat(
     return result
 
 
+def _entry_routing(config: "MemoryConfig", entry: str, section: str | None) -> dict | None:
+    """Classify one memory entry before it is migrated. Advisory; never raises.
+
+    "Not an L0 pointer" is not the same as "durable L1 knowledge", but this
+    migration has always treated the two as identical: every non-index entry
+    goes to L1. That is a long-term pollution source — a runbook, a standing
+    user preference or a one-off trace in the agent's memory file all end up as
+    L1 knowledge. Until the enforce path exists, each migrated entry at least
+    carries the router's opinion, so the operator can see what was misfiled.
+    """
+    try:
+        from .routing import classify_memory_item, routing_settings
+
+        enabled, _mode = routing_settings(config)
+        if not enabled:
+            return None
+        decision = classify_memory_item(
+            entry, config=config, section=section, domain=None
+        )
+        return decision.advisory_summary()
+    except Exception as e:  # noqa: BLE001 — advisory only
+        logger.warning("routing advisory failed during compact (non-critical): %s", e)
+        return None
+
+
 def compact_memory(
     config: "MemoryConfig",
     memory_path: str | Path | None = None,
@@ -313,8 +338,15 @@ def compact_memory(
 
     For each non-index entry:
       1. Determine the best L1 domain/section
-      2. Write the content to L1 via inject_knowledge
-      3. Generate an L0 pointer for it
+      2. Classify it with the persistence router (advisory — see
+         ``_entry_routing``; the migration itself is unchanged)
+      3. Write the content to L1 via inject_knowledge
+      4. Generate an L0 pointer for it
+
+    Step 2 is why the report carries ``routing_advisory``: the "non-index → L1"
+    rule is a structural assumption, not a classification, and the entries it
+    gets wrong are the ones that need a human. Changing what the migration
+    *does* is deliberately out of scope here.
 
     Returns a report of migrated entries and the cleaned memory content.
     The agent should then write the cleaned content back to its memory.
@@ -338,6 +370,7 @@ def compact_memory(
     migrated = []
     kept = []
     errors = []
+    routing_advisory = []
 
     for entry in entries:
         if _is_index_entry(entry, config):
@@ -366,12 +399,31 @@ def compact_memory(
             kept.append(entry)  # leave the original untouched
             continue
 
+        # Classified only once the entry is actually going to move, so the
+        # advisory list describes migrations that happened, not ones refused
+        # for an unrelated reason.
+        routing = _entry_routing(config, entry, suggestion.get("section"))
+        if routing and routing.get("surface") != "l1_knowledge":
+            routing_advisory.append({
+                "entry_preview": entry[:80] + ("..." if len(entry) > 80 else ""),
+                "suggested_domain": suggestion["domain"],
+                "routed_surface": routing["surface"],
+                "ownership": routing["ownership"],
+                "score": routing["score"],
+                "reason": routing["reason"],
+                "note": (
+                    "migrated to L1 anyway — this pass is advisory; routing "
+                    "classification does not yet gate the compact migration"
+                ),
+            })
+
         if dry_run:
             migrated.append({
                 "entry_preview": entry[:80] + ("..." if len(entry) > 80 else ""),
                 "domain": suggestion["domain"],
                 "section": suggestion["section"],
                 "l0_pointer": suggestion["l0_pointer"],
+                "routing": routing,
             })
             # In dry run, still generate the pointer
             kept.append(suggestion["l0_pointer"])
@@ -392,6 +444,7 @@ def compact_memory(
                         "section": suggestion["section"],
                         "l0_pointer": suggestion["l0_pointer"],
                         "l1_action": result.get("action"),
+                        "routing": routing,
                     })
                     kept.append(suggestion["l0_pointer"])
                 else:
@@ -420,6 +473,9 @@ def compact_memory(
         "error_count": len(errors),
         "migrated": migrated,
         "errors": errors,
+        # Entries the router would NOT have sent to L1. Advisory: they were
+        # migrated anyway (see _entry_routing).
+        "routing_advisory": routing_advisory,
         "cleaned_memory": cleaned_content,
         "stats": {
             "before_entries": len(entries),

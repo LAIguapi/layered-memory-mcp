@@ -1,8 +1,12 @@
 """
 Layered Memory MCP Server — FastMCP 2.0 Implementation.
 
-A 4-tier knowledge architecture MCP server that extends AI agent memory
-beyond token limits. Works with any MCP-compatible agent (Hermes, Claude, etc.).
+A common-core knowledge MCP server that extends AI agent memory beyond token
+limits. Works with any MCP-compatible agent (Hermes, Claude, etc.).
+
+The framework owns L0 index / L1 knowledge / TODO / memory changelog. Skills,
+the user profile and other agent-owned content are classified and suggested,
+never written by default.
 
 v0.5.0 — adds smart injection (inject_knowledge), L0 index sync tools,
          auto-sync on write, and knowledge health validation.
@@ -42,6 +46,10 @@ from .injector import inject_knowledge, sync_to_vector_store, remove_from_vector
 from .promotion import scan_split_candidates, scan_cross_domain_duplicates
 from .backups import backup_knowledge_file
 from .governance import post_write_governance, build_validation_extras
+from .routing import (
+    classify_memory_item as _classify_memory_item,
+    surface_capabilities as _surface_capabilities,
+)
 from .cleanup import plan_knowledge_cleanup, apply_safe_knowledge_cleanup
 from .agent_integrator import (
     detect_agent_type,
@@ -1196,7 +1204,12 @@ async def batch_inject_knowledge_tool(
         agent_id: Optional agent identifier for provenance tracking.
 
     Returns:
-        JSON with per-item results, total counts, and any errors.
+        JSON with per-item results, total counts, and any errors. Each item
+        carries the same `routing` advisory as a single inject (plus
+        `routing_warning` when the router would have sent it to another
+        surface), and a `deferred_fusion` item carries its full handshake
+        (`needs_fusion`, `expected_hash`, `fusion`) — batching is a convenience,
+        never a way to skip the contracts a single write has to honour.
     """
     config = _get_config()
 
@@ -1245,7 +1258,7 @@ async def batch_inject_knowledge_tool(
                 mode=mode,
                 agent_id=agent_id,
             )
-            results.append({
+            item_result = {
                 "index": idx,
                 "success": result.get("success", False),
                 "domain": domain,
@@ -1254,7 +1267,19 @@ async def batch_inject_knowledge_tool(
                 "dedup": result.get("dedup"),
                 "l0_synced": result.get("l0_synced"),
                 "error": result.get("error"),
-            })
+                "routing": result.get("routing"),
+            }
+            if result.get("routing_warning"):
+                item_result["routing_warning"] = result["routing_warning"]
+            # A batched deferred_fusion is still a two-step handshake. Dropping
+            # the contract here would make the batch path the one place where an
+            # update can be silently lost, so carry it through verbatim.
+            if result.get("action") == "deferred_fusion":
+                item_result["needs_fusion"] = result.get("needs_fusion", True)
+                item_result["expected_hash"] = result.get("expected_hash")
+                item_result["fusion"] = result.get("fusion")
+                item_result["reason"] = result.get("reason")
+            results.append(item_result)
             if result.get("success"):
                 success_count += 1
             else:
@@ -1276,6 +1301,112 @@ async def batch_inject_knowledge_tool(
         "error_count": error_count,
         "results": results,
     }, ensure_ascii=False, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# MCP Tools — Persistence routing (read-only: classify and reflect, never write)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def classify_memory_item(
+    content: str,
+    domain: str | None = None,
+    section: str | None = None,
+    supported_surfaces: str | None = None,
+    agent_type: str | None = None,
+    mode: str | None = None,
+) -> str:
+    """Decide which memory surface a candidate item belongs to. READ-ONLY.
+
+    Call this BEFORE persisting something you are unsure about. It writes
+    nothing, reads no store, and makes no model call — the decision comes from
+    deterministic marker + structure rules, so `score` is a rule-weight sum, not
+    a probability.
+
+    Surfaces it can return:
+      - framework-owned common core — `l1_knowledge` (durable facts, decisions,
+        architecture, current understanding), `todo` (pending / blocked / needs
+        validation), `l0_index`, `memory_changelog` (provenance of L0/L1
+        changes only);
+      - agent-owned extension recommendation — `skill` (repeatable action
+        protocols: steps, commands, checklists, runbooks), `user_profile`
+        (standing global user preferences), `agent_other`. By default the
+        framework only RECOMMENDS these: `framework_can_apply` is false and
+        `suggested_action` is for YOU to apply. Enabling `agent_extensions` with
+        a handler flips `framework_can_apply`; ownership stays `agent`;
+      - no durable write — `undecided`, `ephemeral` (one-off output, raw traces).
+
+    Args:
+        content: the candidate item's text.
+        domain: optional target domain, echoed as context.
+        section: optional target heading. Scanned for markers along with the
+            content (a heading is part of the item), never for structure.
+        supported_surfaces: comma-separated surfaces you can actually honour
+            (e.g. "l1_knowledge,todo"). When the decided surface is not among
+            them, no `suggested_action` is produced — an action pointed at a
+            surface you cannot write is worse than none.
+        agent_type: echo/statistics only. It is returned under `echo` and has NO
+            effect on the classification.
+        mode: optional per-call override, "advisory" (default) or "enforce".
+            Reported only; this tool never mutates anything either way.
+
+    Returns:
+        The serialized RoutingDecision, plus an `echo` object carrying the
+        inputs that do not affect the decision.
+    """
+    config = _get_config()
+    surfaces = (
+        [s.strip() for s in supported_surfaces.split(",") if s.strip()]
+        if supported_surfaces
+        else None
+    )
+    decision = await asyncio.to_thread(
+        _classify_memory_item,
+        content,
+        config=config,
+        domain=domain,
+        section=section,
+        supported_surfaces=surfaces,
+        mode=mode,
+    )
+    payload = decision.to_dict()
+    payload["echo"] = {
+        "agent_type": agent_type,
+        "domain": domain,
+        "section": section,
+        "supported_surfaces": surfaces,
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def get_memory_surface_capabilities() -> str:
+    """Report what the framework may write, and what it can only suggest. READ-ONLY.
+
+    Use this to find out, under the CURRENT configuration, whether to hand an
+    item to the framework or to apply it yourself:
+
+      - `core_surfaces` — framework-owned (`l0_index`, `l1_knowledge`, `todo`,
+        `memory_changelog`): `can_apply` is true, write them through the
+        framework's own tools.
+      - `extension_surfaces` — agent-owned (`skill`, `user_profile`,
+        `agent_other`): `owned_by` is always `agent`. `can_apply` is false by
+        default, meaning the framework classifies and suggests only. It becomes
+        true only when `agent_extensions` is enabled, that surface is enabled,
+        a handler is configured and the mode allows applying — and even then
+        ownership does not move; the framework is just an orchestrator.
+      - `no_write_surfaces` — `undecided` / `ephemeral`: nothing is persisted.
+      - `source_owned_evidence` — raw session data: scanned, never written.
+      - `derived_stores` — L0 index, vector store, search index: rebuildable
+        from the L1 markdown, which is the source of truth.
+
+    Returns:
+        JSON MemorySurfaceCapabilities (schema_version, routing mode,
+        agent_extensions state, and the four surface groups).
+    """
+    config = _get_config()
+    caps = await asyncio.to_thread(_surface_capabilities, config)
+    return json.dumps(caps.to_dict(), ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
@@ -1852,26 +1983,32 @@ def cognitive_decision_prompt() -> str:
     Inject this prompt into the agent's system prompt to enforce disciplined
     memory usage — consult before acting, learn after solving.
     """
-    return """You use a 4-tier layered memory system. Follow this decision tree for EVERY problem or request:
+    return """You use a layered memory system with a framework-owned common core (L0 index, L1 knowledge, TODO, memory changelog) and your own agent-owned surfaces (skills, user profile). Follow this decision tree for EVERY problem or request:
 
 ## Decision Tree (MANDATORY)
 
 1. SCAN: Check your L0 index for domains relevant to the current problem.
 2. IF MATCHED:
-   a. Load the corresponding L1 knowledge file or L2 skill.
+   a. Load the corresponding L1 knowledge file, and your own skill if the task is procedural.
    b. Read and understand it BEFORE taking any action.
    c. If the knowledge fully solves the problem → use it. Do NOT bypass with guessing.
    d. If the knowledge partially helps → use what applies, then enhance/update the entry.
    e. If the knowledge is outdated or insufficient → treat as a new problem (step 3).
 3. IF NO MATCH: Treat as a new problem. Solve with standard tools and reasoning.
-4. AFTER SOLVING: Evaluate — is this worth preserving for future sessions?
-   a. If yes → write to L1 (facts/conventions) or create a skill (procedures/workflows).
-   b. If no → done.
+4. AFTER SOLVING: Evaluate — is this worth preserving for future sessions? If so, route it:
+   a. Durable facts, decisions, architecture, current understanding → L1 via inject_knowledge.
+   b. Unfinished work (pending, blocked, needs validation) → the TODO store, never L1.
+   c. Repeatable procedures, command sequences, checklists → YOUR skill surface.
+   d. Standing global user preferences → YOUR profile surface, after confirming with the user.
+   e. One-off output and raw traces → nothing. Let them go.
+   f. Unsure? Call classify_memory_item — it is read-only and answers exactly this.
 
 ## Key Principles
 
 - NEVER guess when you have relevant knowledge stored. Load it first.
-- The L0 index is a map, not the territory. You must load L1/L2 to actually use the knowledge.
+- The L0 index is a map, not the territory. You must load L1 to actually use the knowledge.
+- The framework owns the common core; skills and the user profile stay yours. It classifies and
+  suggests for those, and only applies them if the user has explicitly opted in.
 - Every solved problem is a candidate for memory improvement. Be proactive about capturing insights.
 - When you discover gaps in existing knowledge, update it immediately — don't wait to be asked."""
 
@@ -1888,12 +2025,20 @@ async def compact_memory(dry_run: bool = True) -> str:
     classifies them by domain, and either reports (dry_run) or automatically
     migrates them to appropriate L1 files.
 
+    Note the structural assumption: "not an L0 pointer" is treated as "belongs
+    in L1". That is not a classification, so each migrated entry now carries a
+    `routing` block, and `routing_advisory` lists the entries the persistence
+    router would have sent elsewhere (a runbook, a standing preference, a raw
+    trace). They are still migrated — this is advisory in this version — but you
+    can see what was misfiled and move it afterwards.
+
     Args:
         dry_run: If True (default), only report what would be migrated.
                  If False, perform the migration and clean up memory.
 
     Returns:
-        JSON with migration plan or execution report.
+        JSON with migration plan or execution report, including
+        `routing_advisory`.
     """
     config = _get_config()
     from .memory_compactor import compact_memory as _compact
@@ -2011,10 +2156,17 @@ async def init_framework() -> str:
                 "2. The system will automatically create the L1 file and update the L0 index.\n"
                 "3. Use `recall_knowledge(keyword='...')` to search your knowledge base.\n\n"
                 "## Architecture\n"
-                "- **L0**: Short index pointers (loaded every session)\n"
-                "- **L1**: Detailed knowledge files (loaded on demand)\n"
-                "- **L2**: Agent skills and procedures\n"
-                "- **L3**: Raw session data\n"
+                "Framework-owned common core:\n"
+                "- **L0 index**: short pointers to what exists (loaded every session)\n"
+                "- **L1 knowledge**: durable facts, decisions, current state (loaded on demand)\n"
+                "- **TODO**: unfinished state — pending, blocked, needs validation\n"
+                "- **Memory changelog**: provenance of L0/L1 changes\n\n"
+                "Agent-owned extension surfaces (the framework classifies and suggests, "
+                "and only writes them if you opt in via `agent_extensions`):\n"
+                "- **Skills**: repeatable procedures and runbooks\n"
+                "- **User profile**: standing global preferences\n\n"
+                "Source-owned evidence:\n"
+                "- **Raw sessions**: scanned and searched, never written\n"
             )
             welcome_path = config.knowledge_dir / "getting-started.md"
             welcome_path.write_text(welcome_content, encoding="utf-8")

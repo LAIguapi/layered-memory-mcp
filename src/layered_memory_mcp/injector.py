@@ -574,7 +574,126 @@ def _persist_calibration(config, report: dict) -> None:
         logger.debug("Could not persist calibration: %s", e)
 
 
+def _routing_advisory(
+    config: "MemoryConfig",
+    result: dict,
+    domain: str,
+    section: str,
+    content: str,
+) -> dict:
+    """Attach the persistence router's opinion to a write result. Advisory only.
+
+    ``inject_knowledge`` writes L1 — that is its contract. The router exists
+    because callers also aim procedures, standing user preferences and raw
+    traces at it, and L1 silently absorbing those is how a knowledge base turns
+    into a junk drawer. So every result carries the classification, and a write
+    the router would have sent elsewhere also carries ``routing_warning``.
+
+    What this must NOT do, and does not do:
+      - change ``action`` / ``success`` / any existing field;
+      - block, redirect or drop a write (even in ``enforce`` mode — no write
+        path acts on routing yet, and the decision says so);
+      - raise. A failure here is logged and the result is returned untouched.
+    """
+    if not isinstance(result, dict):
+        return result
+    # Pure input-validation failures (empty content, bad filename) have nothing
+    # to classify; leave their minimal error shape alone.
+    if not result.get("success") and not result.get("action"):
+        return result
+    try:
+        from .routing import MemorySurface, classify_memory_item, routing_settings
+
+        enabled, mode = routing_settings(config)
+        if not enabled:
+            return result
+        decision = classify_memory_item(
+            content, config=config, domain=domain, section=section
+        )
+        result["routing"] = decision.advisory_summary()
+        if decision.surface not in (
+            MemorySurface.L1_KNOWLEDGE,
+            MemorySurface.L0_INDEX,
+        ):
+            hint = {
+                MemorySurface.TODO: (
+                    "this reads as unfinished state — add_todo keeps it out of "
+                    "durable L1"
+                ),
+                MemorySurface.SKILL: (
+                    "this reads as a repeatable action protocol — the SKILL "
+                    "surface is agent-owned; L1 keeps the facts and rules"
+                ),
+                MemorySurface.USER_PROFILE: (
+                    "this reads as a standing global user preference — the "
+                    "profile surface is agent-owned and usually needs the user's "
+                    "confirmation"
+                ),
+                MemorySurface.AGENT_OTHER: (
+                    "this reads as agent-owned memory content the framework will "
+                    "not classify further"
+                ),
+                MemorySurface.EPHEMERAL: (
+                    "this reads as one-off/raw output — durable L1 is for what "
+                    "still holds later"
+                ),
+                MemorySurface.UNDECIDED: (
+                    "not enough signal to say this belongs in durable L1 — check "
+                    "the target domain/section"
+                ),
+            }.get(decision.surface, "")
+            result["routing_warning"] = (
+                f"routing suggests surface '{decision.surface.value}' "
+                f"(owned by {decision.ownership.value}, score {decision.score}), "
+                f"not L1 knowledge: {hint}. The write was NOT changed — routing "
+                f"mode is '{mode}' and advisory"
+                + (
+                    "; 'enforce' is not yet acted on by the write path"
+                    if mode == "enforce"
+                    else ""
+                )
+                + "."
+            )
+    except Exception as e:  # noqa: BLE001 — advisory layer must never break a write
+        logger.warning("routing advisory failed (non-critical): %s", e)
+        result["routing_error"] = str(e)
+    return result
+
+
 def inject_knowledge(
+    config: "MemoryConfig",
+    domain: str,
+    section: str,
+    content: str,
+    mode: str = "upsert",
+    agent_id: str | None = None,
+    fuse: bool = False,
+    expected_hash: str | None = None,
+) -> dict:
+    """Smart knowledge injection — the primary write entry point.
+
+    Thin wrapper over :func:`_inject_knowledge_core` that attaches the
+    persistence router's advisory classification (see :func:`_routing_advisory`)
+    to **every** return path, including the ``deferred_fusion`` /
+    ``fuse_conflict`` / family-gate handshakes, without altering any of them.
+    See the core function for the full write contract.
+    """
+    result = _inject_knowledge_core(
+        config=config,
+        domain=domain,
+        section=section,
+        content=content,
+        mode=mode,
+        agent_id=agent_id,
+        fuse=fuse,
+        expected_hash=expected_hash,
+    )
+    return _routing_advisory(
+        config, result, domain=domain, section=section, content=content
+    )
+
+
+def _inject_knowledge_core(
     config: "MemoryConfig",
     domain: str,
     section: str,

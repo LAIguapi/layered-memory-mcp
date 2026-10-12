@@ -1,6 +1,6 @@
 # Layered Memory MCP Server
 
-> Extend AI agent memory beyond token limits with a 4-tier knowledge architecture.
+> Extend AI agent memory beyond token limits with a common-core knowledge framework.
 
 [**中文**](README.zh-CN.md) | [**日本語**](README.ja.md) | [**한국어**](README.ko.md)
 
@@ -15,29 +15,40 @@ AI agents have **limited memory** — typically 2-4KB of persistent context inje
 
 ## The Solution
 
-**Layered Memory** organizes knowledge into 4 tiers, trading immediacy for capacity:
+**Layered Memory** owns a small, well-defined **common core** and keeps everything else where it already belongs:
 
 ```
-┌─────────────────────────────────────────────────────┐
-│  L0 — Index Layer (2-4KB, injected every turn)      │
-│  Pure pointers: "what knowledge exists and where"    │
-├─────────────────────────────────────────────────────┤
-│  L1 — Knowledge Files (unlimited, loaded on-demand)  │
-│  Structured markdown: configs, conventions, facts    │
-├─────────────────────────────────────────────────────┤
-│  L2 — Skills Layer (loaded when needed)              │
-│  Procedures, workflows, tool-specific knowledge      │
-├─────────────────────────────────────────────────────┤
-│  L3 — Raw Sessions (searched rarely)                 │
-│  Full conversation history, searchable by keyword    │
-└─────────────────────────────────────────────────────┘
+Raw session / user input / tool result
+        │
+        ▼
+  persistence classifier
+        │
+        ├─ framework-owned common core  ← the framework writes these
+        │    ├─ L0 index          2-4KB, injected every turn: what exists and where
+        │    ├─ L1 knowledge      durable domain cognition: facts, decisions, current state
+        │    ├─ TODO              unfinished state: pending, blocked, needs validation
+        │    └─ memory changelog  provenance of L0/L1 changes
+        │
+        ├─ agent-owned extension surfaces  ← classified and suggested, not written
+        │    ├─ skill             action protocols, runbooks, command sequences
+        │    ├─ user profile      small standing user preferences
+        │    └─ agent other       agent-owned content the framework won't classify further
+        │
+        └─ no durable write
+             └─ undecided / ephemeral (one-off output, raw traces)
 ```
 
-**L0 is your table of contents. L1 is your bookshelf. L2 is your cookbook. L3 is your diary.**
+**L0 is your table of contents. L1 is your bookshelf. TODO is your open-items tray. Raw sessions are your diary — read-only evidence the framework searches but never writes.**
+
+Your skills and your user profile stay yours. The framework recognises them and hands back a structured recommendation; it only writes them if you explicitly [opt in](#opt-in-agent-extensions).
+
+The L0 index, the vector store and the search index are **derived** from the L1 markdown and can be rebuilt at any time.
 
 ## Features
 
 - **Smart Knowledge Injection** — Inject facts with auto-dedup and section merging (upsert/append/merge), auto L0 sync
+- **Persistence Routing** — A deterministic classifier (`classify_memory_item`) says which surface an item belongs to: durable L1, the TODO store, your own skill/profile surface, or nothing at all. Marker + structure rules only; no model call, no embedding. Advisory by default, so it annotates writes without changing them
+- **Capability Reflection** — `get_memory_surface_capabilities` reports, under your current config, what the framework may write and what it can only suggest
 - **Hybrid Search (RRF)** — Combines keyword, fuzzy, BM25, and semantic search with Reciprocal Rank Fusion for robust ranking. Query-type auto-detection optimizes the semantic/keyword balance
 - **Agent-Agnostic L0 Access** — `get_l0_index` tool lets any MCP agent retrieve the memory index
 - **Multi-Agent Namespace** — Isolate knowledge per agent via `LAYERED_MEMORY_NAMESPACE` while sharing common knowledge
@@ -143,10 +154,13 @@ layered-memory-mcp --verbose
 | `LAYERED_MEMORY_L0_FORMAT` | L0 index format: `hermes` or `generic` | `hermes` |
 | `LAYERED_MEMORY_NAMESPACE` | Agent namespace for multi-agent isolation | `shared` |
 | `LAYERED_MEMORY_PROMOTION_WATCH_PATTERNS` | Comma-separated catch-all glob patterns for maintenance scans | built-in English + Chinese list |
+| `LAYERED_MEMORY_ROUTING_ENABLED` | Classify items and annotate write results | `true` |
+| `LAYERED_MEMORY_ROUTING_MODE` | `advisory` or `enforce` | `advisory` |
+| `LAYERED_MEMORY_AGENT_EXTENSIONS_ENABLED` | Let the framework apply agent-surface actions | `false` |
 
 ### config.yaml
 
-You can also set most behavior in `<LAYERED_MEMORY_HOME>/config.yaml`. The precedence is: constructor argument, then environment variable, then config.yaml, then the built-in default. Two of the sections that are relevant to knowledge governance:
+You can also set most behavior in `<LAYERED_MEMORY_HOME>/config.yaml`. The precedence is: constructor argument, then environment variable, then config.yaml, then the built-in default. Sections relevant to knowledge governance and routing:
 
 ```yaml
 governance:
@@ -159,9 +173,46 @@ governance:
 promotion:
   watch_domains: ["misc"]                      # exact catch-all file names (also checked on writes)
   watch_patterns: ["misc", "misc-*", "notes", "inbox", "scratch", "杂项"]  # case-insensitive globs, maintenance/audit scans only
+
+routing:
+  enabled: true
+  mode: advisory                               # advisory | enforce (see below)
+  # Each list EXTENDS the built-in vocabulary, same style as governance:
+  extra_skill_markers: ["cookbook"]
+  extra_todo_markers: ["needs sign-off"]
+  extra_profile_markers: ["addresses me as"]
+  extra_knowledge_markers: ["service contract"]
+  disabled_markers: ["script"]                 # drop a default that is noise for you
 ```
 
+`mode: advisory` is the default and the only mode the write path acts on today: routing reports its opinion alongside the normal result and changes nothing about what a write does. `enforce` is recognised by the schema and reported in the decision, but no write path gates on it yet — a classifier that started rejecting writes on upgrade would be a data-loss event, not a feature.
+
 Omit a key to keep the defaults. If you set `watch_patterns`, your list replaces the built-in pattern list. Set it to `[]` to turn pattern matching off.
+
+### Opt-in agent extensions
+
+Skills, the user profile and other agent-owned content are **suggestion-only by default**: the framework classifies them, hands back an `AgentAction` with your own text plus a structural `shape_hint`, and writes nothing. If you would rather have the framework apply those actions for you, opt in explicitly:
+
+```yaml
+agent_extensions:
+  enabled: false                 # master switch (default false)
+  mode: suggest                  # suggest | apply_with_confirmation | apply
+  adapter: null                  # name of your integration, e.g. generic / command / custom
+  surfaces:
+    skill:
+      enabled: false
+      handler: null              # name of a registered adapter
+    user_profile:
+      enabled: false
+      handler: null
+    agent_other:
+      enabled: false
+      handler: null
+```
+
+All four conditions must hold before the framework will apply anything to a surface: `enabled: true` at the top level, `enabled: true` for that surface, a `handler` naming a registered adapter, and a `mode` other than `suggest`. Anything missing or malformed falls back, key by key, to "classify and suggest". **Opting in does not transfer ownership**: `get_memory_surface_capabilities` keeps reporting `owned_by: agent` for those surfaces and only flips `can_apply`. The framework is an orchestrator there, never the owner.
+
+No adapter ships with the package — `apply_agent_action` refuses with `status: "unsupported"` until an integration registers one (`layered_memory_mcp.adapters`).
 
 ## Usage
 
@@ -259,6 +310,8 @@ For direct file manipulation:
 | `scan_recent_sessions` | Scan recent sessions for knowledge extraction candidates |
 | `search_sessions_by_keyword` | Search session content by keyword |
 | `get_l0_index` | Retrieve the full L0 index (agent-agnostic) |
+| `classify_memory_item` | Route a candidate item to a surface (`l1_knowledge` / `todo` / `skill` / `user_profile` / `agent_other` / `undecided` / `ephemeral`). Read-only, deterministic, no model call |
+| `get_memory_surface_capabilities` | Report which surfaces the framework may write and which it can only suggest, under the current config |
 
 ### Write Tools
 
@@ -304,14 +357,31 @@ These tools are additive. Existing tools keep their parameters and response fiel
 
 ## Architecture Deep Dive
 
-### Why 4 Tiers?
+### The Surface Model
 
-| Tier | Cost | Capacity | Use Case |
-|------|------|----------|----------|
-| L0 (Index) | Tokens per turn | ~2KB | Quick lookup table |
-| L1 (Knowledge) | 1 file read | Unlimited | Structured facts |
-| L2 (Skills) | 1 skill load | Unlimited | Procedures |
-| L3 (Sessions) | Full search | Unlimited | Historical recall |
+| Surface | Owner | Cost | Holds |
+|---------|-------|------|-------|
+| L0 index | framework | Tokens per turn | ~2KB of pointers: what exists and where |
+| L1 knowledge | framework | 1 file read | Durable facts, decisions, boundaries, current understanding |
+| TODO | framework | 1 query | Unfinished state: pending, blocked, needs validation, awaiting a decision |
+| Memory changelog | framework | — | Provenance of semantic L0/L1 changes |
+| Skill | **agent** | 1 skill load | Repeatable procedures, command sequences, checklists, runbooks |
+| User profile | **agent** | injected | Small standing user preferences and persona facts |
+| Agent other | **agent** | — | Agent-owned memory-like content that fits neither |
+| Raw sessions | **source** | Full search | Read-only evidence; scanned and searched, never written |
+
+Two distinctions do the real work here:
+
+- **Owner vs. appliable.** Ownership is fixed: L0/L1/TODO/changelog are the framework's, skill/profile/other are the agent's, raw sessions are the source's. Whether the framework may *apply* a change to an agent-owned surface is a separate, opt-in question — see [Opt-in agent extensions](#opt-in-agent-extensions).
+- **Source of truth vs. derived.** The L1 markdown files are the source of truth. The L0 index, `data/vectors.db` and the search index are derived from them and are rebuildable (`sync_l0_index`, `reindex_vector_store_tool`).
+
+### What the Memory Changelog Is
+
+`MEMORY_CHANGELOG` is the changelog **of your memory**, not of this software. It records semantic mutations of the durable surfaces — an L1 section created, updated, merged, replaced or deleted; a fusion or consolidation write-back; an L0 entry added, removed or renamed when the map actually changed.
+
+It is explicitly *not* the repository `CHANGELOG.md`, not raw session logs, not a generic event log, and not TODO lifecycle history. Derived-data rebuilds (vector reindex, search index) are not recorded either: the semantic content did not change.
+
+This version ships the schema and the inclusion rules (`layered_memory_mcp.memory_changelog`) without a persistent store. The capability output says so rather than implying a backend that does not exist.
 
 ### Write-Once, Fully-Visible Pipeline (v0.5.0)
 
@@ -343,6 +413,14 @@ L1 is for **durable knowledge**, meaning the rules and facts that hold now. Unfi
 | `keep_with_reason` | The section has an explicit `<keep-reason label>: <reason>` line, so its markers are intentional |
 
 Detection is deterministic (regex and string matching, with no model calls) and advisory. The marker vocabulary is data and is configured through `governance:` in config.yaml, so other languages and house styles can be added without code changes.
+
+The same pass also reports **procedure contamination**: sections that read as action protocols rather than durable knowledge. A section is only flagged when action markers **and** procedural structure both match (numbered steps, a checklist, a command sequence, commands in a code block) — an architecture note that merely mentions "验证" or "流程" is knowledge and is left alone. Flagged sections belong on your own skill surface; the framework reports them and moves nothing.
+
+### Advisory Routing on the Write Path
+
+`inject_knowledge` writes L1 — that is its contract, and routing does not change it. What routing adds is visibility: every result carries a `routing` block, and a write the classifier would have sent elsewhere also carries a `routing_warning` saying so. The write still happens, with the same `action` it always had. Batched writes expose the same per-item `routing`, and a batched `deferred_fusion` carries its full handshake (`needs_fusion`, `expected_hash`, `fusion`) — batching is a convenience, never a quieter write path.
+
+`compact_memory` reports the same way. Its migration rule has always been structural ("not an L0 pointer" → L1), which is not a classification; the report now lists, under `routing_advisory`, the entries the classifier would have routed elsewhere. They are still migrated — this release is advisory — but you can see what was misfiled.
 
 ### Derived Data: L0 Index and Vectors
 
@@ -447,7 +525,7 @@ Agent (2KB memory limit)
 
 ## Cognitive Decision Framework
 
-The 4-tier architecture only works if the agent follows a disciplined decision process. This framework should be injected into the agent's system prompt (or loaded via the `cognitive_decision_prompt` MCP prompt) to ensure consistent behavior.
+The surface model only works if the agent follows a disciplined decision process. This framework should be injected into the agent's system prompt (or loaded via the `cognitive_decision_prompt` MCP prompt) to ensure consistent behavior.
 
 ### Decision Tree
 
@@ -457,7 +535,7 @@ Agent encounters a problem or receives a request
   ├─ Step 1: Scan L0 index for relevant domains
   │
   ├─ Step 2: Match found?
-  │   ├─ YES → Load the corresponding L1 knowledge file / L2 skill
+  │   ├─ YES → Load the corresponding L1 knowledge file (and your own skill, if procedural)
   │   │   │
   │   │   ├─ Knowledge solves it → Use it. Do NOT bypass with guessing.
   │   │   ├─ Knowledge partially covers it → Use it, then enhance the entry.
@@ -468,10 +546,13 @@ Agent encounters a problem or receives a request
   ├─ Step 3: Handle as new problem/requirement
   │   Use standard tools and reasoning to solve.
   │
-  └─ Step 4: Post-solution evaluation
-      Is this worth preserving?
-      ├─ YES → Write to L1 (via inject_knowledge) or L2 (skill) for future reuse.
-      └─ NO  → Done.
+  └─ Step 4: Post-solution evaluation — is this worth preserving, and where?
+      ├─ Durable fact / decision / architecture  → L1, via inject_knowledge
+      ├─ Unfinished work (pending, blocked)      → the TODO store, never L1
+      ├─ Repeatable procedure / command sequence → your own skill surface
+      ├─ Standing global user preference         → your own profile, after confirming
+      ├─ One-off output or raw trace             → nothing; let it go
+      └─ Unsure?                                 → classify_memory_item (read-only)
 ```
 
 ### Why This Matters
@@ -488,11 +569,14 @@ The framework turns the memory system from a passive storage into an **active co
 Add this to your agent's system prompt:
 
 ```
-You use a 4-tier layered memory system. Before tackling any problem:
-1. Check L0 index for matching domains
-2. If matched, load and follow L1/L2 before acting
+You use a layered memory system. Before tackling any problem:
+1. Check the L0 index for matching domains
+2. If matched, load and follow the L1 knowledge before acting
 3. If unmatched, solve normally
-4. After solving, use inject_knowledge to preserve new knowledge
+4. After solving, route what is worth keeping: durable facts to L1 via
+   inject_knowledge, unfinished work to the TODO store, procedures and
+   standing user preferences to your own surfaces. Call classify_memory_item
+   if you are unsure.
 ```
 
 Or use the built-in MCP prompt `cognitive_decision_prompt` to get the full decision framework at runtime.

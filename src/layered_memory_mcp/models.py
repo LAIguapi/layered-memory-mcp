@@ -20,14 +20,23 @@ from pydantic import BaseModel, Field, field_validator
 # ---------------------------------------------------------------------------
 
 class KnowledgeType(str, Enum):
-    """Classification of knowledge entries."""
+    """Classification of knowledge entries.
+
+    ``PROCEDURE`` is **legacy and read-only in spirit**. Step-by-step workflows
+    are action protocols, which the surface model puts on the agent-owned SKILL
+    surface rather than in durable L1 (see ``routing.MemorySurface``). The value
+    is kept because knowledge files written before that split carry
+    ``type: procedure`` in their frontmatter, and those files must keep loading;
+    removing it would make existing markdown unreadable. Prefer classifying new
+    procedural content with ``routing.classify_memory_item``.
+    """
 
     CONFIG = "config"           # Environment setup, API keys, paths
     PITFALL = "pitfall"         # Things that went wrong and how fixed
     DECISION = "decision"       # Architectural or design decisions
     PREFERENCE = "preference"   # User preferences, habits
     FACT = "fact"               # Verified factual information
-    PROCEDURE = "procedure"     # Step-by-step workflows
+    PROCEDURE = "procedure"     # LEGACY: step-by-step workflows → SKILL surface
     RELATIONSHIP = "relationship"  # Connections between concepts
 
 

@@ -5,6 +5,85 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **A surface model, and a deterministic router that uses it.** The framework
+  now states what it owns instead of absorbing everything into L1. The
+  framework-owned **common core** is `L0_INDEX`, `L1_KNOWLEDGE`, `TODO` and
+  `MEMORY_CHANGELOG`. Skills, the user profile and other agent-owned content
+  are **agent-owned extension surfaces**: the framework classifies them and
+  returns a structured recommendation, and writes nothing. Raw session data is
+  source-owned, read-only evidence; the L0 index, vector store and search index
+  are derived data.
+- **`classify_memory_item` (read-only MCP tool).** Routes one candidate item to
+  a surface using marker **and** structure rules — no model call, no embedding.
+  The result is a `RoutingDecision` (`schema_version`, `surface`, `ownership`,
+  `score`, `confidence_basis`, `reason`, `signals`, `alternatives`, `warnings`,
+  `mode`, `suggested_action`, plus the capability fields). `score` is a
+  rule-weight sum and is deliberately not called a confidence: nothing here
+  claims semantic certainty. An optional `agent_type` is echoed for statistics
+  and has no effect on the decision; `supported_surfaces` suppresses an action
+  the caller could not honour.
+- **`get_memory_surface_capabilities` (read-only MCP tool).** Reports, under
+  the current config, which surfaces the framework may write and which it can
+  only suggest.
+- **Opt-in agent extensions.** A new `agent_extensions:` config section
+  (default: disabled, `suggest`, no adapter, no per-surface handler) lets an
+  operator have the framework apply extension actions on their behalf. All four
+  conditions — master switch, per-surface switch, a `handler` naming a
+  registered adapter, and a mode other than `suggest` — must hold, and each
+  falls back independently to suggestion-only when missing or malformed.
+  Opting in does **not** move ownership: those surfaces stay `owned_by: agent`
+  and only `can_apply` changes.
+- **`routing:` config section.** `enabled` (default true) and `mode` (default
+  `advisory`), plus marker extensions in the same style as `governance:`
+  (`extra_skill_markers`, `extra_todo_markers`, `extra_profile_markers`,
+  `extra_knowledge_markers`, `disabled_markers`). Also readable from
+  `LAYERED_MEMORY_ROUTING_ENABLED` / `LAYERED_MEMORY_ROUTING_MODE` /
+  `LAYERED_MEMORY_AGENT_EXTENSIONS_ENABLED`.
+- **Adapter interface (`layered_memory_mcp.adapters`).** The protocol, registry
+  and `apply_agent_action` entry point for applying extension actions. The
+  registry ships empty, so `apply_agent_action` refuses with
+  `status: "unsupported"` until an integration registers an adapter. This is
+  the only place product-specific paths may live; the routing core knows none.
+- **`MEMORY_CHANGELOG` schema (`layered_memory_mcp.memory_changelog`).** The
+  provenance record for semantic L0/L1 mutations, with explicit inclusion and
+  exclusion rules (`RECORDABLE_OPERATIONS` / `NOT_RECORDED`). It is not the
+  repository `CHANGELOG.md`, not session logs, not a generic event log, and not
+  TODO lifecycle history. Schema and rules only — there is no persistent store
+  yet, and the capability output says so.
+- **Procedure-contamination governance check.** `post_write_governance` now
+  reports L1 sections that read as action protocols rather than durable
+  knowledge. A section is flagged only when action markers *and* procedural
+  structure both match, so an architecture note that merely mentions "验证" or
+  "流程" is left alone. Advisory; nothing is moved.
+
+### Changed
+
+- **`inject_knowledge` annotates, it does not redirect.** Every result now
+  carries a `routing` block, and a write the router would have sent elsewhere
+  also carries `routing_warning`. Existing fields, actions and handshakes are
+  untouched: advisory mode changes nothing about what a write does. `enforce`
+  is recognised by the schema and reported, but no write path gates on it.
+- **`batch_inject_knowledge_tool` exposes per-item routing** and now propagates
+  the full `deferred_fusion` handshake (`needs_fusion`, `expected_hash`,
+  `fusion`, `reason`) for batched items, so batching cannot be the one path
+  where an update is silently lost.
+- **`compact_memory` reports what it may be misfiling.** Its rule has always
+  been structural ("not an L0 pointer" → L1), which is not a classification.
+  Each migrated entry now carries `routing`, and the report lists, under
+  `routing_advisory`, the entries the router would have sent elsewhere. The
+  migration behaviour itself is unchanged in this release.
+- **Docs corrected.** README (en / zh-CN / ja / ko), the package docstring, the
+  `cognitive_decision_prompt`, and `init_framework`'s welcome text no longer
+  present skills as an "L2" tier beneath L1. They describe the common core, the
+  agent-owned extension surfaces, source-owned raw sessions and derived stores.
+- **`KnowledgeType.PROCEDURE` is documented as legacy.** The value is kept and
+  still parses from existing frontmatter — removing it would make older
+  markdown unreadable — but procedural content belongs on the SKILL surface.
+
 ## [3.4.7] - 2026-10-12
 
 ### Added

@@ -14,6 +14,9 @@ advisory counterpart for those paths:
                                     "状态保留原因：…" / "State retention reason: …".
     The marker lists are data (``DEFAULT_*`` below) and can be extended per
     deployment through the ``governance:`` section of ``config.yaml``.
+  • procedure contamination — a section the persistence router reads as an
+    action protocol (steps/commands/checklist) instead of durable knowledge.
+    Those belong on the agent-owned SKILL surface; see ``routing``.
   • heading families — the same heading skeleton logged twice in one file
     (``## 发布流程 2026-10-01`` / ``## 发布流程 2026-10-12``), the classic
     append-without-merge shape.
@@ -93,18 +96,25 @@ SUGGESTED_ACTION = "move_to_todo_or_rewrite_as_current_rule"
 _PREVIEW_CHARS = 80
 
 
-def _marker_regex(marker: str) -> re.Pattern:
+def compile_marker(marker: str) -> re.Pattern:
     """Compile one marker.
 
     Non-ASCII markers (CJK) are plain substrings. ASCII markers need word
     boundaries — "TODO" yes, "todo_store" / "TODOS" no — and only all-caps
     tags are case-sensitive, so "Next step:" and "next step" both match.
+
+    Public because ``routing`` compiles its own marker vocabulary with exactly
+    these semantics; one implementation keeps the two from drifting.
     """
     if not marker.isascii():
         return re.compile(re.escape(marker))
     body = r"\s+".join(re.escape(w) for w in marker.split())
     flags = 0 if marker.isupper() else re.IGNORECASE
     return re.compile(rf"(?<![A-Za-z0-9_]){body}(?![A-Za-z0-9_])", flags)
+
+
+# Former internal name, kept for back-compat.
+_marker_regex = compile_marker
 
 
 @dataclass(frozen=True)
@@ -373,6 +383,90 @@ def heading_families(text: str) -> list[dict]:
     ]
 
 
+def _iter_sections(text: str) -> list[tuple[str, int, str]]:
+    """``[(heading, 1-based heading line, body), ...]`` for one document.
+
+    Headings inside fenced code blocks are not headings. The preamble before the
+    first heading comes back with an empty heading.
+    """
+    sections: list[tuple[str, int, list[str]]] = [("", 0, [])]
+    in_fence = False
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        stripped = line.strip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            in_fence = not in_fence
+            sections[-1][2].append(line)
+            continue
+        if not in_fence:
+            hm = _SECTION_HEADING_RE.match(stripped)
+            if hm:
+                sections.append((hm.group(2), lineno, []))
+                continue
+        sections[-1][2].append(line)
+    return [(h, n, "\n".join(body)) for h, n, body in sections]
+
+
+# A section must reach this routing score before it is reported as procedure
+# contamination. Advisory either way; the floor keeps the noise down.
+PROCEDURE_CONTAMINATION_SCORE = 0.6
+
+
+def scan_procedure_contamination(
+    config: "MemoryConfig | None",
+    text: str,
+    file_label: str,
+    max_findings: int = 10,
+) -> dict:
+    """Report L1 sections that the router reads as agent-owned action protocols.
+
+    Durable L1 is for the facts and rules that hold; a runbook ("step 1 … step
+    2 …", a command sequence, a checklist) is an *action protocol* and belongs on
+    the agent-owned SKILL surface. This finds sections whose markers **and**
+    structure both say "procedure" — marker-only matches ("验证", "流程" inside an
+    architecture note) are deliberately not reported.
+
+    Advisory only: nothing is moved, and the framework cannot write the SKILL
+    surface unless the operator has opted in through ``agent_extensions``.
+    """
+    from .routing import MemorySurface, classify_memory_item
+
+    domain = domain_of(file_label)
+    findings: list[dict] = []
+    for heading, lineno, body in _iter_sections(text):
+        if not heading or not body.strip():
+            continue
+        decision = classify_memory_item(
+            body, config=config, domain=domain, section=heading
+        )
+        if (
+            decision.surface is not MemorySurface.SKILL
+            or decision.score < PROCEDURE_CONTAMINATION_SCORE
+        ):
+            continue
+        findings.append({
+            "file": file_label,
+            "domain": domain,
+            "heading": heading[:60],
+            "line": lineno,
+            "surface": decision.surface.value,
+            "ownership": decision.ownership.value,
+            "score": decision.score,
+            "confidence_basis": decision.confidence_basis,
+            "signals": [s.name for s in decision.signals if s.kind != "negative"],
+            "suggested_action": "extract_to_agent_skill_surface",
+            "framework_can_apply": decision.framework_can_apply,
+        })
+    findings.sort(key=lambda f: (-f["score"], f["line"]))
+    return {
+        "summary": {
+            "sections_flagged": len(findings),
+            "score_floor": PROCEDURE_CONTAMINATION_SCORE,
+        },
+        "findings": findings[:max_findings],
+        "truncated": len(findings) > max_findings,
+    }
+
+
 def post_write_governance(
     config: "MemoryConfig",
     domain: str,
@@ -397,6 +491,9 @@ def post_write_governance(
         families = heading_families(content)
         size = len(content.encode("utf-8"))
         oversized = size > OVERSIZED_BYTES
+        procedures = scan_procedure_contamination(
+            config, content, label, max_findings=max_findings
+        )
 
         suggestions: list[str] = []
         n_markers = markers["summary"]["state_markers"]
@@ -422,6 +519,13 @@ def post_write_governance(
             suggestions.append(
                 f"file is {size} bytes (> {OVERSIZED_BYTES}) — consolidate or split."
             )
+        n_proc = procedures["summary"]["sections_flagged"]
+        if n_proc:
+            suggestions.append(
+                f"{n_proc} section(s) read as action protocols (steps/commands/"
+                "checklists) rather than durable knowledge — they belong on the "
+                "agent-owned SKILL surface; L1 keeps the facts and rules."
+            )
 
         return {
             "write_kind": write_kind,
@@ -431,6 +535,7 @@ def post_write_governance(
                 "findings": markers["findings"][:max_findings],
                 "lifecycle_findings": markers["lifecycle_findings"][:max_findings],
             },
+            "procedure_contamination": procedures,
             "heading_families": families,
             "size": {
                 "bytes": size,

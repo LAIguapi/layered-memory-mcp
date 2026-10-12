@@ -2,17 +2,26 @@
 Layered Memory MCP Server
 =========================
 
-A 4-tier knowledge architecture that extends AI agent memory beyond token limits.
+A common-core memory framework that extends AI agent memory beyond token limits.
 
-Tiers:
-  L0 -- Index layer (injected every turn, pure pointers)
-  L1 -- Knowledge files (loaded on-demand)
-  L2 -- Skills/procedures (loaded via skill system)
-  L3 -- Raw sessions (searched rarely)
+Framework-owned common core (the framework may write these):
+  L0_INDEX         -- knowledge map, injected every turn, pure pointers
+  L1_KNOWLEDGE     -- durable domain cognition: facts, decisions, current state
+  TODO             -- unfinished state: pending, blocked, needs validation
+  MEMORY_CHANGELOG -- provenance of semantic L0/L1 changes
+
+Agent-owned extension surfaces (classified and suggested, not written by
+default; opt in through ``agent_extensions`` to let the framework apply them):
+  SKILL / USER_PROFILE / AGENT_OTHER
+
+Source-owned evidence:
+  Raw sessions    -- scanned and searched, never written
 
 This MCP server provides tools for:
   - Searching L1 knowledge files by keyword
   - Scanning recent sessions for knowledge candidates
+  - Classifying what belongs where (``classify_memory_item``) and reflecting
+    on what the framework may apply (``get_memory_surface_capabilities``)
   - Memory space statistics and health checks
   - Managing L1 knowledge file CRUD
 """

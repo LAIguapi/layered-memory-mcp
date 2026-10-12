@@ -331,6 +331,64 @@ DEFAULT_PROMOTION_WATCH_PATTERNS = [
 ]
 
 
+#: Agent-owned extension surfaces the optional integration layer can target.
+#: Mirrors ``routing.EXTENSION_SURFACES``; kept as plain strings here so config
+#: loading never imports the router (and never fails because of it).
+AGENT_EXTENSION_SURFACES = ("skill", "user_profile", "agent_other")
+
+AGENT_EXTENSION_MODES = ("suggest", "apply_with_confirmation", "apply")
+
+ROUTING_MODES = ("advisory", "enforce")
+
+
+def _normalize_agent_extensions(raw: object) -> dict:
+    """Normalise the ``agent_extensions`` section to a complete, safe shape.
+
+    Returns ``{enabled, mode, adapter, surfaces: {<surface>: {enabled, handler}}}``.
+
+    Every key falls back independently, and every fallback is the conservative
+    one (disabled / suggest-only / no handler). A half-written or malformed
+    section therefore degrades to "classify and suggest" instead of raising at
+    start-up — and in particular can never *accidentally* grant the framework
+    permission to write a store that belongs to the agent.
+    """
+    out: dict = {
+        "enabled": False,
+        "mode": "suggest",
+        "adapter": None,
+        "surfaces": {s: {"enabled": False, "handler": None} for s in AGENT_EXTENSION_SURFACES},
+    }
+    if not isinstance(raw, dict):
+        return out
+
+    out["enabled"] = _coerce_bool(raw.get("enabled"), False)
+    mode = str(raw.get("mode") or "suggest").strip().lower()
+    out["mode"] = mode if mode in AGENT_EXTENSION_MODES else "suggest"
+    adapter = raw.get("adapter")
+    out["adapter"] = str(adapter).strip() or None if adapter else None
+
+    surfaces = raw.get("surfaces")
+    if isinstance(surfaces, dict):
+        for key, value in surfaces.items():
+            name = str(key).strip().lower()
+            if name not in out["surfaces"]:
+                continue
+            if isinstance(value, dict):
+                handler = value.get("handler")
+                out["surfaces"][name] = {
+                    "enabled": _coerce_bool(value.get("enabled"), False),
+                    "handler": (str(handler).strip() or None) if handler else None,
+                }
+            else:
+                # ``skill: true`` shorthand — enabled, but still no handler, so
+                # the framework still cannot write it.
+                out["surfaces"][name] = {
+                    "enabled": _coerce_bool(value, False),
+                    "handler": None,
+                }
+    return out
+
+
 def _coerce_str_list(value: object) -> list[str]:
     """Coerce a YAML scalar or list into a clean list of strings."""
     if value is None:
@@ -403,6 +461,11 @@ class MemoryConfig:
         governance_resolved_markers: list[str] | None = None,
         governance_keep_reason_labels: list[str] | None = None,
         governance_disabled_markers: list[str] | None = None,
+        # Unreleased — persistence routing + opt-in agent extension execution.
+        # Both take the raw YAML section shape so a caller/test can pass exactly
+        # what config.yaml would hold (see _normalize_agent_extensions).
+        routing: dict | None = None,
+        agent_extensions: dict | None = None,
     ):
         self.home = Path(home) if home else default_home()
         self.knowledge_dir = Path(knowledge_dir) if knowledge_dir else default_knowledge_dir(self.home)
@@ -746,6 +809,80 @@ class MemoryConfig:
         self.governance_disabled_markers: list[str] = _gov(
             governance_disabled_markers, "disabled_markers"
         )
+
+        # Unreleased: Persistence routing (routing.py). The router classifies a
+        # candidate memory item into a surface — framework-owned common core
+        # (L0/L1/TODO/MEMORY_CHANGELOG), an agent-owned extension
+        # recommendation (skill/user_profile/agent_other), or no durable write.
+        #
+        # `mode` defaults to "advisory": the decision is reported alongside
+        # existing results and changes NOTHING about what a write does. That is
+        # the only non-breaking default for an existing knowledge base — a
+        # classifier that started rejecting writes on upgrade would be a data
+        # loss event, not a feature. "enforce" is recognised by the schema and
+        # surfaced in capability reflection; no write path acts on it yet.
+        #
+        # Precedence: constructor → env → `routing:` in config.yaml → default.
+        # Malformed values fall back per key rather than raising: routing is an
+        # advisory layer, and nothing about it justifies a failed start-up.
+        _routing_yaml = routing if isinstance(routing, dict) else _load_yaml_section(
+            self.home, "routing"
+        )
+        _env_routing_enabled = os.environ.get("LAYERED_MEMORY_ROUTING_ENABLED")
+        self.routing_enabled: bool = (
+            _env_bool("LAYERED_MEMORY_ROUTING_ENABLED", True)
+            if _env_routing_enabled is not None
+            else _coerce_bool(_routing_yaml.get("enabled"), True)
+        )
+        _routing_mode = (
+            os.environ.get("LAYERED_MEMORY_ROUTING_MODE")
+            or _routing_yaml.get("mode")
+            or "advisory"
+        )
+        _routing_mode = str(_routing_mode).strip().lower()
+        self.routing_mode: str = (
+            _routing_mode if _routing_mode in ROUTING_MODES else "advisory"
+        )
+        # Marker extensions, in the same style as `governance:`: each list
+        # EXTENDS the shipped vocabulary, `disabled_markers` removes defaults
+        # that are noise for this knowledge base.
+        self.routing_markers: dict[str, list[str]] = {
+            key: _coerce_str_list(_routing_yaml.get(key))
+            for key in (
+                "extra_skill_markers",
+                "extra_todo_markers",
+                "extra_profile_markers",
+                "extra_knowledge_markers",
+                "disabled_markers",
+            )
+        }
+
+        # Unreleased: Opt-in execution for agent-owned extension surfaces.
+        # DEFAULT: disabled / suggest-only / no handler. Skill, user profile and
+        # "agent other" belong to the agent, so the framework classifies them and
+        # returns an AgentAction recommendation; it writes nothing. An operator
+        # who wants full service enables this section and names a handler per
+        # surface, which makes the framework an orchestrator for that surface —
+        # ownership does not move (see routing.surface_capabilities).
+        _ax_yaml = (
+            agent_extensions
+            if isinstance(agent_extensions, dict)
+            else _load_yaml_section(self.home, "agent_extensions")
+        )
+        self.agent_extensions: dict = _normalize_agent_extensions(_ax_yaml)
+        _env_ax_enabled = os.environ.get("LAYERED_MEMORY_AGENT_EXTENSIONS_ENABLED")
+        if _env_ax_enabled is not None:
+            self.agent_extensions["enabled"] = _env_bool(
+                "LAYERED_MEMORY_AGENT_EXTENSIONS_ENABLED", False
+            )
+        _env_ax_mode = os.environ.get("LAYERED_MEMORY_AGENT_EXTENSIONS_MODE")
+        if _env_ax_mode:
+            _m = _env_ax_mode.strip().lower()
+            if _m in AGENT_EXTENSION_MODES:
+                self.agent_extensions["mode"] = _m
+        _env_ax_adapter = os.environ.get("LAYERED_MEMORY_AGENT_EXTENSIONS_ADAPTER")
+        if _env_ax_adapter:
+            self.agent_extensions["adapter"] = _env_ax_adapter.strip() or None
 
         # v2.10.1: Domain classification table for the auto-extractor. The
         # framework ships **no** business presets — domain inference is opt-in.

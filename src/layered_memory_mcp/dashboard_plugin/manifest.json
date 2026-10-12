@@ -1,7 +1,7 @@
 {
   "name": "layered-memory-dashboard",
   "label": "记忆框架",
-  "description": "分层记忆框架可视化面板 — 展示 L0/L1/L2/L3 四层架构、知识生命周期与健康诊断",
+  "description": "分层记忆框架可视化面板 — 展示 L0 索引 / L1 知识 / TODO 等框架公共核心、知识生命周期与健康诊断",
   "icon": "Layers",
   "version": "2.5.0",
   "tab": {
