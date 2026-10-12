@@ -344,7 +344,12 @@ def read_events(
     limit: int | None = None,
     newest_first: bool = True,
 ) -> dict[str, Any]:
-    """Bounded, filtered read of the changelog. Newest-first by default."""
+    """Bounded, filtered read of the changelog. Newest-first by default.
+
+    Carries the store's ``read_truncated`` / ``read_error`` flags: a log above
+    the store's read ceiling comes back with no entries, and the flags are what
+    keep that distinguishable from a log with nothing in it.
+    """
     from .storage.memory_changelog_store import DEFAULT_READ_LIMIT
 
     settings = changelog_settings(config)
@@ -354,6 +359,8 @@ def read_events(
             "enabled": settings["enabled"],
             "path": str(settings["path"]) if settings["path"] else None,
             "exists": False,
+            "read_truncated": False,
+            "read_error": None,
             "total_events": 0,
             "matched": 0,
             "returned": 0,
@@ -395,7 +402,14 @@ def changelog_stats(config: Any | None = None) -> dict[str, Any]:
         "not_recorded": list(NOT_RECORDED),
     }
     if store is None:
-        base.update({"exists": False, "total_events": 0})
+        base.update(
+            {
+                "exists": False,
+                "read_truncated": False,
+                "read_error": None,
+                "total_events": 0,
+            }
+        )
         return base
     base.update(store.stats())
     return base

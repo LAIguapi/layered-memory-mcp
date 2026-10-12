@@ -46,6 +46,7 @@ from layered_memory_mcp.memory_changelog import (
     record,
 )
 from layered_memory_mcp.routing import surface_capabilities
+from layered_memory_mcp.storage import memory_changelog_store as store_mod
 from layered_memory_mcp.storage.memory_changelog_store import (
     MAX_READ_LIMIT,
     MemoryChangelogStore,
@@ -163,6 +164,94 @@ class TestAppendOnlyStore:
         blocker.write_text("not a directory", encoding="utf-8")
         store = MemoryChangelogStore(blocker / "nested" / "log.jsonl")
         assert store.append({"operation": "l1_section_created"}) is False
+
+
+# --- A2. the read ceiling reports itself -------------------------------------
+
+
+class TestOversizedReadIsReported:
+    """An unreadable log must not read like an empty one.
+
+    The store refuses to parse a file above `MAX_READ_BYTES` (a provenance log
+    that big means something is writing non-semantic events into it), and that
+    refusal used to be visible only in a server log line — so
+    `get_memory_changelog` answered `total_events: 0` with no entries, which is
+    exactly what a clean install answers. The ceiling is reached by growth, not
+    only by misuse: `retention_days` is reported but never enforced, so the file
+    only ever gets bigger.
+
+    `MAX_READ_BYTES` is monkeypatched down rather than writing 16 MiB.
+    """
+
+    @pytest.fixture
+    def tiny_ceiling(self, monkeypatch):
+        monkeypatch.setattr(store_mod, "MAX_READ_BYTES", 64)
+        return 64
+
+    def _populated(self, tmp_path: Path) -> MemoryConfig:
+        cfg = _cfg(tmp_path)
+        for section in ("A", "B", "C"):
+            record(cfg, "l1_section_created", "infra", section=section)
+        return cfg
+
+    def test_an_oversized_log_is_distinguishable_from_an_empty_one(
+        self, tmp_path, tiny_ceiling
+    ):
+        big = self._populated(tmp_path / "big")
+        empty = _cfg(tmp_path / "empty")
+
+        over = read_events(big)
+        none = read_events(empty)
+
+        # Both report nothing — that is the whole hazard.
+        assert over["total_events"] == 0 and over["entries"] == []
+        assert none["total_events"] == 0 and none["entries"] == []
+        # ...and the reports are no longer the same answer.
+        assert over["read_truncated"] is True
+        assert over["read_error"] == store_mod.READ_TOO_LARGE
+        assert over["max_read_bytes"] == tiny_ceiling
+        assert over["file_size_bytes"] > tiny_ceiling
+        assert "NOT parsed" in over["read_note"]
+        assert none["read_truncated"] is False
+        assert none["read_error"] is None
+        assert "read_note" not in none
+
+    def test_stats_flag_the_same_condition(self, tmp_path, tiny_ceiling):
+        cfg = self._populated(tmp_path)
+        stats = changelog_stats(cfg)
+        assert stats["read_truncated"] is True
+        assert stats["read_error"] == store_mod.READ_TOO_LARGE
+        assert stats["total_events"] == 0
+        assert stats["by_operation"] == {}
+        # The long-standing size key still agrees with the new one.
+        assert stats["size_bytes"] == stats["file_size_bytes"] > tiny_ceiling
+
+    def test_the_oversized_file_is_neither_parsed_nor_touched(
+        self, tmp_path, tiny_ceiling
+    ):
+        cfg = self._populated(tmp_path)
+        path = _log_path(cfg)
+        before = path.read_bytes()
+
+        assert read_events(cfg)["entries"] == []
+        assert changelog_stats(cfg)["total_events"] == 0
+
+        assert path.read_bytes() == before, "the read path never rewrites the log"
+
+    def test_an_absent_log_reports_a_clean_read(self, tmp_path, tiny_ceiling):
+        status = MemoryChangelogStore(tmp_path / "nope.jsonl").read_status()
+        assert status["read_truncated"] is False
+        assert status["read_error"] is None
+        assert status["file_size_bytes"] == 0
+
+    def test_a_log_under_the_ceiling_still_parses(self, tmp_path, monkeypatch):
+        """Negative control: the flag is about the ceiling, not about reading."""
+        cfg = self._populated(tmp_path)
+        monkeypatch.setattr(store_mod, "MAX_READ_BYTES", 16 * 1024 * 1024)
+        report = read_events(cfg)
+        assert report["total_events"] == 3
+        assert report["read_truncated"] is False
+        assert report["read_error"] is None
 
 
 # --- B. inclusion rules ------------------------------------------------------

@@ -1739,7 +1739,11 @@ async def get_memory_changelog(
 
     Returns:
         JSON: {enabled, path, total_events, matched, returned, limit, order,
-        filters, entries}. `order` is `newest_first`.
+        filters, entries, read_truncated, read_error, max_read_bytes,
+        file_size_bytes}. `order` is `newest_first`. `read_truncated: true`
+        (with `read_error: "memory_changelog_too_large"`) means the log was
+        above the read ceiling and was **not parsed** — the counts describe
+        nothing, so do not read the empty result as "no provenance recorded".
     """
     config = _get_config()
     from .memory_changelog import read_events
@@ -1766,9 +1770,13 @@ async def get_memory_changelog_stats() -> str:
     Returns:
         JSON: {enabled, path, total_events, by_operation, by_surface,
         by_domain (top 10), first_event_at, last_event_at, size_bytes,
-        malformed_lines, retention_days, retention_enforced, retention_note,
+        malformed_lines, read_truncated, read_error, max_read_bytes,
+        file_size_bytes, retention_days, retention_enforced, retention_note,
         recordable_operations, not_recorded}. The log is append-only and this
-        version never prunes it — `retention_days` is reported, not applied.
+        version never prunes it — `retention_days` is reported, not applied, so
+        a long-lived install can reach the read ceiling: `read_truncated: true`
+        means the file was not parsed and every count here is empty for that
+        reason, not because nothing was recorded.
     """
     config = _get_config()
     from .memory_changelog import changelog_stats
@@ -2585,7 +2593,12 @@ async def integrate_agent(action: str = "status") -> str:
     Actions:
       - "status": check current injection status (default)
       - "inject_soul": inject rules into Hermes SOUL.md
-      - "inject_memory": inject awareness snippet into MEMORY.md
+      - "inject_memory": inject awareness snippet into MEMORY.md — only into an
+        explicitly configured (`agent_memory.path`) or explicitly opted-in
+        (`agent_memory.allow_auto_detect_write`) memory file, or one inside the
+        framework's own home. A purely auto-detected file is refused with
+        `agent_memory_write`, like every other framework write into agent
+        memory: detection is not permission
       - "remove_soul": remove the injection block from SOUL.md
       - "install_dashboard": deploy the Dashboard plugin
       - "remove_dashboard": remove the Dashboard plugin
@@ -2632,7 +2645,31 @@ async def integrate_agent(action: str = "status") -> str:
                 return {"success": False, "error": "Memory injection only supported for Hermes Agent."}
             if not agent_info["memory_path"]:
                 return {"success": False, "error": "MEMORY.md not found."}
-            return inject_memory(agent_info["memory_path"])
+            # Detection is not permission (agent_memory_guard): this snippet
+            # goes into a file the framework does not own, auto-detected by a
+            # probe. The user asked for the injection, but "which file" was
+            # still decided by detection — so the same explicit-target rule the
+            # L0 projection follows applies here.
+            from .agent_memory_guard import resolve_write_target
+
+            target = resolve_write_target(
+                config,
+                detected=agent_info["memory_path"],
+                operation="integrate_agent_inject_memory",
+            )
+            if not target.allowed:
+                return {
+                    "success": False,
+                    "action": "skipped",
+                    "error": target.reason or target.trust,
+                    "agent_memory_write": target.as_report("refused"),
+                    "message": (
+                        "Nothing was written: the agent memory file was "
+                        "auto-detected, and this install has no explicit "
+                        "target or opt-in for writing it."
+                    ),
+                }
+            return inject_memory(target.path)
 
         if action == "remove_soul":
             if not agent_info["soul_path"]:

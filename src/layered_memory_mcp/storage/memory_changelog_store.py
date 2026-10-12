@@ -17,6 +17,10 @@ Design principles (same contract as :mod:`.access_log`):
     ``changelog_settings``), so history cannot vanish silently.
   - Reads are bounded (:data:`MAX_READ_LIMIT`) and tolerant: a corrupt line is
     counted and skipped rather than failing the whole read.
+  - A file above :data:`MAX_READ_BYTES` is not parsed at all, and that is
+    *reported* rather than only logged (``read_status``, carried by every
+    ``query`` / ``stats`` result). An oversized log must never read like an
+    empty one.
 """
 
 from __future__ import annotations
@@ -39,6 +43,11 @@ MAX_READ_LIMIT = 500
 #: Above this file size the log is assumed to have been misused as a generic
 #: event log; reads refuse rather than load it into memory.
 MAX_READ_BYTES = 16 * 1024 * 1024
+
+#: ``read_error`` value when :data:`MAX_READ_BYTES` stopped the read. Stable
+#: string: a caller branches on it to tell "nothing recorded" from "recorded
+#: too much to read", which an empty ``entries`` list alone cannot say.
+READ_TOO_LARGE = "memory_changelog_too_large"
 
 
 def _parse_ts(value: Any) -> datetime | None:
@@ -92,21 +101,53 @@ class MemoryChangelogStore:
         except OSError:
             return False
 
+    def read_status(self) -> dict:
+        """Why a read returned what it returned — reported, not just logged.
+
+        Always present in ``query`` / ``stats`` output so "no provenance
+        recorded" and "too much recorded to read" are different answers:
+
+        * ``read_truncated`` — the file was above :data:`MAX_READ_BYTES` and was
+          **not parsed**. ``total_events`` / ``entries`` then describe nothing
+          at all, rather than an empty log.
+        * ``read_error`` — :data:`READ_TOO_LARGE`, or ``None``.
+        * ``max_read_bytes`` / ``file_size_bytes`` — the limit and the file, so
+          the caller can see how far over it is without stat-ing it itself.
+        """
+        try:
+            size = self.path.stat().st_size if self.exists() else 0
+        except OSError:
+            size = 0
+        truncated = size > MAX_READ_BYTES
+        status = {
+            "read_truncated": truncated,
+            "read_error": READ_TOO_LARGE if truncated else None,
+            "max_read_bytes": MAX_READ_BYTES,
+            "file_size_bytes": size,
+        }
+        if truncated:
+            status["read_note"] = (
+                f"memory_changelog is {size} bytes, above the {MAX_READ_BYTES}-byte "
+                "read ceiling, so it was NOT parsed: the counts and entries here "
+                "describe nothing, and an empty result does not mean an empty log. "
+                "A provenance log this size means something is writing "
+                "non-semantic events into it. The file is append-only and "
+                "untouched — archive or split it manually."
+            )
+        return status
+
     def load(self) -> tuple[list[dict], int]:
-        """``(events in append order, malformed line count)``. Never raises."""
+        """``(events in append order, malformed line count)``. Never raises.
+
+        An oversized file reads as ``([], 0)`` — the read is refused rather
+        than loaded into memory, and *this* signature cannot say so. Callers
+        that report to a user must pair it with :meth:`read_status` (``query``
+        and ``stats`` below do); do not "fix" it by raising here, since the read
+        path's contract is never-raises.
+        """
         if not self.exists():
             return [], 0
         try:
-            # TRADEOFF (known gap, left as-is deliberately): returning
-            # ``([], 0)`` makes an oversized changelog indistinguishable from an
-            # empty one to every caller — the only trace is this log line, which
-            # an MCP caller never sees, so `query`/report output reads as "no
-            # provenance recorded". And this branch is reachable over time, not
-            # just under misuse: ``retention_days`` is parsed and reported but
-            # never enforced (see ``memory_changelog.changelog_settings``), so
-            # the file only grows. The fix is to surface a flag/error in the read
-            # result rather than only logging; do not "fix" it by raising here,
-            # since the read path's contract is never-raises.
             if self.path.stat().st_size > MAX_READ_BYTES:
                 logger.warning(
                     "memory_changelog is larger than %d bytes (%s) — refusing to "
@@ -165,6 +206,7 @@ class MemoryChangelogStore:
         return {
             "path": str(self.path),
             "exists": self.exists(),
+            **self.read_status(),
             "total_events": len(events),
             "matched": len(matched),
             "returned": len(ordered[:bounded]),
@@ -197,17 +239,17 @@ class MemoryChangelogStore:
                     bucket[str(value)] = bucket.get(str(value), 0) + 1
 
         ranked = sorted(by_domain.items(), key=lambda kv: (-kv[1], kv[0]))
-        try:
-            size_bytes = self.path.stat().st_size if self.exists() else 0
-        except OSError:
-            size_bytes = 0
+        status = self.read_status()
 
         return {
             "path": str(self.path),
             "exists": self.exists(),
+            **status,
             "total_events": len(events),
             "malformed_lines": malformed,
-            "size_bytes": size_bytes,
+            # Long-standing key, kept: callers assert on it. Same number as
+            # ``file_size_bytes`` from read_status.
+            "size_bytes": status["file_size_bytes"],
             "by_operation": dict(sorted(by_operation.items())),
             "by_surface": dict(sorted(by_surface.items())),
             "by_domain": dict(ranked[: max(1, int(top_domains))]),
@@ -228,5 +270,6 @@ __all__ = [
     "DEFAULT_READ_LIMIT",
     "MAX_READ_BYTES",
     "MAX_READ_LIMIT",
+    "READ_TOO_LARGE",
     "MemoryChangelogStore",
 ]

@@ -1285,10 +1285,14 @@ def classify_memory_item(
             # "insufficient". The warning and the low score are the only markers
             # of that; every downstream gate that inspects ``surface`` alone
             # reads this as a positive L1 classification. Moving
-            # MIN_CHARS_FOR_FALLBACK therefore changes
-            # ``injector._direct_write_gate`` (what a strict direct write
-            # refuses) and ``compact_memory``'s enforce behaviour, not just this
-            # function's output.
+            # MIN_CHARS_FOR_FALLBACK therefore changes ``compact_memory``'s
+            # enforce behaviour (an UNDECIDED entry is held back from L1, an
+            # L1_KNOWLEDGE one is migrated) and which ``routing_warning`` an
+            # explicit write carries, not just this function's output. It no
+            # longer changes what ``injector._direct_write_gate`` refuses: that
+            # gate refuses positive non-L1 classifications only, so UNDECIDED
+            # and this fallback both reach L1 — one annotated as insufficient
+            # evidence, the other as resting on length alone.
             surface = MemorySurface.L1_KNOWLEDGE
             score = min(score, 0.35)
             reason = (
@@ -1558,12 +1562,19 @@ def surface_capabilities(config: Any | None = None) -> MemorySurfaceCapabilities
             note += (
                 ". Direct inject_knowledge writes of non-l1_knowledge content "
                 + (
-                    "are REFUSED (routing.enforce_direct_writes: true); pass "
-                    "routing_override='force_l1' to write anyway"
+                    "are REFUSED (routing.enforce_direct_writes: true) when the "
+                    "classification is positive (skill, user_profile, "
+                    "agent_other, todo, ephemeral); pass "
+                    "routing_override='force_l1' to write anyway. 'undecided' "
+                    "(insufficient evidence) is written with a routing_warning "
+                    "rather than refused"
                     if direct["gate_active"]
                     else "are written with a routing_warning "
                     "(routing.enforce_direct_writes: false)"
                 )
+                + ". The gate covers inject_knowledge / "
+                "batch_inject_knowledge_tool only — create_knowledge_file and "
+                "update_knowledge_file are whole-file tools and are not routed"
             )
         caps.core_surfaces[surface.value] = SurfaceCapability(
             surface=surface,

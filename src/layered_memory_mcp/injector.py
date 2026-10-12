@@ -587,26 +587,42 @@ def _persist_calibration(config, report: dict) -> None:
 #   1. ``_routing_advisory`` — always on (when routing is enabled). It annotates
 #      the result and changes nothing.
 #   2. ``_direct_write_gate`` — off by default. With
-#      ``routing.enforce_direct_writes: true`` an explicit write of
-#      non-L1-classified content is REFUSED before the write, unless the caller
-#      passes ``routing_override="force_l1"``.
+#      ``routing.enforce_direct_writes: true`` an explicit write whose content
+#      classifies as a *positive* non-L1 surface is REFUSED before the write,
+#      unless the caller passes ``routing_override="force_l1"``. Content the
+#      classifier could not place (``undecided``) is written and annotated —
+#      see :data:`_GATE_ALLOWED_SURFACES`.
 #
 # The default is compatibility on purpose: an explicit ``inject_knowledge`` call
 # is a caller naming its own target, and a classifier that starts dropping those
 # on upgrade is a data-loss event, not a feature.
 
 #: The surfaces an L1 write is legitimately *about*. Everything else is what the
-#: advisory layer warns on, and what the strict gate refuses.
-#
-# INVARIANT (deliberate asymmetry — tiny tuple, whole contract): ``undecided`` is
-# NOT a member. The strict gate therefore refuses on *absence of evidence* too,
-# and the refusal depends on length: a short unmarked fact (below
-# ``routing.MIN_CHARS_FOR_FALLBACK``) classifies ``undecided`` and is refused,
-# while longer unmarked prose is admitted as ``l1_knowledge`` through the
-# length-only fallback with score 0.0. Adding ``undecided`` here would flip the
-# contract to "refuse only on positive non-L1 classification" — a real policy
-# change, not a cleanup. Make that choice deliberately and add tests for it.
+#: advisory layer warns on.
 _L1_WRITE_SURFACES: tuple[str, ...] = ("l1_knowledge", "l0_index")
+
+#: "The classifier could not place this item" — not a verdict about where it
+#: belongs. Kept as a name because the two layers treat it differently.
+_UNDECIDED_SURFACE = "undecided"
+
+#: What the strict gate (``routing.enforce_direct_writes``) lets through.
+#
+# POLICY: the gate refuses a *positive non-L1 classification* — ``skill``,
+# ``user_profile``, ``agent_other``, ``todo``, ``ephemeral``, and anything else
+# a future surface adds (this is an allow-list, so a new surface is refused
+# until it is deliberately listed). It does **not** refuse on absence of
+# evidence: ``undecided`` proceeds to the L1 write path and is annotated, with
+# ``routing_enforcement.insufficient_evidence: true`` and a ``routing_warning``
+# saying the classifier found nothing to go on.
+#
+# Why: ``undecided`` is what the classifier returns when no rule matched, so
+# refusing it would make the gate's answer a function of length rather than of
+# content — a short unmarked fact (below ``routing.MIN_CHARS_FOR_FALLBACK``)
+# would be refused while the same fact written out at length would be admitted
+# as ``l1_knowledge`` by the length-only fallback. "No evidence" is not evidence
+# of a misfile, and refusing on it loses data the caller explicitly named a
+# target for. The advisory layer still warns, so the asymmetry is visible.
+_GATE_ALLOWED_SURFACES: tuple[str, ...] = _L1_WRITE_SURFACES + (_UNDECIDED_SURFACE,)
 
 #: Per-surface explanation, keyed by ``MemorySurface`` *value* so this stays a
 #: plain data table and the router is still imported lazily (it is the lower
@@ -701,10 +717,14 @@ def _direct_write_gate(
 ) -> dict:
     """Decide whether this explicit L1 write may proceed. Never raises.
 
-    Returns ``{refused, override, override_applied, decision, enforcement}``:
+    Returns ``{refused, override, override_applied, insufficient_evidence,
+    decision, enforcement}``:
 
-    * ``refused`` — the classification is not an L1 surface and no override was
-      given. The caller must return before writing.
+    * ``refused`` — the content classified as a positive non-L1 surface and no
+      override was given. The caller must return before writing.
+    * ``insufficient_evidence`` — it classified ``undecided``; the write
+      proceeds (see :data:`_GATE_ALLOWED_SURFACES`) and the advisory layer says
+      so.
     * ``decision`` — the ``RoutingDecision``, reused by the advisory layer so a
       write classifies once.
     * ``enforcement`` — the block attached to the result. Present only when the
@@ -719,6 +739,7 @@ def _direct_write_gate(
         "refused": False,
         "override": ROUTING_OVERRIDE_NONE,
         "override_applied": False,
+        "insufficient_evidence": False,
         "decision": None,
         "enforcement": None,
     }
@@ -774,24 +795,45 @@ def _direct_write_gate(
             content, config=config, domain=domain, section=section
         )
         gate["decision"] = decision
-        if decision.surface.value in _L1_WRITE_SURFACES:
-            enforcement["note"] = (
-                f"classified '{decision.surface.value}' — an L1 surface, so the "
-                "strict gate allowed the write"
-            )
+        surface = decision.surface.value
+        if surface in _GATE_ALLOWED_SURFACES:
+            if surface == _UNDECIDED_SURFACE:
+                # Absence of evidence, not a verdict: allowed, and said out loud.
+                gate["insufficient_evidence"] = True
+                enforcement["insufficient_evidence"] = True
+                enforcement["note"] = (
+                    "classified 'undecided': the classifier found insufficient "
+                    "evidence to place this item, which is not a positive "
+                    "non-L1 classification — the strict gate refuses those "
+                    "only, so the write was allowed and annotated. Check the "
+                    "target domain/section, and pass "
+                    "routing_override='force_l1' to state explicitly that this "
+                    "is L1 knowledge"
+                    + (
+                        ". The caller already passed "
+                        "routing_override='force_l1'; it was not needed here"
+                        if override == ROUTING_OVERRIDE_FORCE_L1
+                        else ""
+                    )
+                )
+            else:
+                enforcement["note"] = (
+                    f"classified '{surface}' — an L1 surface, so the strict "
+                    "gate allowed the write"
+                )
             return gate
         if override == ROUTING_OVERRIDE_FORCE_L1:
             gate["override_applied"] = True
             enforcement["override_applied"] = True
             enforcement["note"] = (
-                f"classified '{decision.surface.value}', which "
+                f"classified '{surface}', which "
                 "routing.enforce_direct_writes would refuse; written anyway "
                 "because the caller passed routing_override='force_l1'"
             )
             return gate
         gate["refused"] = True
         enforcement["note"] = (
-            f"classified '{decision.surface.value}': refused before any L1 "
+            f"classified '{surface}': refused before any L1 "
             "write. Nothing was written and no MEMORY_CHANGELOG event was "
             "recorded"
         )
@@ -925,6 +967,7 @@ def _routing_advisory(
         override_applied = bool((gate or {}).get("override_applied"))
         if override_applied:
             result["routing_override_applied"] = True
+        insufficient_evidence = bool((gate or {}).get("insufficient_evidence"))
         decision = (gate or {}).get("decision") or classify_memory_item(
             content, config=config, domain=domain, section=section
         )
@@ -942,6 +985,16 @@ def _routing_advisory(
                     "this write; it happened because the caller passed "
                     "routing_override='force_l1'. The item is now in L1 — if "
                     "that was a mistake, move it to the surface named above."
+                )
+            elif insufficient_evidence:
+                result["routing_warning"] = (
+                    head + " routing.enforce_direct_writes is true, but it "
+                    "refuses positive non-L1 classifications only — 'undecided' "
+                    "means the classifier found INSUFFICIENT EVIDENCE to place "
+                    "this item, not that it belongs elsewhere, so the write was "
+                    "allowed and annotated rather than refused. Check the target "
+                    "domain/section yourself; pass routing_override='force_l1' "
+                    "to state explicitly that this is L1 knowledge."
                 )
             else:
                 result["routing_warning"] = (

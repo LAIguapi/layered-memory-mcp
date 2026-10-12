@@ -21,6 +21,13 @@ provenance is destructive and a silent one is worse than none. Done when a
 prune exists that is explicit (its own tool or an opt-in flag), reports what it
 removed, and is documented as deleting history.
 
+Since the file therefore only grows, the store's read ceiling is now *reported*
+rather than only logged: above `MAX_READ_BYTES` (16 MiB) nothing is parsed and
+both reads carry `read_truncated: true`, `read_error:
+"memory_changelog_too_large"`, `max_read_bytes` and `file_size_bytes`, so an
+unreadable log is no longer indistinguishable from an empty one. That is a
+report flag, not retention — the file is still never rewritten.
+
 **Gap 2 — `l1_section_deleted` has no producer.** The operation is in
 `RECORDABLE_OPERATIONS` because section deletion is a semantic mutation, but no
 tool deletes a single section today (`apply_safe_knowledge_cleanup` deliberately
@@ -129,8 +136,10 @@ gating `compact_memory` only — the path where the *framework* picks the target
 and still never refuses an explicit write. The new
 `routing.enforce_direct_writes` (default **false**, env
 `LAYERED_MEMORY_ROUTING_ENFORCE_DIRECT_WRITES`) is the only switch that can
-refuse one. With it on, an `inject_knowledge` whose content classifies as
-anything but `l1_knowledge`/`l0_index` returns
+refuse one. With it on, an `inject_knowledge` whose content classifies as a
+*positive* non-L1 surface (`skill`, `user_profile`, `agent_other`, `todo`,
+`ephemeral` — the gate is an allow-list, so any future surface starts refused)
+returns
 `{success: false, action: "routing_refused", error:
 "routing_enforce_direct_write_refused", routing, routing_warning,
 suggested_action, routing_enforcement, hint}` — classified *before* the write,
@@ -140,10 +149,21 @@ and `batch_inject_knowledge_tool`) writes anyway and reports
 `routing_override_applied: true`; an unknown value is ignored rather than read
 as permission. `routing.enabled: false` makes the flag inert, a classifier
 failure fails **open**, and compaction passes `direct_write=False` so one config
-key never silently re-decides two behaviours. README / README.zh-CN carry the
+key never silently re-decides two behaviours. All four READMEs carry the
 behaviour matrix, and `get_memory_surface_capabilities` reports both switches
 plus an `l1_knowledge` note saying which one is live.
 `tests/test_v355_inject_enforce.py` locks all of it.
+
+**`undecided` is not refused** — decided here, with the gate shipping as an
+allow-list of `l1_knowledge` / `l0_index` / `undecided`. `undecided` is what the
+classifier returns when *no rule matched*, so refusing it would make the gate's
+answer a function of length rather than of content: a short unmarked fact
+(below `MIN_CHARS_FOR_FALLBACK`) classifies `undecided`, while the same fact
+written out at length is admitted as `l1_knowledge` with score 0.0 by the
+length-only fallback. Such a write proceeds and is annotated —
+`routing_enforcement.insufficient_evidence: true` plus a `routing_warning`
+naming the absence of evidence and the override — rather than being refused for
+absence of evidence.
 
 **Gap 1 — the fuse/consolidate handshake is gated on both halves.** Under the
 strict gate the second call (`fuse=True`) is classified like any other direct
@@ -153,12 +173,16 @@ L1 write) but it means a handshake can dead-end on content the first half
 accepted. Done when either the gate recognises a handshake continuation by its
 `expected_hash`, or the limitation is documented as intended.
 
-**Gap 2 — the whole-file tools are not gated.** `create_knowledge_file` /
-`update_knowledge_file` write L1 without passing through the router at all, so
-`enforce_direct_writes` does not reach them. They are blunt instruments by
-design, but "strict common-core purity" is not strict while that door is open.
-Done when they classify too, or when the flag's documentation says explicitly
-that it governs `inject_knowledge` only.
+**Gap 2 — the whole-file tools are not gated; now documented as such.**
+`create_knowledge_file` / `update_knowledge_file` write L1 without passing
+through the router at all, so `enforce_direct_writes` does not reach them. They
+are blunt instruments by design, but "strict common-core purity" is not strict
+while that door is open. The documentation half of "done" is in: all four
+READMEs, `config/config.example.yaml` and the `l1_knowledge` capability note now
+state that the flag governs `inject_knowledge` / `batch_inject_knowledge_tool`
+only. Fully done when the whole-file tools classify too — which needs a decision
+about what "the content" of a whole-file write even is (one body, many
+sections), so it is a feature, not a follow-up edit.
 
 ## 5. ja/ko README routing-section translation pass — done, with one gap
 
@@ -259,25 +283,39 @@ the usage-ratio trigger, the critical trigger, an explicit `compact_memory` —
 sees it immediately, and the alternative (reading the state file and hashing
 the config on the trigger hot path) buys nothing a 7-day interval cares about.
 
-## 7. Final review annotations — comments only, no behaviour change
+## 7. Final review annotations — comments, plus the fixups that followed
 
 A read-only review of the common-core routing work (verdict: pass, no P0) named
-a set of non-obvious invariants and latent gaps. They are now recorded **as
+a set of non-obvious invariants and latent gaps. They are recorded **as
 comments at the code they constrain**, so the tradeoff is read by whoever edits
-the line rather than by whoever happens to open this file. Nothing below was
-fixed in that pass; each is a reminder, not a change.
+the line rather than by whoever happens to open this file.
 
-- `injector._L1_WRITE_SURFACES` — `undecided` is deliberately absent, so the
-  strict direct-write gate refuses on absence of evidence, and length decides:
-  short unmarked content is refused, long unmarked prose is admitted.
+Fixed before release (see `3.5.0` in `CHANGELOG.md`):
+
+- `injector._L1_WRITE_SURFACES` — the strict gate no longer refuses on absence
+  of evidence. It is an allow-list (`_GATE_ALLOWED_SURFACES`) of
+  `l1_knowledge` / `l0_index` / `undecided`; a positive non-L1 classification
+  is refused, `undecided` is written with
+  `routing_enforcement.insufficient_evidence: true`. See §4.
+- `storage.MemoryChangelogStore.load` — an oversized log no longer reads as an
+  empty one: `read_status()` reports `read_truncated` / `read_error` /
+  `max_read_bytes` / `file_size_bytes` through `query` and `stats`. See §1.
+- `api/server.py` `lifespan` — resolves `MemoryConfig`'s own `knowledge_dir`
+  and `<home>/data` instead of defaulting to a product path, and the module is
+  now in the AST boundary test's `_CORE_SOURCES`.
+- `integrate_agent(action="inject_memory")` — the one remaining write that
+  treated detection as permission now goes through
+  `agent_memory_guard.resolve_write_target` (with the detected candidate
+  judged, so a configured target elsewhere is not read as permission for it).
+
+Still open; each is a reminder, not a change:
+
 - `routing.SCORE_FLOOR` — unreachable with shipped weights; the "treat as
   unrouted" branch has never run and needs tests before it is relied on.
 - `routing.MIN_CHARS_FOR_FALLBACK` — the only path returning `l1_knowledge`
-  with no supporting signal; moving it moves the direct-write gate and
-  `compact_memory` enforce behaviour with it.
-- `storage.MemoryChangelogStore.load` — an oversized log reads as an empty one;
-  should surface a flag/error instead of only logging. Reachable because
-  `retention_days` is still reported and not enforced.
+  with no supporting signal. It no longer moves what the direct-write gate
+  refuses, but it still moves `compact_memory`'s enforce behaviour and which
+  `routing_warning` an explicit write carries.
 - `injector._direct_write_gate` — the validation-failure `note` is not
   observable through the current result shape; do not report from it.
 - `memory_compactor.detect_memory_bloat` — dereferences a possibly-`None` path
@@ -288,5 +326,9 @@ fixed in that pass; each is a reminder, not a change.
   memory is untouched"; the usage-ratio and critical triggers stay unthrottled.
 - `governance.scan_procedure_contamination` — runs on every L1 write at
   sections × marker vocabulary; bound the scan before dropping the advisory.
-- `api/server.py` `lifespan` — legacy product-path defaults, the last ones
-  outside the adapters, and not covered by the AST boundary test.
+- `integrate_agent(action="inject_soul")` — writes the persona file
+  (`SOUL.md`), also adapter-detected, and is **not** guarded: it is a persona
+  surface rather than a memory file, the block is marker-delimited and
+  reversible through `remove_soul`, and no derived memory content lands in it.
+  Done when the guard's rule is generalised to "any framework write into an
+  agent-owned file", or when this exemption is restated as permanent.

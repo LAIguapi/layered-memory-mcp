@@ -58,12 +58,19 @@ from layered_memory_mcp.routing import classify_memory_item, surface_capabilitie
 
 #: Core modules that must not name a product path any more. The Hermes adapter
 #: itself is deliberately excluded — naming Hermes is its whole job.
+#:
+#: ``api/server.py`` is on the list because it was the last module outside
+#: ``adapters/`` that still defaulted its stores to ``~/.hermes/knowledge`` and
+#: ``~/.hermes/data`` — a layout no other entry point shared — and the boundary
+#: test never looked at it. It now resolves ``MemoryConfig``'s own
+#: ``knowledge_dir`` / ``<home>/data``.
 _CORE_SOURCES = (
     "config.py",
     "memory_compactor.py",
     "routing.py",
     "agent_memory_guard.py",
     "memory_changelog.py",
+    "api/server.py",
 )
 
 _SRC = Path(__file__).resolve().parents[1] / "src" / "layered_memory_mcp"
@@ -338,6 +345,28 @@ class TestCoreUsesTheAdapterLayer:
                 assert "§" not in literal, (
                     f"{name} still hardcodes the '§' separator in {literal!r}"
                 )
+
+    def test_api_server_resolves_the_framework_layout(self, tmp_path, monkeypatch):
+        """The REST server's stores follow `MemoryConfig`, not a product path.
+
+        Same layout as every other entry point: `knowledge_dir` from
+        `LAYERED_MEMORY_HOME` (or an explicit override), the SQLite stores in
+        `<home>/data`. Skipped where FastAPI is not installed — the REST layer
+        is optional, the boundary assertion above is not.
+        """
+        pytest.importorskip("fastapi")
+        from layered_memory_mcp.api.server import store_dirs
+
+        home = tmp_path / "api-home"
+        monkeypatch.setenv("LAYERED_MEMORY_HOME", str(home))
+        knowledge_dir, data_dir = store_dirs()
+        assert knowledge_dir == home / "knowledge"
+        assert data_dir == home / "data"
+
+        explicit = MemoryConfig(
+            home=str(tmp_path / "other"), knowledge_dir=str(tmp_path / "kb")
+        )
+        assert store_dirs(explicit) == (tmp_path / "kb", tmp_path / "other" / "data")
 
 
 # ---------------------------------------------------------------------------

@@ -142,7 +142,7 @@ layered-memory-mcp --verbose
 | `LAYERED_MEMORY_AUTO_MAINTAIN_ATTEMPT_INTERVAL_HOURS` | *주기 트리거* 지연 판단 사이의 최소 시간(시간 단위, `0`이면 해제) | `1` |
 | `LAYERED_MEMORY_ROUTING_ENABLED` | 콘텐츠를 분류하고 쓰기 결과에 라우팅 정보를 주석으로 덧붙임 | `true` |
 | `LAYERED_MEMORY_ROUTING_MODE` | `advisory`(제안) 또는 `enforce`(강제) — `compact_memory`에만 작용 | `advisory` |
-| `LAYERED_MEMORY_ROUTING_ENFORCE_DIRECT_WRITES` | 명시적 `inject_knowledge`가 비-L1 콘텐츠를 쓰려 하면 거부 | `false` |
+| `LAYERED_MEMORY_ROUTING_ENFORCE_DIRECT_WRITES` | 명시적 `inject_knowledge`의 내용이 적극적으로 비-L1 면으로 분류되면 거부 | `false` |
 | `LAYERED_MEMORY_AGENT_EXTENSIONS_ENABLED` | 에이전트 소유 면에 대한 대리 기록을 허용 | `false` |
 | `LAYERED_MEMORY_AGENT_EXTENSIONS_MODE` | `suggest` / `apply_with_confirmation` / `apply` | `suggest` |
 | `LAYERED_MEMORY_AGENT_EXTENSIONS_ROOT` | 파일을 쓰는 확장 핸들러의 기준 디렉터리 | 미설정 (거부됨) |
@@ -170,7 +170,7 @@ promotion:
 routing:
   enabled: true
   mode: advisory                               # advisory | enforce — compact_memory만 통제 (아래 참조)
-  enforce_direct_writes: false                 # true = inject_knowledge가 비-L1 콘텐츠를 거부
+  enforce_direct_writes: false                 # true = inject_knowledge가 적극적으로 비-L1로 분류된 콘텐츠를 거부
   # 아래 목록도 governance와 같은 방식으로 내장 어휘에 "추가"됩니다:
   extra_skill_markers: ["운영 절차서"]
   extra_todo_markers: ["승인 대기"]
@@ -196,7 +196,7 @@ memory_changelog:
 
 어떤 키를 쓰지 않으면 기본값이 유지됩니다. `watch_patterns`를 설정하면 당신의 목록이 내장 패턴 목록을 대체합니다. `[]`로 두면 패턴 매칭을 끌 수 있습니다.
 
-`agent_memory:`는 프레임워크가 L0 포인터／지식 색인 항목을 어느 「에이전트 자신의」 메모리 파일(`MEMORY.md`, `CLAUDE.md` 등)에 투사할 수 있는지를 결정합니다. 경로를 설정하지 않으면 프레임워크가 자동으로 탐지합니다 — 읽기에는 문제없지만 쓰기에는 위험합니다: 모호한 설정(테스트, 임시 home 위에서 돌아가는 일회성 스크립트)이 실제 파일을 해석해 조용히 덧붙일 수 있습니다. 그래서 투사 쓰기에는 다음 중 하나가 필요합니다: 명시적 대상(`agent_memory.path`, 또는 호출 시 `memory_path` 인수), 명시적 허용(`allow_auto_detect_write: true`), 탐지된 파일이 `<LAYERED_MEMORY_HOME>` 안에 있는 경우, 또는 그 home이 임시／테스트 샌드박스가 아니라 이번 설치의 실제 설정 home인 경우. 그 외에는 모두 거부되고 `agent_memory_write: {status: "skipped", reason: "unsafe_auto_detect_write", detected_path, hint}`로 보고됩니다 — L1 쓰기 자체는 언제나 정상적으로 성공하고, 멈추는 것은 투사뿐입니다. **탐지할 수 있다는 것이 권한은 아닙니다**: 어댑터를 통해 경로를 해석했다고 해서 그것을 쓸 권리가 생기지는 않습니다.
+`agent_memory:`는 프레임워크가 L0 포인터／지식 색인 항목을 어느 「에이전트 자신의」 메모리 파일(`MEMORY.md`, `CLAUDE.md` 등)에 투사할 수 있는지를 결정합니다. 경로를 설정하지 않으면 프레임워크가 자동으로 탐지합니다 — 읽기에는 문제없지만 쓰기에는 위험합니다: 모호한 설정(테스트, 임시 home 위에서 돌아가는 일회성 스크립트)이 실제 파일을 해석해 조용히 덧붙일 수 있습니다. 그래서 투사 쓰기에는 다음 중 하나가 필요합니다: 명시적 대상(`agent_memory.path`, 또는 호출 시 `memory_path` 인수), 명시적 허용(`allow_auto_detect_write: true`), 탐지된 파일이 `<LAYERED_MEMORY_HOME>` 안에 있는 경우, 또는 그 home이 임시／테스트 샌드박스가 아니라 이번 설치의 실제 설정 home인 경우. 그 외에는 모두 거부되고 `agent_memory_write: {status: "skipped", reason: "unsafe_auto_detect_write", detected_path, hint}`로 보고됩니다 — L1 쓰기 자체는 언제나 정상적으로 성공하고, 멈추는 것은 투사뿐입니다. **탐지할 수 있다는 것이 권한은 아닙니다**: 어댑터를 통해 경로를 해석했다고 해서 그것을 쓸 권리가 생기지는 않습니다. 같은 규칙이 `integrate_agent(action="inject_memory")`(그 파일에 인식 스니펫을 덧붙이는 동작)에도 적용됩니다: 주입을 요청한 것은 사용자지만 '어느 파일인가'는 여전히 탐지가 정했으므로, 순수하게 자동 탐지된 대상은 `agent_memory_write: {status: "refused", …}`로 거부되고 아무것도 기록되지 않습니다. 탐지와 상태 보고, 읽기는 영향을 받지 않습니다.
 
 ### 공통 코어는 에이전트와 무관하다
 
@@ -508,7 +508,7 @@ Agent: "데이터베이스 연결 문자열이 뭐야?"
 
 **기록되지 않는 것.** 융합／통합의 지연 핸드셰이크, `fuse_conflict`나 `consolidate_refused` 거부, 건너뛴 중복, 검증 실패, 쓰기 실패, `dry_run=True` 시험 실행, 항목 집합이 바뀌지 않은 L0 재동기화, 그리고 콘텐츠 해시가 바뀌지 않은 쓰기. 단일 섹션 삭제는 아직 이벤트가 없습니다 — 섹션 하나만 지우는 도구가 없기 때문입니다(`ROADMAP.md` 참조).
 
-**읽는 방법.** `get_memory_changelog(domain, operation, surface, since, limit)`는 최신순·건수 상한(기본 50, 하드 상한 500)으로 반환합니다. `get_memory_changelog_stats()`는 작업／면／도메인별 건수와 기간을 집계합니다. 둘 다 읽기 전용입니다. `get_memory_surface_capabilities`는 `memory_changelog`에 대해 백엔드가 실제로 켜져 있는지를 `can_apply`에 반영하고, 해석된 `store_path`도 함께 보고합니다.
+**읽는 방법.** `get_memory_changelog(domain, operation, surface, since, limit)`는 최신순·건수 상한(기본 50, 하드 상한 500)으로 반환합니다. `get_memory_changelog_stats()`는 작업／면／도메인별 건수와 기간을 집계합니다. 둘 다 읽기 전용입니다. `get_memory_surface_capabilities`는 `memory_changelog`에 대해 백엔드가 실제로 켜져 있는지를 `can_apply`에 반영하고, 해석된 `store_path`도 함께 보고합니다. 16 MiB 읽기 상한을 넘어 자란 로그는 아예 파싱되지 않습니다 — 그럴 때 두 보고 모두 `read_truncated: true`, `read_error: "memory_changelog_too_large"`, `max_read_bytes`, `file_size_bytes`를 담으므로, 읽을 수 없는 로그가 빈 로그처럼 보이는 일은 없습니다. 파일 자체는 건드리지 않습니다.
 
 ### Write-Once, Fully-Visible 파이프라인 (v0.5.0)
 
@@ -557,11 +557,16 @@ L1에 두는 것은 **지속되는 지식**, 즉 지금 성립하는 규칙과 �
 |---|---|---|---|---|
 | `true` | `false` (기본) | — | 아무것이든 | 평소처럼 기록. 비-L1이면 `routing_warning` 첨부 (동작 불변) |
 | `true` | `true` | `"none"` (기본) | `l1_knowledge` / `l0_index` | 정상적으로 기록하고 `MEMORY_CHANGELOG` 이벤트도 남김 |
-| `true` | `true` | `"none"` | 그 외 | **거부**, 아무것도 쓰지 않음 |
-| `true` | `true` | `"force_l1"` | 그 외 | 기록하고 `routing_override_applied: true` 표시 |
+| `true` | `true` | `"none"` | `undecided`(어느 쪽으로도 근거가 없음) | 정상적으로 기록하고, 추가로 `routing_warning`과 `routing_enforcement.insufficient_evidence: true` |
+| `true` | `true` | `"none"` | `skill` / `user_profile` / `agent_other` / `todo` / `ephemeral` | **거부**, 아무것도 쓰지 않음 |
+| `true` | `true` | `"force_l1"` | 거부되는 면 중 하나 | 기록하고 `routing_override_applied: true` 표시 |
 | `false` | `true` | — | 분류하지 않음 | 평소처럼 기록, 결과는 옛 형태(routing 필드 없음) |
 
+게이트가 거부하는 것은 **적극적인** 비-L1 분류입니다 — 분류기가 다른 면에 속한다고 판단한 내용이죠. 근거의 부재로는 거부하지 않습니다: `undecided`는 어떤 규칙도 맞지 않았다는 뜻이므로, 쓰기는 지정한 위치로 들어가고 대신 경고가 붙습니다. 이것까지 거부하면 답이 내용이 아니라 길이의 함수가 됩니다 — 같은 무표기 사실도 `MIN_CHARS_FOR_FALLBACK`(80자)를 넘겨 쓰면 길이만 보는 폴백이 `l1_knowledge`로 받아들이기 때문입니다. 그런 쓰기에서는 `routing_warning`을 확인하세요. `routing_override="force_l1"`도 여기서 받아들여지며, 필요하지 않았다고 알려 줍니다.
+
 `routing.mode`는 끝까지 이와 직교합니다: `compact_memory`가 무엇을 이전하는지를 정할 뿐, 그 자체로 직접 쓰기를 거부하는 일은 없습니다.
+
+**게이트가 다루는 범위.** `inject_knowledge`, `inject_knowledge_tool`, `batch_inject_knowledge_tool` — 섹션 단위의 직접 쓰기입니다. 파일 전체를 다루는 `create_knowledge_file` / `update_knowledge_file`은 **대상이 아닙니다**: 이들은 라우터를 전혀 거치지 않고 L1 파일을 통째로 쓰거나 교체하므로, 이 플래그가 켜져 있든 꺼져 있든 분류도 거부도 적용되지 않습니다. 설계상 투박한 도구로 남아 있습니다. ROADMAP §4 Gap 2를 참조하세요.
 
 거부 결과는 구조화되어 있고, 검증 오류가 아닙니다 — 요청 자체는 문제가 없고 문제는 **대상**입니다:
 
@@ -821,12 +826,14 @@ python -m layered_memory_mcp.server
 
 ## Changelog
 
-전체 릴리스 이력은 [CHANGELOG.md](CHANGELOG.md)를 참조하세요. `3.4.7`의 주요 내용:
+전체 릴리스 이력은 [CHANGELOG.md](CHANGELOG.md)를 참조하세요. `3.5.0`의 주요 내용:
 
-- 라이프사이클 거버넌스: 구조화된 권장 액션(`move_to_todo` / `rewrite_as_current_rule` / `keep_with_reason`), 마커 어휘 설정 가능
-- `plan_knowledge_cleanup_tool`과 `apply_safe_knowledge_cleanup_tool`: 읽기 전용 계획, 안전한 액션은 dry-run 먼저 후 실행
-- 지식 백업을 활성 지식 디렉터리 밖 `data/backups/knowledge/`로 이동
-- 벡터에 임베딩되는 텍스트의 제목에서 날짜·버전 등 노이즈 제거
+- 면 모델과 결정론적 지속성 라우터(`classify_memory_item`), 기본값은 조언만
+- `get_memory_surface_capabilities`: 현재 설정에서 프레임워크가 쓸 수 있는 면과 제안만 가능한 면
+- 선택 활성화 에이전트 확장과 `apply_agent_action`: 기본 비활성, 모든 거부를 보고
+- 영속 `MEMORY_CHANGELOG` 백엔드와 `get_memory_changelog` / `get_memory_changelog_stats`
+- 엄격한 직접 쓰기(`routing.enforce_direct_writes`): 적극적으로 비-L1로 분류된 내용은 거부하고, 판단할 수 없는 내용은 기록하며 주석
+- 에이전트 환경 어댑터: 공통 코어에 제품 경로가 없고, 탐지는 결코 권한이 아니다
 - glob 기반 잡동사니 파일 스캔(`promotion.watch_patterns`), 영어·중국어 기본값 포함
 
 ## 라이선스

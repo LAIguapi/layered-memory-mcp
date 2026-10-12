@@ -17,15 +17,18 @@ auto-detected path to a write target.
 
 THE RULE
 --------
-Derived / compatibility L0 projection writes into agent-native memory require
-an **explicit target** or an **explicit opt-in**. Auto-detection may still be
-used for reads, capability probes and reporting — never for a silent write from
-an ambiguous config.
+Framework writes into agent-native memory require an **explicit target** or an
+**explicit opt-in**. That covers the derived / compatibility L0 projection and
+the ``integrate_agent(action="inject_memory")`` awareness snippet alike: both
+land in a file the framework does not own, chosen by a probe. Auto-detection
+may still be used for reads, capability probes and reporting — never for a
+silent write from an ambiguous config.
 
 A write target is accepted when any of these holds:
 
 1. the caller passed an explicit ``memory_path`` (it named the file itself);
-2. ``agent_memory.path`` / ``LAYERED_MEMORY_AGENT_MEMORY_PATH`` is configured;
+2. ``agent_memory.path`` / ``LAYERED_MEMORY_AGENT_MEMORY_PATH`` is configured
+   *and* resolves to the file about to be written;
 3. ``agent_memory.allow_auto_detect_write`` is true (explicit opt-in);
 4. the detected path lies inside the framework's own ``home`` (the
    ``<home>/agent-memory.md`` fallback — the framework owns that directory);
@@ -197,12 +200,21 @@ def resolve_write_target(
     memory_path: str | Path | None = None,
     *,
     operation: str = "agent_memory_write",
+    detected: str | Path | None = None,
 ) -> WriteTarget:
     """Resolve where a derived L0 projection may be written — or refuse.
 
     Mirrors ``memory_compactor._resolve_memory_path`` for the *write* case; see
     the module docstring for the five acceptance rules. Read-only callers
     (bloat detection, capability reporting) keep using the plain resolver.
+
+    ``detected`` is for a caller that has *already* auto-detected a candidate by
+    another route (``agent_integrator.detect_agent_type()["memory_path"]``) and
+    needs that exact file judged — detection by a different code path is still
+    detection, so it buys no permission. Unlike ``memory_path`` it is not the
+    caller naming a target; rule 2 then only applies when the configured path
+    *is* that file, so a configured target cannot license a write to a
+    different one.
 
     ``operation`` only labels the refusal log line.
     """
@@ -213,33 +225,35 @@ def resolve_write_target(
     if config is None:
         return WriteTarget(None, False, "no_config", UNRESOLVED)
 
-    detected = _detect(config)
-    if detected is None:
+    candidate = Path(detected) if detected else _detect(config)
+    if candidate is None:
         return WriteTarget(None, False, "unresolved", UNRESOLVED)
 
-    # 2. Explicitly configured path (agent_memory.path / env var).
-    if getattr(config, "agent_memory_path", None):
-        return WriteTarget(detected, True, "explicit_config")
+    # 2. Explicitly configured path (agent_memory.path / env var) — and it is
+    #    this candidate, not merely some configured file.
+    configured = getattr(config, "agent_memory_path", None)
+    if configured and _resolved(configured) == _resolved(candidate):
+        return WriteTarget(candidate, True, "explicit_config")
 
     # 3. Explicit opt-in to the legacy auto-detect projection.
     if getattr(config, "agent_memory_allow_auto_detect_write", False):
-        return WriteTarget(detected, True, "allow_auto_detect_write")
+        return WriteTarget(candidate, True, "allow_auto_detect_write")
 
     # 4. Inside the framework's own home — the generic fallback file.
     home = getattr(config, "home", None)
-    if home and _is_within(_resolved(detected), _resolved(home)):
-        return WriteTarget(detected, True, "inside_framework_home")
+    if home and _is_within(_resolved(candidate), _resolved(home)):
+        return WriteTarget(candidate, True, "inside_framework_home")
 
     # 5. Legacy compatibility for a real install (see module docstring).
     if _is_configured_home(config):
-        return WriteTarget(detected, True, "configured_home")
+        return WriteTarget(candidate, True, "configured_home")
 
     logger.warning(
         "%s refused: auto-detected agent memory %s is outside the framework "
         "home %s and no explicit target/opt-in is configured. %s",
         operation,
-        detected,
+        candidate,
         home,
         HINT,
     )
-    return WriteTarget(detected, False, "auto_detect_outside_home", UNSAFE_AUTO_DETECT)
+    return WriteTarget(candidate, False, "auto_detect_outside_home", UNSAFE_AUTO_DETECT)

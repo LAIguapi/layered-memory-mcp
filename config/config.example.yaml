@@ -271,11 +271,19 @@ backend:
 #       and returned as candidates. It never refuses an explicit write.
 #
 #   enforce_direct_writes: true
-#       Gates inject_knowledge — the path where the CALLER picks the target.
-#       Content that classifies as anything but l1_knowledge/l0_index is
+#       Gates inject_knowledge / batch_inject_knowledge_tool — the path where
+#       the CALLER picks the target. Content that classifies as a POSITIVE
+#       non-L1 surface (skill, user_profile, agent_other, todo, ephemeral) is
 #       refused before the write (action="routing_refused"); nothing is
 #       written and no MEMORY_CHANGELOG event is recorded. The result carries
 #       the routing decision and the AgentAction to take instead.
+#
+#       "undecided" is NOT refused: it means no rule matched, and absence of
+#       evidence is not evidence of a misfile. The write proceeds to L1 with a
+#       routing_warning and routing_enforcement.insufficient_evidence: true.
+#
+#       The gate does not reach the whole-file tools create_knowledge_file /
+#       update_knowledge_file — those bypass the router entirely.
 #
 #       Override one call with routing_override="force_l1" when the classifier
 #       is wrong about a piece of durable knowledge. It is not a way to push a

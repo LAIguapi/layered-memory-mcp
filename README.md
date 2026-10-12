@@ -159,7 +159,7 @@ layered-memory-mcp --verbose
 | `LAYERED_MEMORY_AUTO_MAINTAIN_ATTEMPT_INTERVAL_HOURS` | Minimum hours between two *interval-triggered* lazy decisions (`0` disables) | `1` |
 | `LAYERED_MEMORY_ROUTING_ENABLED` | Classify items and annotate write results | `true` |
 | `LAYERED_MEMORY_ROUTING_MODE` | `advisory` or `enforce` — gates `compact_memory` only | `advisory` |
-| `LAYERED_MEMORY_ROUTING_ENFORCE_DIRECT_WRITES` | Refuse an explicit `inject_knowledge` write of non-L1 content | `false` |
+| `LAYERED_MEMORY_ROUTING_ENFORCE_DIRECT_WRITES` | Refuse an explicit `inject_knowledge` write whose content classifies as a positive non-L1 surface | `false` |
 | `LAYERED_MEMORY_AGENT_EXTENSIONS_ENABLED` | Let the framework apply agent-surface actions | `false` |
 | `LAYERED_MEMORY_AGENT_EXTENSIONS_MODE` | `suggest` / `apply_with_confirmation` / `apply` | `suggest` |
 | `LAYERED_MEMORY_AGENT_EXTENSIONS_ROOT` | Base dir for a file-writing extension handler | unset (refuses) |
@@ -187,7 +187,7 @@ promotion:
 routing:
   enabled: true
   mode: advisory                               # advisory | enforce — gates compact_memory (see below)
-  enforce_direct_writes: false                 # true = inject_knowledge REFUSES non-L1 content
+  enforce_direct_writes: false                 # true = inject_knowledge REFUSES positively non-L1 content
   # Each list EXTENDS the built-in vocabulary, same style as governance:
   extra_skill_markers: ["cookbook"]
   extra_todo_markers: ["needs sign-off"]
@@ -213,7 +213,7 @@ memory_changelog:
 
 Omit a key to keep the defaults. If you set `watch_patterns`, your list replaces the built-in pattern list. Set it to `[]` to turn pattern matching off.
 
-`agent_memory:` controls where the framework may project the L0 pointer / knowledge-index entry into the agent's *own* memory file (`MEMORY.md`, `CLAUDE.md`, …). With no path configured the framework auto-detects one, which is fine for reading but not for writing: any ambiguous config — a test, a throwaway script on a temp home — would otherwise resolve the real file and silently append to it. A projection write therefore needs an explicit target (`agent_memory.path`, or a `memory_path` argument), an explicit opt-in (`allow_auto_detect_write: true`), a detected file inside `<LAYERED_MEMORY_HOME>`, or a home that is this install's real configured home and not a temp/test sandbox. Anything else is refused and reported as `agent_memory_write: {status: "skipped", reason: "unsafe_auto_detect_write", detected_path, hint}` — the L1 write itself always succeeds, only the projection stops. **Detection is not permission:** resolving a path through an adapter grants no right to write it.
+`agent_memory:` controls where the framework may project the L0 pointer / knowledge-index entry into the agent's *own* memory file (`MEMORY.md`, `CLAUDE.md`, …). With no path configured the framework auto-detects one, which is fine for reading but not for writing: any ambiguous config — a test, a throwaway script on a temp home — would otherwise resolve the real file and silently append to it. A projection write therefore needs an explicit target (`agent_memory.path`, or a `memory_path` argument), an explicit opt-in (`allow_auto_detect_write: true`), a detected file inside `<LAYERED_MEMORY_HOME>`, or a home that is this install's real configured home and not a temp/test sandbox. Anything else is refused and reported as `agent_memory_write: {status: "skipped", reason: "unsafe_auto_detect_write", detected_path, hint}` — the L1 write itself always succeeds, only the projection stops. **Detection is not permission:** resolving a path through an adapter grants no right to write it. The same rule covers `integrate_agent(action="inject_memory")`, which appends the awareness snippet to that file: you asked for the injection, but *which* file was still chosen by a probe, so a purely auto-detected target is refused with `agent_memory_write: {status: "refused", …}` and nothing is written. Detection, status reporting and reads are unaffected.
 
 ### The common core is agent-neutral
 
@@ -526,7 +526,7 @@ It is explicitly *not* the repository `CHANGELOG.md`, not raw session logs, not 
 
 **What is not recorded.** A deferred-fusion or deferred-consolidate handshake, a `fuse_conflict` or `consolidate_refused` refusal, a skipped duplicate, a validation failure, a failed write, a `dry_run=True` pass, an L0 resync whose entry set did not move, and a write whose content hash came out unchanged. Single-section deletion has no event yet because no tool deletes one section — see `ROADMAP.md`.
 
-**Reading it.** `get_memory_changelog(domain, operation, surface, since, limit)` returns newest-first, bounded entries (default 50, hard ceiling 500); `get_memory_changelog_stats()` summarises counts by operation / surface / domain and the time span. Both are read-only. `get_memory_surface_capabilities` reports `memory_changelog` with `can_apply` reflecting whether the backend is actually enabled, plus the resolved `store_path`.
+**Reading it.** `get_memory_changelog(domain, operation, surface, since, limit)` returns newest-first, bounded entries (default 50, hard ceiling 500); `get_memory_changelog_stats()` summarises counts by operation / surface / domain and the time span. Both are read-only. `get_memory_surface_capabilities` reports `memory_changelog` with `can_apply` reflecting whether the backend is actually enabled, plus the resolved `store_path`. A log that has grown past the 16 MiB read ceiling is not parsed at all — both reports then carry `read_truncated: true`, `read_error: "memory_changelog_too_large"`, `max_read_bytes` and `file_size_bytes`, so an unreadable log never looks like an empty one. The file itself is left untouched.
 
 ### Write-Once, Fully-Visible Pipeline (v0.5.0)
 
@@ -575,11 +575,16 @@ This is the deliberate asymmetry with compaction: an explicit `inject_knowledge`
 |---|---|---|---|---|
 | `true` | `false` (default) | — | anything | Written, `routing_warning` when non-L1 (unchanged behaviour) |
 | `true` | `true` | `"none"` (default) | `l1_knowledge` / `l0_index` | Written normally, `MEMORY_CHANGELOG` event recorded |
-| `true` | `true` | `"none"` | anything else | **Refused**, nothing written |
-| `true` | `true` | `"force_l1"` | anything else | Written, `routing_override_applied: true` |
+| `true` | `true` | `"none"` | `undecided` (no evidence either way) | Written normally, plus `routing_warning` and `routing_enforcement.insufficient_evidence: true` |
+| `true` | `true` | `"none"` | `skill` / `user_profile` / `agent_other` / `todo` / `ephemeral` | **Refused**, nothing written |
+| `true` | `true` | `"force_l1"` | any refused surface | Written, `routing_override_applied: true` |
 | `false` | `true` | — | not classified | Written, legacy result shape (no routing keys) |
 
+The gate refuses a **positive** non-L1 classification — content the classifier places on another surface. It does not refuse on absence of evidence: `undecided` means no rule matched at all, so the write goes where you aimed it and carries the warning instead. Refusing it would make the answer a function of length rather than of content, since the same unmarked fact written out past `MIN_CHARS_FOR_FALLBACK` (80 characters) is admitted as `l1_knowledge` by the length-only fallback. Check the `routing_warning` on those writes; `routing_override="force_l1"` is accepted there too and reports that it was not needed.
+
 `routing.mode` is orthogonal throughout: it decides what `compact_memory` migrates and never refuses a direct write on its own.
+
+**What the gate covers.** `inject_knowledge`, `inject_knowledge_tool` and `batch_inject_knowledge_tool` — the section-level direct writes. It does **not** cover the whole-file tools `create_knowledge_file` / `update_knowledge_file`: those write (or replace) a whole L1 file without passing through the router at all, so neither the classification nor the refusal applies to them, with the flag on or off. They remain blunt instruments by design; see ROADMAP §4 Gap 2.
 
 A refusal is structured, and it is not a validation error — the request was fine, the destination was not:
 
@@ -840,13 +845,14 @@ python -m layered_memory_mcp.server
 
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md) for the full release history. Recent highlights in `3.4.7`:
+See [CHANGELOG.md](CHANGELOG.md) for the full release history. Recent highlights in `3.5.0`:
 
-- Lifecycle governance with structured actions (`move_to_todo` / `rewrite_as_current_rule` / `keep_with_reason`) and configurable marker lists
-- `plan_knowledge_cleanup_tool` and `apply_safe_knowledge_cleanup_tool` (read-only planning, plus dry-run-first application of safe actions)
-- Knowledge backups moved out of the live knowledge directory into `data/backups/knowledge/`
-- Noise-stripped headings in embedded vector text
-- Glob-based catch-all scans (`promotion.watch_patterns`) with English and Chinese defaults
+- A surface model and a deterministic persistence router (`classify_memory_item`), advisory by default
+- `get_memory_surface_capabilities`: what the framework may write under your config, and what it can only suggest
+- Opt-in agent extensions and `apply_agent_action` — off by default, every refusal reported
+- A persistent `MEMORY_CHANGELOG` backend with `get_memory_changelog` / `get_memory_changelog_stats`
+- Strict direct writes (`routing.enforce_direct_writes`): refuses a positive non-L1 classification, annotates one it cannot place
+- Agent-environment adapters, so the common core carries no product paths — and detection is never permission
 
 ## License
 

@@ -1,7 +1,7 @@
 [project]
 name = "layered-memory-mcp"
-version = "3.4.7"
-description = "Layered Memory MCP Server — Extend AI agent memory beyond token limits with a 4-tier knowledge architecture"
+version = "3.5.0"
+description = "Layered Memory MCP Server — Durable common-core memory for AI agents: L0 index, L1 knowledge, TODO and provenance, with deterministic persistence routing"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"

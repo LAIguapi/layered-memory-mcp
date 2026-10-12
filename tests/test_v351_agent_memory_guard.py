@@ -425,3 +425,147 @@ class TestGuardRules:
         target = resolve_write_target(None)
         assert target.allowed is False
         assert target.path is None
+
+    def test_a_configured_path_does_not_license_a_different_file(
+        self, tmp_path, monkeypatch
+    ):
+        """Rule 2 is about *this* file, not about having configured some file.
+
+        Matters for callers that detect a candidate by another route and hand it
+        to the guard (``detected=``): a configured target elsewhere must not be
+        read as permission to write the probe's find.
+        """
+        monkeypatch.delenv("LAYERED_MEMORY_AGENT_MEMORY_PATH", raising=False)
+        home = tmp_path / "configured-home"
+        home.mkdir(parents=True, exist_ok=True)
+        mine = home / "MEMORY.md"
+        mine.write_text("", encoding="utf-8")
+        someone_elses = tmp_path / "other-home" / ".hermes" / "memories" / "MEMORY.md"
+        someone_elses.parent.mkdir(parents=True, exist_ok=True)
+        someone_elses.write_text(PROD_CONTENT, encoding="utf-8")
+
+        cfg = MemoryConfig(home=str(home), agent_memory={"path": str(mine)})
+
+        mine_target = resolve_write_target(cfg, detected=mine)
+        assert mine_target.allowed is True
+        assert mine_target.trust == "explicit_config"
+
+        other = resolve_write_target(cfg, detected=someone_elses)
+        assert other.allowed is False
+        assert other.reason == UNSAFE_AUTO_DETECT
+        assert other.path == someone_elses
+
+
+class TestIntegrateAgentInjectMemory:
+    """`integrate_agent(action="inject_memory")` is a write into agent memory.
+
+    The user asks for it, but *which file* is still decided by a probe — so it
+    is subject to the same rule as the L0 projection. Before this pass it wrote
+    the auto-detected file directly, which is the one path in the codebase that
+    still treated detection as permission.
+    """
+
+    def _run(self, cfg, action: str = "inject_memory") -> dict:
+        import asyncio
+        import json
+
+        from layered_memory_mcp import server
+
+        server._config = cfg
+        try:
+            return json.loads(asyncio.run(server.integrate_agent(action)))
+        finally:
+            server._config = None
+
+    @pytest.fixture
+    def hermes_host(self, monkeypatch):
+        """Make the integration probe report a Hermes host at ``path``."""
+        from layered_memory_mcp import server
+
+        def _set(path):
+            monkeypatch.setattr(
+                server,
+                "detect_agent_type",
+                lambda: {
+                    "agent_type": "hermes",
+                    "soul_path": None,
+                    "memory_path": path,
+                    "home_dir": path.parent.parent,
+                },
+            )
+
+        return _set
+
+    def test_an_auto_detected_memory_file_is_refused(
+        self, tmp_path, monkeypatch, prod, hermes_host
+    ):
+        hermes_host(prod)
+        cfg = _bare_config(tmp_path, monkeypatch)
+        before = _digest(prod)
+
+        payload = self._run(cfg)
+
+        assert payload["success"] is False
+        assert payload["error"] == UNSAFE_AUTO_DETECT
+        assert payload["agent_memory_write"]["status"] == "refused"
+        assert payload["agent_memory_write"]["detected_path"] == str(prod)
+        assert "agent_memory.path" in payload["agent_memory_write"]["hint"]
+        assert _digest(prod) == before
+        assert prod.read_text(encoding="utf-8") == PROD_CONTENT
+
+    def test_an_explicitly_configured_file_is_still_injected(
+        self, tmp_path, monkeypatch, hermes_host
+    ):
+        """The legitimate case keeps working, unchanged."""
+        monkeypatch.delenv("LAYERED_MEMORY_AGENT_MEMORY_PATH", raising=False)
+        home = tmp_path / "explicit-home"
+        home.mkdir(parents=True, exist_ok=True)
+        mem = home / "MEMORY.md"
+        mem.write_text("[L0] infra: notes → knowledge/infra.md\n", encoding="utf-8")
+        hermes_host(mem)
+
+        cfg = MemoryConfig(home=str(home), agent_memory={"path": str(mem)})
+        payload = self._run(cfg)
+
+        assert payload["success"] is True
+        assert payload["action"] == "injected"
+        assert "get_l0_index()" in mem.read_text(encoding="utf-8")
+
+        # Idempotent, as before — and still guarded.
+        again = self._run(cfg)
+        assert again["action"] == "already_injected"
+
+    def test_the_opt_in_restores_the_legacy_behaviour(
+        self, tmp_path, monkeypatch, hermes_host
+    ):
+        monkeypatch.delenv("LAYERED_MEMORY_AGENT_MEMORY_PATH", raising=False)
+        fake = tmp_path / "opt-in-home" / ".hermes" / "memories" / "MEMORY.md"
+        fake.parent.mkdir(parents=True, exist_ok=True)
+        fake.write_text("", encoding="utf-8")
+        hermes_host(fake)
+
+        cfg = MemoryConfig(
+            home=str(tmp_path / "optin-l1"),
+            agent_memory={"allow_auto_detect_write": True},
+        )
+        payload = self._run(cfg)
+
+        assert payload["success"] is True
+        assert payload["action"] == "injected"
+        assert "get_l0_index()" in fake.read_text(encoding="utf-8")
+
+    def test_status_still_reads_the_detected_file_without_writing(
+        self, tmp_path, monkeypatch, prod, hermes_host
+    ):
+        """Detection and reporting are untouched: the guard gates writes only."""
+        hermes_host(prod)
+        cfg = _bare_config(tmp_path, monkeypatch)
+        before = _digest(prod)
+
+        payload = self._run(cfg, action="status")
+
+        assert payload["success"] is True
+        assert payload["agent_type"] == "hermes"
+        assert payload["memory_path"] == str(prod)
+        assert payload["memory_injected"] is False
+        assert _digest(prod) == before

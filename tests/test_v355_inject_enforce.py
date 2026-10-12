@@ -17,6 +17,14 @@ The properties pinned below are the ones that make that safe to ship on top of
 an existing knowledge base:
 
   * **The default is unchanged.** Same result keys, same actions, same writes.
+  * **Only a positive non-L1 classification is refused.** `skill`,
+    `user_profile`, `agent_other`, `todo`, `ephemeral` — things the classifier
+    says belong somewhere else. `undecided` is the classifier saying it has no
+    evidence at all; that is not a verdict, so the write proceeds and is
+    annotated (`routing_enforcement.insufficient_evidence`). Refusing it would
+    have made the gate's answer a function of *length*: the same short fact
+    written out at length is admitted as `l1_knowledge` by the length-only
+    fallback.
   * **A refusal writes nothing.** No file, no section, no MEMORY_CHANGELOG
     event, no agent-owned write — and it hands back the surface the item
     belongs to, with the `AgentAction` to take instead.
@@ -34,6 +42,8 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+
+import pytest
 
 from layered_memory_mcp.config import MemoryConfig
 from layered_memory_mcp.injector import (
@@ -108,6 +118,19 @@ KNOWLEDGE_TEXT = (
 KNOWLEDGE_TEXT_2 = (
     "写入路径的职责边界：直写闸门在分类之后、去重之前运行，这个顺序是刻意的决策 —— "
     "被拒绝的内容不应该付出向量与合并的代价。当前的事实是：闸门只影响调用方自己指定目标的写入。"
+)
+
+#: Short, unmarked, structurally plain: no rule matches and it is below
+#: ``routing.MIN_CHARS_FOR_FALLBACK``, so it classifies `undecided` with score
+#: 0.0 and `confidence_basis: insufficient`.
+SHORT_UNMARKED_FACT = "镜像仓库在 registry.example.com。"
+
+#: The same shape of content, past ``MIN_CHARS_FOR_FALLBACK``: still no marker,
+#: but long enough for the length-only fallback to call it `l1_knowledge`.
+LONG_UNMARKED_PROSE = (
+    "镜像仓库在 registry.example.com，内网直连，不走代理；构建机和跳板机都已经配好解析，"
+    "别的机器要先改 hosts 才能拉取。这段话没有任何标记词，也没有编号步骤或命令块，"
+    "纯粹靠长度被归到持久知识。"
 )
 
 LOG_TEXT = """08:12:01 INFO: starting scan of 14 domains
@@ -370,6 +393,167 @@ class TestStrictGateRefuses:
             res["routing_enforcement"]["override_warning"]
         )
         assert _knowledge_files(cfg) == []
+
+
+# --- C2. absence of evidence is not a refusal --------------------------------
+
+
+class TestUndecidedIsAllowedWithAWarning:
+    """`undecided` means "no evidence", and no evidence is not a misfile.
+
+    The gate refuses what the classifier *positively* places elsewhere. An item
+    it cannot place at all goes where the caller said, annotated — otherwise a
+    strict install would refuse a one-line fact and accept the same fact padded
+    out past `MIN_CHARS_FOR_FALLBACK`, which is a rule about length, not about
+    content.
+    """
+
+    def test_the_fixture_really_is_undecided(self, tmp_path):
+        """Guards the tests below against a rule change in the classifier."""
+        from layered_memory_mcp.routing import classify_memory_item
+
+        decision = classify_memory_item(
+            SHORT_UNMARKED_FACT,
+            config=_strict(tmp_path),
+            domain="infra",
+            section="镜像仓库",
+        )
+        assert decision.surface.value == "undecided"
+        assert decision.confidence_basis == "insufficient"
+        assert decision.score == 0.0
+
+    def test_a_short_unmarked_fact_is_written_not_refused(self, tmp_path):
+        cfg = _strict(tmp_path)
+        res = inject_knowledge(
+            config=cfg,
+            domain="infra",
+            section="镜像仓库",
+            content=SHORT_UNMARKED_FACT,
+        )
+        assert res["success"] is True
+        assert res["action"] != ROUTING_REFUSED_ACTION
+        assert res["action"] in ("created", "section_created", "appended", "replaced")
+        assert "## 镜像仓库" in (Path(cfg.knowledge_dir) / "infra.md").read_text(
+            encoding="utf-8"
+        )
+        assert res["routing"]["surface"] == "undecided"
+
+    def test_the_allowed_write_carries_the_insufficient_evidence_warning(
+        self, tmp_path
+    ):
+        res = inject_knowledge(
+            config=_strict(tmp_path),
+            domain="infra",
+            section="镜像仓库",
+            content=SHORT_UNMARKED_FACT,
+        )
+        block = res["routing_enforcement"]
+        assert block["gate_active"] is True
+        assert block["insufficient_evidence"] is True
+        assert "insufficient evidence" in block["note"]
+        assert "the write was allowed and annotated" in block["note"]
+
+        warning = res["routing_warning"]
+        assert "INSUFFICIENT EVIDENCE" in warning
+        assert "allowed and annotated rather than refused" in warning
+        assert "routing_override='force_l1'" in warning
+
+    def test_the_allowed_write_records_a_normal_changelog_event(self, tmp_path):
+        """A real write is a real mutation — the warning does not change that."""
+        cfg = _strict(tmp_path)
+        inject_knowledge(
+            config=cfg,
+            domain="infra",
+            section="镜像仓库",
+            content=SHORT_UNMARKED_FACT,
+            agent_id="tester",
+        )
+        events = _events(cfg)
+        assert [e["operation"] for e in events] == ["l1_domain_created"]
+        assert events[0]["tool"] == "inject_knowledge"
+
+    def test_long_unmarked_prose_still_lands_as_l1_by_length_fallback(self, tmp_path):
+        """The other half of the asymmetry that used to decide refusals."""
+        cfg = _strict(tmp_path)
+        res = inject_knowledge(
+            config=cfg,
+            domain="infra",
+            section="镜像仓库",
+            content=LONG_UNMARKED_PROSE,
+        )
+        assert res["success"] is True
+        assert res["routing"]["surface"] == "l1_knowledge"
+        assert res["routing"]["confidence_basis"] == "insufficient"
+        assert "insufficient_evidence" not in res["routing_enforcement"]
+        assert "allowed the write" in res["routing_enforcement"]["note"]
+        assert "routing_warning" not in res
+        assert [e["operation"] for e in _events(cfg)] == ["l1_domain_created"]
+
+    def test_an_unmarked_fact_is_written_while_a_runbook_is_refused(self, tmp_path):
+        """One config, both halves of the policy."""
+        cfg = _strict(tmp_path)
+        allowed = inject_knowledge(
+            config=cfg,
+            domain="infra",
+            section="镜像仓库",
+            content=SHORT_UNMARKED_FACT,
+        )
+        refused = inject_knowledge(
+            config=cfg, domain="ops", section="发布流程", content=SKILL_TEXT
+        )
+        assert allowed["success"] is True
+        assert refused["action"] == ROUTING_REFUSED_ACTION
+        assert refused["routing"]["surface"] == "skill"
+        assert _knowledge_files(cfg) == ["infra.md"]
+        assert [e["operation"] for e in _events(cfg)] == ["l1_domain_created"]
+
+    @pytest.mark.parametrize(
+        ("surface", "section", "content"),
+        [
+            ("todo", "待办", TODO_TEXT),
+            ("ephemeral", "同步失败", LOG_TEXT),
+            ("user_profile", "回答风格", PROFILE_TEXT),
+        ],
+    )
+    def test_positive_non_l1_classifications_are_still_refused(
+        self, tmp_path, surface, section, content
+    ):
+        cfg = _strict(tmp_path)
+        res = inject_knowledge(
+            config=cfg, domain="ops", section=section, content=content
+        )
+        assert res["action"] == ROUTING_REFUSED_ACTION
+        assert res["error"] == ROUTING_REFUSED_ERROR
+        assert res["routing"]["surface"] == surface
+        assert "insufficient_evidence" not in res["routing_enforcement"]
+        assert _knowledge_files(cfg) == []
+        assert _events(cfg) == [], "a refusal is not a mutation"
+
+    def test_force_l1_on_an_undecided_item_is_a_no_op_that_says_so(self, tmp_path):
+        """The override is not needed here, and the result does not pretend it was."""
+        cfg = _strict(tmp_path)
+        res = inject_knowledge(
+            config=cfg,
+            domain="infra",
+            section="镜像仓库",
+            content=SHORT_UNMARKED_FACT,
+            routing_override="force_l1",
+        )
+        assert res["success"] is True
+        assert "routing_override_applied" not in res
+        assert res["routing_enforcement"]["override_requested"] == "force_l1"
+        assert res["routing_enforcement"]["override_applied"] is False
+        assert "it was not needed here" in res["routing_enforcement"]["note"]
+        assert "would have REFUSED" not in res["routing_warning"]
+
+    def test_capabilities_say_undecided_is_written_not_refused(self, tmp_path):
+        note = (
+            surface_capabilities(_strict(tmp_path))
+            .to_dict()["core_surfaces"]["l1_knowledge"]["notes"]
+        )
+        assert "REFUSED" in note
+        assert "'undecided'" in note
+        assert "rather than refused" in note
 
 
 # --- D. the gate lets L1 through, and the caller can insist ------------------

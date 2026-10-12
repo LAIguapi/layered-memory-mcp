@@ -18,12 +18,11 @@ from __future__ import annotations
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from ..config import get_config
 from ..models import (
     ConfidenceScorer,
     KnowledgeEntry,
@@ -34,6 +33,9 @@ from ..models import (
     SourceType,
 )
 from ..storage import L1Store, ReviewQueue, VectorStore
+
+if TYPE_CHECKING:
+    from ..config import MemoryConfig
 
 logger = logging.getLogger("layered_memory_mcp.api")
 
@@ -104,20 +106,31 @@ class ReviewQueueItem(BaseModel):
 stores: dict[str, Any] = {}
 
 
+def store_dirs(config: "MemoryConfig | None" = None) -> tuple[Path, Path]:
+    """``(knowledge_dir, data_dir)`` for this HTTP server's stores.
+
+    Framework-native, and deliberately the *same* layout the MCP server uses:
+    ``MemoryConfig`` resolves ``knowledge_dir`` from ``LAYERED_MEMORY_HOME`` /
+    ``<home>/knowledge`` (``config.default_knowledge_dir``), and the SQLite
+    stores sit beside it in ``<home>/data`` — the directory ``MemoryConfig``
+    already uses for the vector store, the changelog and the session state DB.
+
+    This used to read ``knowledge_dir`` / ``data_dir`` out of a dict with
+    ``~/.hermes/...`` fallbacks: the last product-path literals outside
+    ``adapters/``, and a layout no other entry point shared. ``api/server.py``
+    is now in the AST product-path boundary test
+    (``tests/test_v353_agent_adapters.py``) so it cannot drift back.
+    """
+    from ..config import MemoryConfig
+
+    cfg = config if config is not None else MemoryConfig()
+    return Path(cfg.knowledge_dir), Path(cfg.home) / "data"
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize stores on startup."""
-    cfg = get_config()
-    # These product-path defaults are legacy to this HTTP server and are the last
-    # such literals left outside the adapters. The framework's own layout is
-    # ``<LAYERED_MEMORY_HOME>/knowledge`` and ``/data`` via
-    # ``config.default_knowledge_dir``; this module predates that and is not
-    # covered by the AST product-path boundary test (which lists only the core
-    # modules), so the drift is invisible to the suite. Align it with
-    # ``default_knowledge_dir`` in a dedicated change — it moves where an
-    # existing deployment reads and writes.
-    knowledge_dir = Path(cfg.get("knowledge_dir", "~/.hermes/knowledge")).expanduser()
-    data_dir = Path(cfg.get("data_dir", "~/.hermes/data")).expanduser()
+    knowledge_dir, data_dir = store_dirs()
 
     stores["l1"] = L1Store(knowledge_dir)
     stores["vector"] = VectorStore(data_dir / "vectors.db")

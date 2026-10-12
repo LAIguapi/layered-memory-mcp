@@ -142,7 +142,7 @@ layered-memory-mcp --verbose
 | `LAYERED_MEMORY_AUTO_MAINTAIN_ATTEMPT_INTERVAL_HOURS` | *周期トリガー*による遅延判定の最小間隔（時間、`0` で無効） | `1` |
 | `LAYERED_MEMORY_ROUTING_ENABLED` | 内容を分類し、書き込み結果にルーティング情報を注記 | `true` |
 | `LAYERED_MEMORY_ROUTING_MODE` | `advisory`（助言）または `enforce`（強制）— `compact_memory` にのみ作用 | `advisory` |
-| `LAYERED_MEMORY_ROUTING_ENFORCE_DIRECT_WRITES` | 明示的な `inject_knowledge` が非L1内容を書こうとしたら拒否 | `false` |
+| `LAYERED_MEMORY_ROUTING_ENFORCE_DIRECT_WRITES` | 明示的な `inject_knowledge` の内容が積極的に非L1の面と判定されたら拒否 | `false` |
 | `LAYERED_MEMORY_AGENT_EXTENSIONS_ENABLED` | エージェント所有面への代理書き込みを許可 | `false` |
 | `LAYERED_MEMORY_AGENT_EXTENSIONS_MODE` | `suggest` / `apply_with_confirmation` / `apply` | `suggest` |
 | `LAYERED_MEMORY_AGENT_EXTENSIONS_ROOT` | ファイル書き込み型ハンドラの基準ディレクトリ | 未設定（拒否される） |
@@ -170,7 +170,7 @@ promotion:
 routing:
   enabled: true
   mode: advisory                               # advisory | enforce — compact_memory のみを制御（下記参照）
-  enforce_direct_writes: false                 # true = inject_knowledge が非L1内容を拒否
+  enforce_direct_writes: false                 # true = inject_knowledge が積極的に非L1と判定された内容を拒否
   # 以下のリストも governance と同じく内蔵語彙に「追加」されます：
   extra_skill_markers: ["手順書"]
   extra_todo_markers: ["承認待ち"]
@@ -196,7 +196,7 @@ memory_changelog:
 
 キーを書かなければデフォルトが維持されます。`watch_patterns` を設定すると、あなたのリストが内蔵パターンリストを置き換えます。`[]` にするとパターン一致を無効化できます。
 
-`agent_memory:` は、L0ポインタ／知識インデックス項目をどの「エージェント自身の」記憶ファイル（`MEMORY.md`、`CLAUDE.md` など）に投射できるかを決めます。パス未設定の場合フレームワークは自動検出します — 読むだけなら問題ありませんが、書き込みには危険です：曖昧な設定（テスト、一時的なhome上で走る使い捨てスクリプト）が実ファイルを解決して静かに追記してしまいます。そのため投射書き込みには次のいずれかが必要です：明示的な書き込み先（`agent_memory.path`、または呼び出し時の `memory_path` 引数）、明示的な許可（`allow_auto_detect_write: true`）、検出先が `<LAYERED_MEMORY_HOME>` の内側にあること、あるいはそのhomeが一時／テスト用サンドボックスではなく本インストールの実際の設定homeであること。それ以外はすべて拒否され、`agent_memory_write: {status: "skipped", reason: "unsafe_auto_detect_write", detected_path, hint}` として報告されます — L1書き込み自体は常に成功し、止まるのは投射だけです。**検出できることは権限ではありません**：アダプタ経由でパスを解決できても、それを書く権利は生じません。
+`agent_memory:` は、L0ポインタ／知識インデックス項目をどの「エージェント自身の」記憶ファイル（`MEMORY.md`、`CLAUDE.md` など）に投射できるかを決めます。パス未設定の場合フレームワークは自動検出します — 読むだけなら問題ありませんが、書き込みには危険です：曖昧な設定（テスト、一時的なhome上で走る使い捨てスクリプト）が実ファイルを解決して静かに追記してしまいます。そのため投射書き込みには次のいずれかが必要です：明示的な書き込み先（`agent_memory.path`、または呼び出し時の `memory_path` 引数）、明示的な許可（`allow_auto_detect_write: true`）、検出先が `<LAYERED_MEMORY_HOME>` の内側にあること、あるいはそのhomeが一時／テスト用サンドボックスではなく本インストールの実際の設定homeであること。それ以外はすべて拒否され、`agent_memory_write: {status: "skipped", reason: "unsafe_auto_detect_write", detected_path, hint}` として報告されます — L1書き込み自体は常に成功し、止まるのは投射だけです。**検出できることは権限ではありません**：アダプタ経由でパスを解決できても、それを書く権利は生じません。同じ規則は `integrate_agent(action="inject_memory")`（そのファイルに認識用スニペットを追記する操作）にも適用されます：注入を求めたのはあなたですが、「どのファイルか」を決めたのは依然として検出なので、純粋に自動検出された書き込み先は `agent_memory_write: {status: "refused", …}` で拒否され、何も書かれません。検出・状態報告・読み取りには影響しません。
 
 ### 共通コアはエージェント非依存
 
@@ -508,7 +508,7 @@ agent_extensions:
 
 **記録されないもの。** 融合／統合の遅延ハンドシェイク、`fuse_conflict` や `consolidate_refused` の拒否、スキップされた重複、検証の失敗、書き込みの失敗、`dry_run=True` の試行、エントリ集合が変わらなかったL0再同期、そして内容ハッシュが変わらなかった書き込み。単一セクションの削除にはまだイベントがありません — 一つのセクションだけを削除するツールが存在しないためです（`ROADMAP.md` 参照）。
 
-**読み方。** `get_memory_changelog(domain, operation, surface, since, limit)` は新しい順・件数上限付き（既定50、ハード上限500）で返します。`get_memory_changelog_stats()` は操作／面／領域別の件数と期間を集計します。どちらも読み取り専用です。`get_memory_surface_capabilities` は `memory_changelog` について、バックエンドが実際に有効かどうかを `can_apply` に反映し、解決後の `store_path` も報告します。
+**読み方。** `get_memory_changelog(domain, operation, surface, since, limit)` は新しい順・件数上限付き（既定50、ハード上限500）で返します。`get_memory_changelog_stats()` は操作／面／領域別の件数と期間を集計します。どちらも読み取り専用です。`get_memory_surface_capabilities` は `memory_changelog` について、バックエンドが実際に有効かどうかを `can_apply` に反映し、解決後の `store_path` も報告します。16 MiB の読み取り上限を超えて育ったログはそもそも解析されません — そのとき両方のレポートが `read_truncated: true`、`read_error: "memory_changelog_too_large"`、`max_read_bytes`、`file_size_bytes` を持つので、「読めないログ」が「空のログ」に見えることはありません。ファイル自体には触れません。
 
 ### 書き込み一回で即座に可視化パイプライン (v0.5.0)
 
@@ -557,11 +557,16 @@ L1に置くのは**持続する知識**、つまり今成り立っているル�
 |---|---|---|---|---|
 | `true` | `false`（既定） | — | 任意 | 従来どおり書き込み。非L1なら `routing_warning` 付き（挙動は不変） |
 | `true` | `true` | `"none"`（既定） | `l1_knowledge` / `l0_index` | 通常どおり書き込み、`MEMORY_CHANGELOG` イベントも記録 |
-| `true` | `true` | `"none"` | それ以外 | **拒否**、何も書かない |
-| `true` | `true` | `"force_l1"` | それ以外 | 書き込み、`routing_override_applied: true` を付与 |
+| `true` | `true` | `"none"` | `undecided`（どちらとも言える根拠がない） | 通常どおり書き込み、加えて `routing_warning` と `routing_enforcement.insufficient_evidence: true` |
+| `true` | `true` | `"none"` | `skill` / `user_profile` / `agent_other` / `todo` / `ephemeral` | **拒否**、何も書かない |
+| `true` | `true` | `"force_l1"` | 拒否される面のいずれか | 書き込み、`routing_override_applied: true` を付与 |
 | `false` | `true` | — | 分類しない | 従来どおり書き込み、結果は旧来の形（routingフィールドなし） |
 
+ゲートが拒否するのは**積極的な**非L1分類 — 分類器が別の面に属すると判断した内容です。根拠の不在では拒否しません：`undecided` はどのルールにも一致しなかったという意味なので、書き込みは指定どおりの場所に入り、代わりに警告が付きます。これを拒否すると、答えが内容ではなく長さの関数になってしまいます — 同じ無標記の事実でも `MIN_CHARS_FOR_FALLBACK`（80文字）を超えて書けば、長さだけのフォールバックで `l1_knowledge` として受け入れられるからです。こうした書き込みでは `routing_warning` を確認してください。`routing_override="force_l1"` もここでは受け付けられ、「不要だった」と報告します。
+
 `routing.mode` は終始これと直交します：`compact_memory` が何を移行するかを決めるだけで、それ自体が直接書き込みを拒否することはありません。
+
+**ゲートの適用範囲。** `inject_knowledge`、`inject_knowledge_tool`、`batch_inject_knowledge_tool` — セクション単位の直接書き込みです。ファイル全体を扱う `create_knowledge_file` / `update_knowledge_file` は**対象外**です：あれらはルーターを一切通さずにL1ファイルを丸ごと書き込み（または置き換え）ますので、このフラグがオンでもオフでも分類も拒否も適用されません。設計上あくまで粗い道具です。ROADMAP §4 Gap 2 を参照してください。
 
 拒否結果は構造化されており、検証エラーではありません — リクエスト自体は正しく、問題は**書き込み先**です：
 
@@ -821,12 +826,14 @@ python -m layered_memory_mcp.server
 
 ## 変更履歴
 
-完全なリリース履歴は [CHANGELOG.md](CHANGELOG.md) を参照してください。`3.4.7` の主な内容：
+完全なリリース履歴は [CHANGELOG.md](CHANGELOG.md) を参照してください。`3.5.0` の主な内容：
 
-- ライフサイクル治理：構造化された推奨アクション（`move_to_todo` / `rewrite_as_current_rule` / `keep_with_reason`）、マーカー語彙は設定可能
-- `plan_knowledge_cleanup_tool` と `apply_safe_knowledge_cleanup_tool`：読み取り専用の計画と、安全なアクションのdry-run優先の実行
-- 知識のバックアップを稼働中の知識ディレクトリの外、`data/backups/knowledge/` に集約
-- ベクトルに埋め込むテキストの見出しから日付・バージョンなどのノイズを除去
+- 記憶面モデルと決定論的な永続化ルーター（`classify_memory_item`）。既定では助言のみ
+- `get_memory_surface_capabilities`：現在の設定でフレームワークが書ける面と、提案しかできない面
+- 任意で有効化するエージェント拡張層と `apply_agent_action`：既定で無効、拒否はすべて報告
+- 永続化された `MEMORY_CHANGELOG` バックエンドと `get_memory_changelog` / `get_memory_changelog_stats`
+- 厳格な直接書き込み（`routing.enforce_direct_writes`）：積極的に非L1と判定された内容は拒否し、判定できない内容は書き込んで注記
+- エージェント環境アダプタ：共通コアに製品パスはもう存在せず、検出は権限ではない
 - globベースの雑多ファイルスキャン（`promotion.watch_patterns`）、英語・中国語のデフォルト付き
 
 ## ライセンス

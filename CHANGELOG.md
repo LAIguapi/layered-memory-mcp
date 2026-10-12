@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [3.5.0] - 2026-10-12
 
 ### Added
 
@@ -428,6 +428,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`KnowledgeType.PROCEDURE` is documented as legacy.** The value is kept and
   still parses from existing frontmatter — removing it would make older
   markdown unreadable — but procedural content belongs on the SKILL surface.
+- **The strict direct-write gate refuses a verdict, not a silence.**
+  `routing.enforce_direct_writes: true` now refuses only a **positive** non-L1
+  classification — `skill`, `user_profile`, `agent_other`, `todo`, `ephemeral`,
+  and any future surface (the gate is an allow-list of `l1_knowledge` /
+  `l0_index` / `undecided`, so a new surface starts refused). `undecided` is no
+  longer refused: it is what the classifier returns when *no rule matched*, so
+  refusing it made the gate's answer a function of length rather than of
+  content — a short unmarked fact classified `undecided` and was refused, while
+  the same fact written out past `MIN_CHARS_FOR_FALLBACK` was admitted as
+  `l1_knowledge` by the length-only fallback. Such a write now proceeds to L1
+  and says what it rests on: `routing_enforcement.insufficient_evidence: true`,
+  a note naming the absence of evidence, and a `routing_warning` pointing at
+  the target domain/section and at `routing_override="force_l1"` (accepted
+  there too, and reported as "not needed"). Refusals, `force_l1` and the
+  changelog semantics are otherwise unchanged, and the default install is
+  untouched.
+- **`routing.enforce_direct_writes` documents its reach.** All four READMEs,
+  `config/config.example.yaml` and the `l1_knowledge` capability note now state
+  that it governs `inject_knowledge` / `inject_knowledge_tool` /
+  `batch_inject_knowledge_tool` and does **not** route the whole-file tools
+  `create_knowledge_file` / `update_knowledge_file` (ROADMAP §4 Gap 2). Docs
+  only; no behaviour change.
+
+### Fixed
+
+- **An unreadable memory changelog no longer looks like an empty one.** Above
+  the store's 16 MiB read ceiling the file is not parsed — and that used to be
+  visible only in a server log line, so `get_memory_changelog` answered
+  `total_events: 0` with no entries, exactly like a clean install. Both reads
+  now carry `read_truncated`, `read_error`
+  (`"memory_changelog_too_large"`), `max_read_bytes` and `file_size_bytes`,
+  plus a `read_note` when truncated. The read path still never raises, still
+  never parses the oversized file and still never rewrites it; `size_bytes` and
+  every other existing key are unchanged. This is a report flag, not retention
+  — nothing prunes the log.
+- **`integrate_agent(action="inject_memory")` is guarded.** It appended the
+  awareness snippet straight into the auto-detected agent memory file — the one
+  write left that treated detection as permission. It now resolves through
+  `agent_memory_guard`: an explicitly configured target, an explicit opt-in, a
+  file inside the framework's own home or a real configured install writes as
+  before; anything else is refused with `{success: false, action: "skipped",
+  error: "unsafe_auto_detect_write", agent_memory_write: {...}}` and writes
+  nothing. `resolve_write_target` gained a `detected=` argument for callers
+  that resolved a candidate by another probe, and rule 2 now requires the
+  configured path to *be* that candidate, so a configured target cannot
+  license a write to a different file. Detection, `status` reporting and reads
+  are unchanged.
+- **The REST API server no longer defaults to a product path.**
+  `api/server.py` resolved its stores from `~/.hermes/knowledge` and
+  `~/.hermes/data` — the last product-path literals outside `adapters/`, a
+  layout no other entry point shared, and reached through a `get_config` import
+  that no longer existed. It now uses `store_dirs()`: `MemoryConfig`'s own
+  `knowledge_dir` (`LAYERED_MEMORY_HOME` / `<home>/knowledge`) and
+  `<home>/data`, the same layout as the MCP server. `api/server.py` joined the
+  AST product-path boundary test so it cannot drift back.
 
 ## [3.4.7] - 2026-10-12
 

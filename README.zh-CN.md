@@ -142,7 +142,7 @@ layered-memory-mcp --verbose
 | `LAYERED_MEMORY_AUTO_MAINTAIN_ATTEMPT_INTERVAL_HOURS` | 两次*周期触发*的懒判断之间的最小小时数（`0` 关闭） | `1` |
 | `LAYERED_MEMORY_ROUTING_ENABLED` | 分类内容并为写入结果加注路由信息 | `true` |
 | `LAYERED_MEMORY_ROUTING_MODE` | `advisory`（建议）或 `enforce` —— 只作用于 `compact_memory` | `advisory` |
-| `LAYERED_MEMORY_ROUTING_ENFORCE_DIRECT_WRITES` | 显式 `inject_knowledge` 写入非 L1 内容时直接拒绝 | `false` |
+| `LAYERED_MEMORY_ROUTING_ENFORCE_DIRECT_WRITES` | 显式 `inject_knowledge` 的内容被明确分类到非 L1 面时直接拒绝 | `false` |
 | `LAYERED_MEMORY_AGENT_EXTENSIONS_ENABLED` | 允许框架代写代理自有面 | `false` |
 | `LAYERED_MEMORY_AGENT_EXTENSIONS_MODE` | `suggest` / `apply_with_confirmation` / `apply` | `suggest` |
 | `LAYERED_MEMORY_AGENT_EXTENSIONS_ROOT` | 写文件类扩展处理器的基准目录 | 未设置（会拒绝） |
@@ -170,7 +170,7 @@ promotion:
 routing:
   enabled: true
   mode: advisory                               # advisory | enforce —— 只拦 compact_memory（见下）
-  enforce_direct_writes: false                 # true = inject_knowledge 拒写非 L1 内容
+  enforce_direct_writes: false                 # true = inject_knowledge 拒写明确非 L1 的内容
   # 以下列表同样是在内置词表基础上"追加"，风格与 governance 一致：
   extra_skill_markers: ["操作手册"]
   extra_todo_markers: ["待签字"]
@@ -196,7 +196,7 @@ memory_changelog:
 
 不写某个键就保持默认。如果设置了 `watch_patterns`，你的列表会替换内置模式列表；设为 `[]` 可关闭模式匹配。
 
-`agent_memory:` 决定框架可以把 L0 指针 / 知识索引条目投射到哪个「代理自己的」记忆文件（`MEMORY.md`、`CLAUDE.md` 等）。没配路径时框架会自动探测 —— 用于读取没问题，用于写入就危险了：任何含糊的配置（一个测试、一个建在临时 home 上的试跑脚本）都会解析到真实文件并静默追加。所以投射写入必须满足其中之一：显式目标（`agent_memory.path`，或调用时传 `memory_path`）、显式开关（`allow_auto_detect_write: true`）、探测到的文件就在 `<LAYERED_MEMORY_HOME>` 之内、或者这个 home 确实是本次安装真正配置的 home 而非临时/测试沙箱。其余情况一律拒绝并上报 `agent_memory_write: {status: "skipped", reason: "unsafe_auto_detect_write", detected_path, hint}` —— L1 写入本身永远照常成功，只是投射停下。**能探测到不等于有权写入**：通过适配器解析出一个路径，并不授予写它的权限。
+`agent_memory:` 决定框架可以把 L0 指针 / 知识索引条目投射到哪个「代理自己的」记忆文件（`MEMORY.md`、`CLAUDE.md` 等）。没配路径时框架会自动探测 —— 用于读取没问题，用于写入就危险了：任何含糊的配置（一个测试、一个建在临时 home 上的试跑脚本）都会解析到真实文件并静默追加。所以投射写入必须满足其中之一：显式目标（`agent_memory.path`，或调用时传 `memory_path`）、显式开关（`allow_auto_detect_write: true`）、探测到的文件就在 `<LAYERED_MEMORY_HOME>` 之内、或者这个 home 确实是本次安装真正配置的 home 而非临时/测试沙箱。其余情况一律拒绝并上报 `agent_memory_write: {status: "skipped", reason: "unsafe_auto_detect_write", detected_path, hint}` —— L1 写入本身永远照常成功，只是投射停下。**能探测到不等于有权写入**：通过适配器解析出一个路径，并不授予写它的权限。同一条规则也适用于 `integrate_agent(action="inject_memory")`（把感知片段追加进那个文件）：注入是你要求的，但「写哪个文件」仍然是探测决定的，所以纯自动探测出来的目标会被拒绝，返回 `agent_memory_write: {status: "refused", …}`，什么都不写。探测、状态查询与读取不受影响。
 
 ### 公共内核与代理无关
 
@@ -509,7 +509,7 @@ Agent: "数据库连接字符串是什么？"
 
 **不记录的。** 延迟融合 / 延迟合并的握手、`fuse_conflict` 或 `consolidate_refused` 的拒绝、跳过的重复内容、参数校验失败、写入失败、`dry_run=True` 的试跑、条目集合没有变化的 L0 重新同步，以及内容哈希没变的写入。单个章节删除暂时没有事件，因为目前没有任何工具只删一个章节 —— 见 `ROADMAP.md`。
 
-**怎么读。** `get_memory_changelog(domain, operation, surface, since, limit)` 返回倒序、有上限的条目（默认 50，硬上限 500）；`get_memory_changelog_stats()` 汇总按操作 / 面 / 领域的计数与时间跨度。两者都是只读。`get_memory_surface_capabilities` 报告的 `memory_changelog` 中，`can_apply` 如实反映后端是否真的启用，并给出解析后的 `store_path`。
+**怎么读。** `get_memory_changelog(domain, operation, surface, since, limit)` 返回倒序、有上限的条目（默认 50，硬上限 500）；`get_memory_changelog_stats()` 汇总按操作 / 面 / 领域的计数与时间跨度。两者都是只读。`get_memory_surface_capabilities` 报告的 `memory_changelog` 中，`can_apply` 如实反映后端是否真的启用，并给出解析后的 `store_path`。如果日志已经涨过 16 MiB 的读取上限，它根本不会被解析 —— 这时两个报告都会带上 `read_truncated: true`、`read_error: "memory_changelog_too_large"`、`max_read_bytes` 和 `file_size_bytes`，所以「读不了」永远不会看起来像「没有记录」。文件本身不会被动过。
 
 ### 写即可见流水线（v0.5.0）
 
@@ -558,11 +558,16 @@ L1 用来存放**长期知识**，也就是当前成立的规则和事实。未�
 |---|---|---|---|---|
 | `true` | `false`（默认） | — | 任意 | 照常写入，非 L1 时带 `routing_warning`（行为不变） |
 | `true` | `true` | `"none"`（默认） | `l1_knowledge` / `l0_index` | 照常写入，并记录 `MEMORY_CHANGELOG` 事件 |
-| `true` | `true` | `"none"` | 其他 | **拒绝**，什么都不写 |
-| `true` | `true` | `"force_l1"` | 其他 | 照写，并标记 `routing_override_applied: true` |
+| `true` | `true` | `"none"` | `undecided`（两边都没有证据） | 照常写入，并带 `routing_warning` 与 `routing_enforcement.insufficient_evidence: true` |
+| `true` | `true` | `"none"` | `skill` / `user_profile` / `agent_other` / `todo` / `ephemeral` | **拒绝**，什么都不写 |
+| `true` | `true` | `"force_l1"` | 任何会被拒绝的面 | 照写，并标记 `routing_override_applied: true` |
 | `false` | `true` | — | 不分类 | 照常写入，结果是旧的形状（没有任何 routing 字段） |
 
+闸门拒的是**明确的**非 L1 分类 —— 分类器判定它属于另一个面的内容。它不会因为「没有证据」而拒：`undecided` 表示没有任何规则命中，所以这条写入照旧落到你指定的位置，只是带上警告。如果连这个也拒，答案就变成了长度的函数而不是内容的函数 —— 同一条没有标记的事实，只要写得超过 `MIN_CHARS_FOR_FALLBACK`（80 字符），就会被纯长度回退判成 `l1_knowledge`。这类写入请留意 `routing_warning`；`routing_override="force_l1"` 在这里也接受，并会说明它其实不需要。
+
 `routing.mode` 全程与此正交：它决定 `compact_memory` 迁移什么，自己永远不会拒绝一次直写。
+
+**闸门管到哪里。** `inject_knowledge`、`inject_knowledge_tool` 和 `batch_inject_knowledge_tool` —— 也就是节级别的直接写入。它**不**管整文件工具 `create_knowledge_file` / `update_knowledge_file`：那两个会整体写入（或替换）一个 L1 文件，根本不经过路由器，所以无论这个开关是开还是关，分类与拒绝都不适用于它们。它们按设计就是粗颗粒的工具；见 ROADMAP §4 Gap 2。
 
 拒绝结果是结构化的，而且不是校验错误 —— 请求本身没问题，问题在于**目标**：
 
@@ -822,12 +827,14 @@ python -m layered_memory_mcp.server
 
 ## 更新日志
 
-完整版本历史见 [CHANGELOG.md](CHANGELOG.md)。`3.4.7` 近期要点：
+完整版本历史见 [CHANGELOG.md](CHANGELOG.md)。`3.5.0` 近期要点：
 
-- 生命周期治理：结构化建议动作（`move_to_todo` / `rewrite_as_current_rule` / `keep_with_reason`），标记词表可配置
-- `plan_knowledge_cleanup_tool` 与 `apply_safe_knowledge_cleanup_tool`：只读规划，安全动作先 dry-run 再执行
-- 知识备份移出活动知识目录，统一放在 `data/backups/knowledge/`
-- 向量文本中的标题去除日期/版本等噪声
+- 记忆面模型与确定性持久化路由（`classify_memory_item`），默认只给建议
+- `get_memory_surface_capabilities`：当前配置下框架能写哪些面、哪些只能给建议
+- 可选的代理扩展层与 `apply_agent_action`：默认关闭，每次拒绝都上报
+- 持久化的 `MEMORY_CHANGELOG` 后端，配套 `get_memory_changelog` / `get_memory_changelog_stats`
+- 严格直写（`routing.enforce_direct_writes`）：拒绝明确非 L1 的分类，对无法判定的内容照写并加注
+- 代理环境适配器：公共核心不再包含任何产品路径 —— 能探测到也不等于有权写入
 - 基于 glob 的杂项文件扫描（`promotion.watch_patterns`），内置中英文默认值
 
 ## 许可证
