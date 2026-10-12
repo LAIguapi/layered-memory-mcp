@@ -78,16 +78,49 @@ and the installers are Hermes-only, and refuse clearly on any other host. Done
 when a second agent actually needs one of those surfaces and the branch becomes
 a capability lookup.
 
-## 3. Optional `apply_agent_action` execution path
+## 3. Optional `apply_agent_action` execution path — done, with three gaps
 
-The `agent_extensions` config exists and `apply_agent_action` refuses with
-`status: "unsupported"` because the registry is empty. No real skill/profile
-write is implemented, by design.
+**Done.** `apply_agent_action` is a write-capable MCP tool and public function
+that refuses by default and reports every refusal as a structured
+`AgentActionResult` (`{applied, status, surface, operation, handler, adapter,
+mode, dry_run, confirmed, target, blockers, detail, error, metadata}`). The
+gates are: action validation (`kind` / `surface` / `operation` /
+`source_content`, refused not repaired), extension-surface membership, the two
+`enabled` switches, `mode != suggest`, a `handler` that is registered *and*
+supports the surface, the handler's own `readiness`, `confirmed=True` under
+`apply_with_confirmation` or for an action asking for it, then `dry_run`.
 
-Done when: one reference adapter performs a real write for one agent-owned
-surface, gated on all four opt-in conditions plus confirmation semantics for
-`apply_with_confirmation`, and a refusal path that is reported rather than
-silent — the same contract [item 5 of the write guard] establishes.
+`adapters/generic_file.py` is the reference adapter: it appends one bounded
+Markdown section to an explicitly configured file and never edits existing text
+(`update` records what it supersedes). It refuses `no_configured_path`,
+`path_escapes_base`, `unsafe_system_target` and `unsafe_file_type`. It is the
+only registered handler, and registration grants nothing.
+`routing.extension_readiness` is the single computation behind both
+`get_memory_surface_capabilities` and the execution path, so `can_apply` can no
+longer promise a write that would then be refused.
+`tests/test_v354_apply_agent_action.py` covers the chain link by link; no
+agent-owned apply records a `MEMORY_CHANGELOG` event.
+
+**Gap 1 — no agent-native handler.** Writing a *Hermes* skill or profile file
+(or Claude Code's, or Cursor's) is still unimplemented, deliberately: the
+generic handler proves the contract without the framework claiming to know
+another product's skill format. Done when an environment adapter also exposes
+an extension-write target and a handler uses it — at which point the question
+"what shape does a skill file have in this product?" has to be answered, and
+that answer belongs to the product, not here.
+
+**Gap 2 — append-only, so no lifecycle.** `update` appends a superseding
+section and nothing ever removes or supersedes-in-place. A file that
+accumulates forty revisions of one runbook is the user's to clean up; the
+handler will not prune it. Done when either a compaction pass for these files
+exists (and says what it removed) or the limitation is documented as permanent.
+
+**Gap 3 — the lock file is left behind.** The handler takes the same
+`<path>.lock` `FileLock` the L1 write path uses, so two concurrent applies
+cannot interleave their sections, but nothing removes the lock file afterwards
+(neither does `l1_store`). Harmless, and still litter next to a file the user
+owns. Done when the write paths clean up their own locks, or when the `.lock`
+convention moves somewhere out of the user's directory.
 
 ## 4. `inject_knowledge` enforce behaviour — decide it
 

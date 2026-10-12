@@ -49,6 +49,7 @@ L0 索引、向量库与搜索索引都是从 L1 Markdown **派生**出来的，
 - **智能知识注入** — 一次写入即可见：自动去重、定位章节、同步 L0 索引（支持 upsert/append/merge 模式）
 - **持久化路由** — 确定性分类器（`classify_memory_item`）判断一条内容该去哪个记忆面：L1 知识、TODO、你自己的技能/画像面，还是干脆不保留。只用标记词 + 结构规则，不调用模型、不做向量推断。默认只给建议，为写入结果加注而不改变写入行为
 - **能力反射** — `get_memory_surface_capabilities` 按当前配置如实报告：哪些面框架可以代写，哪些面只能给建议
+- **可选的代理动作执行** — `apply_agent_action` 可以代你写入已分类的技能／画像／代理自有内容，但只以「显式配置的编排者」身份行事：默认关闭，按面分开关，有确认模式、`dry_run` 和显式目标路径。每一次拒绝都会上报，绝不静默
 - **关键词搜索** — 支持关键词、模糊、BM25/TF-IDF 三种搜索模式，长文档评分更准确
 - **Agent 无关 L0 访问** — `get_l0_index` 工具让任何 MCP agent 都能获取记忆索引
 - **多 Agent 命名空间** — 通过 `LAYERED_MEMORY_NAMESPACE` 隔离不同 agent 的知识，同时共享公共知识
@@ -140,6 +141,8 @@ layered-memory-mcp --verbose
 | `LAYERED_MEMORY_ROUTING_ENABLED` | 分类内容并为写入结果加注路由信息 | `true` |
 | `LAYERED_MEMORY_ROUTING_MODE` | `advisory`（建议）或 `enforce` | `advisory` |
 | `LAYERED_MEMORY_AGENT_EXTENSIONS_ENABLED` | 允许框架代写代理自有面 | `false` |
+| `LAYERED_MEMORY_AGENT_EXTENSIONS_MODE` | `suggest` / `apply_with_confirmation` / `apply` | `suggest` |
+| `LAYERED_MEMORY_AGENT_EXTENSIONS_ROOT` | 写文件类扩展处理器的基准目录 | 未设置（会拒绝） |
 | `LAYERED_MEMORY_AGENT_MEMORY_PATH` | 代理自己的记忆文件（显式写入目标） | 自动探测 |
 | `LAYERED_MEMORY_AGENT_MEMORY_ALLOW_AUTO_DETECT_WRITE` | 允许向自动探测到的记忆文件投射 L0 指针 | `false` |
 | `LAYERED_MEMORY_CHANGELOG_ENABLED` | 把 L0/L1 的语义变更记入记忆变更日志 | `true` |
@@ -239,22 +242,88 @@ environments.register(AcmeEnvironment(), priority=15)
 agent_extensions:
   enabled: false                 # 总开关（默认关闭）
   mode: suggest                  # suggest | apply_with_confirmation | apply
-  adapter: null                  # 你的集成名，例如 generic / command / custom
+  adapter: null                  # 集成标签，例如 generic_file / custom
+  root: null                     # 可选：相对路径的基准目录
   surfaces:
     skill:
       enabled: false
       handler: null              # 已注册适配器的名字
+      path: null                 # 写文件类处理器的显式目标
     user_profile:
       enabled: false
       handler: null
+      path: null
     agent_other:
       enabled: false
       handler: null
+      path: null
 ```
 
-框架要代写某个面，四个条件必须同时成立：顶层 `enabled: true`、该面 `enabled: true`、`handler` 指向一个已注册的适配器、并且 `mode` 不是 `suggest`。任何一项缺失或配置写错，都会逐键回退到"只分类、只建议"。**开启它不会转移归属**：`get_memory_surface_capabilities` 仍然把这些面报告为 `owned_by: agent`，只是把 `can_apply` 置为 true —— 框架在那里是编排者，永远不是所有者。
+框架要代写某个面，五个条件必须同时成立：顶层 `enabled: true`、该面 `enabled: true`、`handler` 指向一个**确实已注册**的适配器、`mode` 不是 `suggest`、并且该处理器能解析出一个安全的目标。任何一项缺失或配置写错，都会逐键回退到"只分类、只建议"。**开启它不会转移归属**：`get_memory_surface_capabilities` 仍然把这些面报告为 `owned_by: agent`、`default_behavior: suggest`，只是把 `can_apply` 置为 true —— 框架在那里是编排者，永远不是所有者。
 
-本包不附带任何适配器：在集成方注册适配器（`layered_memory_mcp.adapters`）之前，`apply_agent_action` 一律以 `status: "unsupported"` 拒绝执行。
+`can_apply` 报告的是*真实*就绪状态，而不只是开关状态：配了但没注册的处理器会报 `handler_registered: false`，`apply_blockers` 列出的原因码与 `apply_agent_action` 拒绝时用的是同一套（`extensions_disabled`、`surface_disabled`、`mode_suggest`、`no_handler`、`handler_not_registered`、`no_configured_path` 等）。`registered_handlers` 列出你可以配置的处理器名字。
+
+#### `apply_agent_action` —— 唯一可写的工具，默认关闭
+
+```
+apply_agent_action(
+  surface="skill", operation="create", title="发布流程",
+  source_content="<你的原文>", rationale="可复用的操作协议",
+  confirmed=false, dry_run=false,
+  action=null,            # AgentAction 的 JSON 形式；给了就覆盖上面的扁平字段
+)
+```
+
+返回 `{applied, status, surface, operation, handler, adapter, mode, dry_run, confirmed, target, blockers, detail, error, metadata}`。`status` 取值：
+
+| status | 写了吗 | 含义 |
+| --- | --- | --- |
+| `disabled` | 没有 | `agent_extensions`（或该面）未开启，或 `mode: suggest` —— 只给建议 |
+| `unsupported` | 没有 | 没配 handler、handler 未注册，或它不支持这个面 |
+| `refused` | 没有 | 不是扩展面，或处理器拒绝（没有显式路径、目标不安全等） |
+| `invalid_action` | 没有 | `kind` / `surface` / `operation` / `source_content` 校验不通过 —— 绝不自动修补 |
+| `confirmation_required` | 没有 | `mode: apply_with_confirmation`（或动作自己要求确认）而 `confirmed` 为 false |
+| `would_apply` | 没有 | `dry_run: true` —— 报告目标路径、字节数和标题 |
+| `applied` | **写了** | 处理器已写入 |
+| `error` | 没有 | 处理器抛异常，异常信息在 `error` 里 |
+
+三种模式：`suggest`（默认）只分类并把 `AgentAction` 交给你；`apply_with_confirmation` 解析并报告目标，但需要带 `confirmed=true` 再调一次；`apply` 第一次调用就写，但动作自身 `requires_user_confirmation` 为真时仍然必须确认。
+
+执行 agent 自有动作**不会**写入 `MEMORY_CHANGELOG`。那份日志只记录框架自有的 L0/L1 语义变更；这里的写入属于 agent。
+
+#### `generic_file` 参考处理器
+
+包里随附一个已注册的处理器，但"已注册"不等于"有权限"—— 在上面那条链配齐、且目标路径能安全解析之前，它什么都不写：
+
+```yaml
+agent_extensions:
+  enabled: true
+  mode: apply_with_confirmation
+  adapter: generic_file
+  surfaces:
+    skill:
+      enabled: true
+      handler: generic_file
+      path: /srv/agent/extensions/skills.md
+```
+
+它为每个动作追加一个有长度上限的 Markdown `##` 小节：你的 `source_content`，上面带一小段元信息（面、操作、处理器、时间戳、rationale、`shape_hint`、动作 metadata），并以 `<!-- layered-memory:agent-action -->` 标记开头，便于机器检索。`create`、`append`、`update` **都是追加**；`update` 只记录它 `supersedes` 了什么，不做模糊原地编辑 —— 改写框架并不拥有的文件，是唯一可能毁掉内容的行为。超过 8000 字符的内容会被截断并显式标注。
+
+路径规则，全部是明确拒绝而非猜测：
+
+| 情况 | 结果 |
+| --- | --- |
+| 既没有 `path` 也没有 `root` | 拒绝，`no_configured_path` —— 故意不设默认位置 |
+| 只有 `root` | `<root>/<surface>.md` |
+| 相对 `path` | 基于 `root` 解析，没有 `root` 时基于 `LAYERED_MEMORY_HOME`，且必须留在其内（`path_escapes_base`） |
+| 绝对 `path` | 接受 —— 指名文件本身就是这道闸门要的"显式" |
+| 目录（已存在，或以 `/` 结尾） | `<dir>/<surface>.md` |
+| 位于 `/etc`、`/usr`、`/sys`、`/var/lib`、`C:\Windows` 等 | 拒绝，`unsafe_system_target` |
+| `.py` / `.yaml` / `.json` / `.db` / `.env` 或隐藏文件 | 拒绝，`unsafe_file_type` —— 往里追加 Markdown 会破坏文件 |
+
+父目录只会为你显式配置的路径创建。这条路径上没有命令适配器，也没有任何 shell 执行。写 Hermes 原生的技能／画像文件**没有实现**，仍在范围之外。
+
+自定义处理器就是一个带 `name`、`supports(surface)`、可选 `readiness(surface, config)` 和 `apply(action, config=None, *, dry_run=False)` 的类，通过 `layered_memory_mcp.adapters.registry.register(...)` 注册。没有声明 `dry_run` 参数的适配器永远不会在 `dry_run=True` 下被调用 —— 框架会直接拒绝，而不是冒着写入的风险。
 
 ## 使用方法
 
@@ -365,6 +434,7 @@ Agent: "数据库连接字符串是什么？"
 | `create_knowledge_file` | 创建新的 .md 文件（自动 L0 同步） |
 | `update_knowledge_file` | 覆盖已有文件（自动 L0 同步） |
 | `delete_knowledge_file` | 删除文件（自动 L0 同步） |
+| `apply_agent_action` | 通过已配置的处理器执行 agent 自有扩展面动作（`skill` / `user_profile` / `agent_other`）。**默认关闭** —— 在显式开启 `agent_extensions` 之前一律返回 `status: "disabled"`；支持 `dry_run` 与 `confirmed`，且不写 `MEMORY_CHANGELOG` |
 
 ### 管理工具
 

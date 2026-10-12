@@ -364,19 +364,29 @@ ROUTING_MODES = ("advisory", "enforce")
 def _normalize_agent_extensions(raw: object) -> dict:
     """Normalise the ``agent_extensions`` section to a complete, safe shape.
 
-    Returns ``{enabled, mode, adapter, surfaces: {<surface>: {enabled, handler}}}``.
+    Returns
+    ``{enabled, mode, adapter, root, surfaces: {<surface>: {enabled, handler, path}}}``.
 
     Every key falls back independently, and every fallback is the conservative
-    one (disabled / suggest-only / no handler). A half-written or malformed
-    section therefore degrades to "classify and suggest" instead of raising at
-    start-up — and in particular can never *accidentally* grant the framework
-    permission to write a store that belongs to the agent.
+    one (disabled / suggest-only / no handler / no path). A half-written or
+    malformed section therefore degrades to "classify and suggest" instead of
+    raising at start-up — and in particular can never *accidentally* grant the
+    framework permission to write a store that belongs to the agent.
+
+    ``root`` and the per-surface ``path`` are what an apply-capable handler
+    writes to. They are deliberately *not* defaulted: the reference
+    ``generic_file`` handler refuses when neither is set, because an implicit
+    target is exactly the hazard the whole opt-in chain exists to prevent.
     """
     out: dict = {
         "enabled": False,
         "mode": "suggest",
         "adapter": None,
-        "surfaces": {s: {"enabled": False, "handler": None} for s in AGENT_EXTENSION_SURFACES},
+        "root": None,
+        "surfaces": {
+            s: {"enabled": False, "handler": None, "path": None}
+            for s in AGENT_EXTENSION_SURFACES
+        },
     }
     if not isinstance(raw, dict):
         return out
@@ -386,6 +396,8 @@ def _normalize_agent_extensions(raw: object) -> dict:
     out["mode"] = mode if mode in AGENT_EXTENSION_MODES else "suggest"
     adapter = raw.get("adapter")
     out["adapter"] = str(adapter).strip() or None if adapter else None
+    root = raw.get("root")
+    out["root"] = (str(root).strip() or None) if root else None
 
     surfaces = raw.get("surfaces")
     if isinstance(surfaces, dict):
@@ -395,16 +407,19 @@ def _normalize_agent_extensions(raw: object) -> dict:
                 continue
             if isinstance(value, dict):
                 handler = value.get("handler")
+                path = value.get("path")
                 out["surfaces"][name] = {
                     "enabled": _coerce_bool(value.get("enabled"), False),
                     "handler": (str(handler).strip() or None) if handler else None,
+                    "path": (str(path).strip() or None) if path else None,
                 }
             else:
-                # ``skill: true`` shorthand — enabled, but still no handler, so
-                # the framework still cannot write it.
+                # ``skill: true`` shorthand — enabled, but still no handler and
+                # no path, so the framework still cannot write it.
                 out["surfaces"][name] = {
                     "enabled": _coerce_bool(value, False),
                     "handler": None,
+                    "path": None,
                 }
     return out
 
@@ -923,6 +938,9 @@ class MemoryConfig:
         _env_ax_adapter = os.environ.get("LAYERED_MEMORY_AGENT_EXTENSIONS_ADAPTER")
         if _env_ax_adapter:
             self.agent_extensions["adapter"] = _env_ax_adapter.strip() or None
+        _env_ax_root = os.environ.get("LAYERED_MEMORY_AGENT_EXTENSIONS_ROOT")
+        if _env_ax_root:
+            self.agent_extensions["root"] = _env_ax_root.strip() or None
 
         # v2.10.1: Domain classification table for the auto-extractor. The
         # framework ships **no** business presets — domain inference is opt-in.

@@ -46,6 +46,12 @@ With ``agent_extensions.enabled`` plus a configured per-surface handler, the
 framework becomes an orchestrator for that surface — the surface is still the
 agent's.
 
+``can_apply`` / ``framework_can_apply`` report *real* readiness, not just the
+config switches: :func:`extension_readiness` also asks whether the named handler
+is registered and whether it can resolve a safe target. A capability output that
+promised a write ``apply_agent_action`` then refuses would be worse than no
+capability output at all.
+
 This module never touches a filesystem path belonging to a specific agent
 product. Any such mapping belongs in an adapter (see ``adapters/base.py``).
 """
@@ -131,6 +137,22 @@ def ownership_of(surface: MemorySurface) -> SurfaceOwnership:
 ApplicationMode = Literal["suggest", "apply_with_confirmation", "apply"]
 RoutingMode = Literal["advisory", "enforce"]
 ConfidenceBasis = Literal["markers", "structure", "mixed", "insufficient"]
+
+# --- apply-blocker vocabulary ------------------------------------------------
+# Stable reason codes for "why can this extension surface not be applied".
+# Defined here, the lower layer, so the capability reflection and
+# ``adapters.base.apply_agent_action`` cannot drift apart; ``adapters.base``
+# re-exports them.
+BLOCK_EXTENSIONS_DISABLED = "extensions_disabled"
+BLOCK_SURFACE_DISABLED = "surface_disabled"
+BLOCK_MODE_SUGGEST = "mode_suggest"
+BLOCK_NO_HANDLER = "no_handler"
+BLOCK_HANDLER_NOT_REGISTERED = "handler_not_registered"
+BLOCK_HANDLER_CANNOT_WRITE_SURFACE = "handler_cannot_write_surface"
+BLOCK_HANDLER_READINESS_ERROR = "handler_readiness_error"
+BLOCK_HANDLER_NOT_READY = "handler_not_ready"
+BLOCK_ADAPTER_LAYER_UNAVAILABLE = "adapter_layer_unavailable"
+BLOCK_NOT_AN_EXTENSION_SURFACE = "not_an_extension_surface"
 
 #: Order used to break score ties. Earlier wins: an item that is both open work
 #: and a procedure leaves durable L1 first, and prose only falls through to L1
@@ -257,10 +279,17 @@ class SurfaceCapability(BaseModel):
     owned_by: SurfaceOwnership
     default_behavior: Literal["apply", "suggest", "none"]
     configured_handler: str | None = None
+    #: Whether ``configured_handler`` actually resolves to a registered adapter.
+    #: False with a non-null handler means the config names something unknown —
+    #: visible here rather than only in a refusal at write time.
+    handler_registered: bool = False
     can_apply: bool = False
     application_mode: ApplicationMode = "suggest"
+    #: Stable reason codes for why ``can_apply`` is false. Empty when it is true.
+    apply_blockers: list[str] = Field(default_factory=list)
     #: Resolved location of the surface's own durable store, when it has one
-    #: the caller can read directly (today: the memory changelog's JSONL file).
+    #: the caller can read directly: the memory changelog's JSONL file for the
+    #: core, or the configured handler's resolved target for an extension.
     store_path: str | None = None
     notes: str = ""
 
@@ -274,6 +303,14 @@ class MemorySurfaceCapabilities(BaseModel):
     agent_extensions_enabled: bool = False
     agent_extensions_mode: ApplicationMode = "suggest"
     adapter: str | None = None
+    #: Optional base directory configured for extension handlers that write
+    #: files (``agent_extensions.root``). ``None`` means "no default location".
+    agent_extensions_root: str | None = None
+    #: Handler names an operator may put in ``surfaces.*.handler`` — i.e. the
+    #: adapters actually registered in this process. A configured handler that
+    #: is not in this list is the reason a surface reports
+    #: ``handler_registered: false``.
+    registered_handlers: list[str] = Field(default_factory=list)
     #: Which *environment* adapter is answering the framework's questions about
     #: the host agent's own files — ``{configured, resolved, known, ...}`` from
     #: ``adapters.environment.describe_environment``. Distinct from ``adapter``
@@ -598,8 +635,10 @@ def agent_extension_settings(config: Any | None) -> dict[str, Any]:
         "enabled": False,
         "mode": "suggest",
         "adapter": None,
+        "root": None,
         "surfaces": {
-            s.value: {"enabled": False, "handler": None} for s in EXTENSION_SURFACES
+            s.value: {"enabled": False, "handler": None, "path": None}
+            for s in EXTENSION_SURFACES
         },
     }
     raw = getattr(config, "agent_extensions", None) if config is not None else None
@@ -612,9 +651,12 @@ def agent_extension_settings(config: Any | None) -> dict[str, Any]:
     out["mode"] = mode if mode in ("suggest", "apply_with_confirmation", "apply") else "suggest"
     adapter = raw.get("adapter")
     out["adapter"] = str(adapter) if adapter else None
+    root = raw.get("root")
+    out["root"] = str(root) if root else None
 
     surfaces = {
-        s.value: {"enabled": False, "handler": None} for s in EXTENSION_SURFACES
+        s.value: {"enabled": False, "handler": None, "path": None}
+        for s in EXTENSION_SURFACES
     }
     raw_surfaces = raw.get("surfaces")
     if isinstance(raw_surfaces, dict):
@@ -623,12 +665,100 @@ def agent_extension_settings(config: Any | None) -> dict[str, Any]:
             if name not in surfaces or not isinstance(value, dict):
                 continue
             handler = value.get("handler")
+            path = value.get("path")
             surfaces[name] = {
                 "enabled": bool(value.get("enabled", False)),
                 "handler": str(handler) if handler else None,
+                "path": str(path) if path else None,
             }
     out["surfaces"] = surfaces
     return out
+
+
+def _handler_readiness(
+    handler: str | None, surface: MemorySurface, config: Any | None
+) -> tuple[bool, list[str], str | None, str]:
+    """``(registered, blockers, target, detail)`` for a configured handler name.
+
+    Imported lazily: ``adapters.base`` imports this module for the surface enum
+    and the action model, so a module-level import here would be a cycle. A
+    broken or missing adapter layer degrades to "not ready", never to "ready".
+    """
+    try:
+        from .adapters.base import adapter_readiness, registry
+    except Exception:  # noqa: BLE001 — reflection must never raise
+        return False, [BLOCK_ADAPTER_LAYER_UNAVAILABLE], None, ""
+
+    adapter = registry.get(handler)
+    if adapter is None:
+        return False, [BLOCK_HANDLER_NOT_REGISTERED], None, ""
+    try:
+        supports = bool(adapter.supports(MemorySurface(surface)))
+    except Exception:  # noqa: BLE001 — a broken probe is not a permission
+        supports = False
+    if not supports:
+        return True, [BLOCK_HANDLER_CANNOT_WRITE_SURFACE], None, ""
+
+    probe = adapter_readiness(adapter, surface, config)
+    return (
+        True,
+        [] if probe.ready else list(probe.blockers) or [BLOCK_HANDLER_NOT_READY],
+        probe.target,
+        probe.detail,
+    )
+
+
+def extension_readiness(
+    surface: MemorySurface, config: Any | None
+) -> dict[str, Any]:
+    """Everything that decides whether an extension surface can be applied.
+
+    One computation shared by the capability reflection and by
+    ``adapters.base.apply_agent_action``, so the two can never disagree about
+    whether a write is possible. Read-only and never raises.
+
+    Returns ``{surface, enabled, handler, handler_registered, mode,
+    configured_path, target, needs_confirmation, can_apply, blockers, detail}``.
+    ``blockers`` is empty exactly when ``can_apply`` is true.
+    """
+    surface = MemorySurface(surface)
+    settings = agent_extension_settings(config)
+    entry = settings["surfaces"].get(surface.value, {})
+    handler = entry.get("handler")
+    mode: ApplicationMode = settings["mode"]
+
+    blockers: list[str] = []
+    if not settings["enabled"]:
+        blockers.append(BLOCK_EXTENSIONS_DISABLED)
+    if not entry.get("enabled"):
+        blockers.append(BLOCK_SURFACE_DISABLED)
+    if mode == "suggest":
+        blockers.append(BLOCK_MODE_SUGGEST)
+    if not handler:
+        blockers.append(BLOCK_NO_HANDLER)
+
+    registered = False
+    target: str | None = None
+    detail = ""
+    if handler:
+        registered, handler_blockers, target, detail = _handler_readiness(
+            handler, surface, config
+        )
+        blockers.extend(handler_blockers)
+
+    return {
+        "surface": surface.value,
+        "enabled": bool(settings["enabled"]) and bool(entry.get("enabled")),
+        "handler": handler,
+        "handler_registered": registered,
+        "mode": mode,
+        "configured_path": entry.get("path"),
+        "target": target,
+        "needs_confirmation": mode == "apply_with_confirmation",
+        "can_apply": not blockers,
+        "blockers": blockers,
+        "detail": detail,
+    }
 
 
 def _apply_capability(
@@ -638,6 +768,12 @@ def _apply_capability(
 
     The one place these are decided, so no caller can assemble the impossible
     combination "agent-owned surface the framework silently writes anyway".
+
+    For an extension surface this is the *real* readiness, not just the config
+    switches: a handler that is named but not registered, or registered but
+    unable to resolve a safe target, reports ``framework_can_apply: False``.
+    Saying otherwise would promise a write that ``apply_agent_action`` then
+    refuses.
     """
     owner = ownership_of(surface)
     if owner is SurfaceOwnership.FRAMEWORK:
@@ -645,17 +781,13 @@ def _apply_capability(
     if owner is SurfaceOwnership.NONE:
         return False, False, "suggest", None
 
-    settings = agent_extension_settings(config)
-    entry = settings["surfaces"].get(surface.value, {})
-    handler = entry.get("handler")
-    enabled = bool(settings["enabled"]) and bool(entry.get("enabled"))
-    mode: ApplicationMode = settings["mode"]
-    can_apply = bool(enabled and handler and mode in ("apply", "apply_with_confirmation"))
+    readiness = extension_readiness(surface, config)
+    can_apply = bool(readiness["can_apply"])
     return (
         can_apply,
         not can_apply,
-        mode if can_apply else "suggest",
-        handler if enabled else None,
+        readiness["mode"] if can_apply else "suggest",
+        readiness["handler"],
     )
 
 
@@ -1114,6 +1246,16 @@ def _environment_capability(config: Any | None) -> dict[str, Any]:
         return {}
 
 
+def _registered_handlers() -> list[str]:
+    """Extension-action handler names registered in this process. Never raises."""
+    try:
+        from .adapters.base import registry
+
+        return registry.names()
+    except Exception:  # noqa: BLE001 — reflection must never raise
+        return []
+
+
 _EXTENSION_NOTES: dict[MemorySurface, str] = {
     MemorySurface.SKILL: "action protocols, methods, runbooks, commands, pitfalls",
     MemorySurface.USER_PROFILE: "small global user preference / persona facts",
@@ -1135,6 +1277,8 @@ def surface_capabilities(config: Any | None = None) -> MemorySurfaceCapabilities
         agent_extensions_enabled=bool(settings["enabled"]),
         agent_extensions_mode=settings["mode"],
         adapter=settings["adapter"],
+        agent_extensions_root=settings.get("root"),
+        registered_handlers=_registered_handlers(),
         agent_environment=_environment_capability(config),
         source_owned_evidence=["raw_session"],
         derived_stores=["l0_index", "vector_store", "search_index"],
@@ -1176,20 +1320,27 @@ def surface_capabilities(config: Any | None = None) -> MemorySurfaceCapabilities
         )
 
     for surface in EXTENSION_SURFACES:
-        can_apply, _agent, app_mode, handler = _apply_capability(surface, config)
+        readiness = extension_readiness(surface, config)
+        can_apply = bool(readiness["can_apply"])
         note = _EXTENSION_NOTES.get(surface, "")
         if not can_apply:
             note += (
-                " — suggestion-only: enable agent_extensions and configure a "
-                "handler for this surface to let the framework apply actions"
+                " — suggestion-only: apply_agent_action would refuse ("
+                + ", ".join(readiness["blockers"])
+                + "). Enable agent_extensions, enable this surface, name a "
+                "registered handler, set a mode other than 'suggest', and give "
+                "the handler an explicit target"
             )
         caps.extension_surfaces[surface.value] = SurfaceCapability(
             surface=surface,
             owned_by=ownership_of(surface),
             default_behavior="suggest",
-            configured_handler=handler,
+            configured_handler=readiness["handler"],
+            handler_registered=bool(readiness["handler_registered"]),
             can_apply=can_apply,
-            application_mode=app_mode,
+            application_mode=readiness["mode"] if can_apply else "suggest",
+            apply_blockers=list(readiness["blockers"]),
+            store_path=readiness.get("target"),
             notes=note,
         )
 
@@ -1224,6 +1375,7 @@ __all__ = [
     "SurfaceOwnership",
     "agent_extension_settings",
     "classify_memory_item",
+    "extension_readiness",
     "ownership_of",
     "routing_settings",
     "rules_from_config",

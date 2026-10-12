@@ -50,6 +50,7 @@ from .routing import (
     classify_memory_item as _classify_memory_item,
     surface_capabilities as _surface_capabilities,
 )
+from .adapters import apply_agent_action as _apply_agent_action
 from .cleanup import plan_knowledge_cleanup, apply_safe_knowledge_cleanup
 from .agent_integrator import (
     detect_agent_type,
@@ -1410,7 +1411,10 @@ async def batch_inject_knowledge_tool(
 
 
 # ---------------------------------------------------------------------------
-# MCP Tools — Persistence routing (read-only: classify and reflect, never write)
+# MCP Tools — Persistence routing
+#   classify_memory_item / get_memory_surface_capabilities are read-only.
+#   apply_agent_action is the one write-capable tool here, and it is off by
+#   default: see its docstring for the full opt-in chain.
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
@@ -1499,8 +1503,12 @@ async def get_memory_surface_capabilities() -> str:
         `agent_other`): `owned_by` is always `agent`. `can_apply` is false by
         default, meaning the framework classifies and suggests only. It becomes
         true only when `agent_extensions` is enabled, that surface is enabled,
-        a handler is configured and the mode allows applying — and even then
-        ownership does not move; the framework is just an orchestrator.
+        a configured `handler` is actually registered (`handler_registered`),
+        the mode allows applying and the handler resolves a safe target
+        (`store_path`) — and even then ownership does not move; the framework
+        is just an orchestrator. `apply_blockers` lists exactly what is
+        missing, in the same vocabulary `apply_agent_action` refuses with, and
+        `registered_handlers` names the handlers you may configure.
       - `no_write_surfaces` — `undecided` / `ephemeral`: nothing is persisted.
       - `source_owned_evidence` — raw session data: scanned, never written.
       - `derived_stores` — L0 index, vector store, search index: rebuildable
@@ -1518,6 +1526,118 @@ async def get_memory_surface_capabilities() -> str:
     config = _get_config()
     caps = await asyncio.to_thread(_surface_capabilities, config)
     return json.dumps(caps.to_dict(), ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def apply_agent_action(
+    surface: str,
+    source_content: str,
+    operation: str = "create",
+    rationale: str = "",
+    title: str | None = None,
+    shape_hint: str | None = None,
+    requires_user_confirmation: bool = False,
+    confirmed: bool = False,
+    dry_run: bool = False,
+    action: str | None = None,
+) -> str:
+    """Apply an agent-owned extension action — DISABLED BY DEFAULT.
+
+    This is the only write-capable routing tool, and out of the box it writes
+    nothing: it returns `status: "disabled"` because `agent_extensions` is off.
+    `skill`, `user_profile` and `agent_other` are AGENT-OWNED surfaces. Applying
+    one is a service the framework performs only when an operator has
+    configured it to, and ownership never moves.
+
+    Every gate must be open before a byte is written:
+      1. the action validates (`kind`, `surface`, `operation`, non-empty
+         `source_content`) — an invalid action is refused, never repaired;
+      2. the surface is `skill` / `user_profile` / `agent_other` (core surfaces
+         are written through `inject_knowledge`, `add_todo`, … instead);
+      3. `agent_extensions.enabled: true` AND that surface's `enabled: true`;
+      4. `agent_extensions.mode` is `apply_with_confirmation` or `apply`
+         (`suggest`, the default, returns recommendation-only);
+      5. the surface's `handler` names a registered adapter that supports it;
+      6. the handler resolves a safe explicit target. The shipped reference
+         handler, `generic_file`, needs
+         `agent_extensions.surfaces.<surface>.path` (or `root`) and refuses
+         system directories and non-prose file types;
+      7. under `apply_with_confirmation`, `confirmed=True` — otherwise you get
+         `status: "confirmation_required"` and nothing is written;
+      8. `dry_run=True` reports `would_apply` and returns before writing.
+
+    `generic_file` appends one bounded Markdown section per action and never
+    edits or deletes existing text. `create`, `append` and `update` all append;
+    `update` records what it supersedes instead of attempting a fuzzy edit.
+
+    Applying an agent-owned action does NOT record a MEMORY_CHANGELOG event —
+    that log is provenance for framework-owned L0/L1 mutations only.
+
+    Args:
+        surface: `skill`, `user_profile` or `agent_other`.
+        source_content: the text to persist. YOUR text: the framework never
+            invents prose for a surface it does not own.
+        operation: `create`, `update` or `append`.
+        rationale: why this belongs on that surface (recorded with the write).
+        title: section heading. Derived from the first content line when absent.
+        shape_hint: comma-separated structural hints, e.g.
+            "title,when_to_use,steps,verification".
+        requires_user_confirmation: mark this specific action as needing
+            confirmation even under `mode: apply`.
+        confirmed: the user has agreed to this write.
+        dry_run: report what would happen; write nothing.
+        action: a JSON object of AgentAction fields. When given it REPLACES the
+            flat arguments above (`confirmed` / `dry_run` still apply).
+
+    Returns:
+        JSON AgentActionResult: `{applied, status, surface, operation, handler,
+        adapter, mode, dry_run, confirmed, target, blockers, detail, error,
+        metadata}`. `status` is one of `applied`, `would_apply`,
+        `confirmation_required`, `disabled`, `unsupported`, `refused`,
+        `invalid_action`, `error`; `applied` is true only for `applied`.
+        `blockers` carries stable reason codes for anything else.
+    """
+    if action:
+        try:
+            payload = json.loads(action)
+        except (TypeError, ValueError) as e:
+            return json.dumps({
+                "applied": False,
+                "status": "invalid_action",
+                "detail": f"action is not valid JSON: {e}",
+                "error": str(e),
+                "blockers": ["invalid_action"],
+            }, ensure_ascii=False, indent=2)
+        if not isinstance(payload, dict):
+            return json.dumps({
+                "applied": False,
+                "status": "invalid_action",
+                "detail": "action must be a JSON object of AgentAction fields",
+                "blockers": ["invalid_action"],
+            }, ensure_ascii=False, indent=2)
+    else:
+        payload = {
+            "kind": "agent_native_write",
+            "surface": surface,
+            "operation": operation,
+            "title": title,
+            "source_content": source_content,
+            "shape_hint": [
+                h.strip() for h in (shape_hint or "").split(",") if h.strip()
+            ],
+            "rationale": rationale,
+            "requires_user_confirmation": requires_user_confirmation,
+        }
+
+    config = _get_config()
+    result = await asyncio.to_thread(
+        _apply_agent_action,
+        payload,
+        config,
+        confirmed=confirmed,
+        dry_run=dry_run,
+    )
+    return json.dumps(result.to_dict(), ensure_ascii=False, indent=2)
 
 
 @mcp.tool()

@@ -23,6 +23,8 @@ This MCP server provides tools for:
   - Scanning recent sessions for knowledge candidates
   - Classifying what belongs where (``classify_memory_item``) and reflecting
     on what the framework may apply (``get_memory_surface_capabilities``)
+  - Optionally applying an agent-owned action (``apply_agent_action``) — off by
+    default, and only through an explicitly configured handler
   - Reading why the knowledge base changed (``get_memory_changelog``)
   - Memory space statistics and health checks
   - Managing L1 knowledge file CRUD

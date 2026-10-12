@@ -49,6 +49,7 @@ The L0 index, the vector store and the search index are **derived** from the L1 
 - **Smart Knowledge Injection** — Inject facts with auto-dedup and section merging (upsert/append/merge), auto L0 sync
 - **Persistence Routing** — A deterministic classifier (`classify_memory_item`) says which surface an item belongs to: durable L1, the TODO store, your own skill/profile surface, or nothing at all. Marker + structure rules only; no model call, no embedding. Advisory by default, so it annotates writes without changing them
 - **Capability Reflection** — `get_memory_surface_capabilities` reports, under your current config, what the framework may write and what it can only suggest
+- **Opt-in Agent Action Execution** — `apply_agent_action` can write a classified skill / profile / agent-other item for you, but only as an explicitly configured orchestrator: off by default, with per-surface switches, a confirmation mode, `dry_run`, and an explicit target path. Every refusal is reported, never silent
 - **Hybrid Search (RRF)** — Combines keyword, fuzzy, BM25, and semantic search with Reciprocal Rank Fusion for robust ranking. Query-type auto-detection optimizes the semantic/keyword balance
 - **Agent-Agnostic L0 Access** — `get_l0_index` tool lets any MCP agent retrieve the memory index
 - **Multi-Agent Namespace** — Isolate knowledge per agent via `LAYERED_MEMORY_NAMESPACE` while sharing common knowledge
@@ -157,6 +158,8 @@ layered-memory-mcp --verbose
 | `LAYERED_MEMORY_ROUTING_ENABLED` | Classify items and annotate write results | `true` |
 | `LAYERED_MEMORY_ROUTING_MODE` | `advisory` or `enforce` | `advisory` |
 | `LAYERED_MEMORY_AGENT_EXTENSIONS_ENABLED` | Let the framework apply agent-surface actions | `false` |
+| `LAYERED_MEMORY_AGENT_EXTENSIONS_MODE` | `suggest` / `apply_with_confirmation` / `apply` | `suggest` |
+| `LAYERED_MEMORY_AGENT_EXTENSIONS_ROOT` | Base dir for a file-writing extension handler | unset (refuses) |
 | `LAYERED_MEMORY_AGENT_MEMORY_PATH` | The agent's own memory file (explicit write target) | auto-detected |
 | `LAYERED_MEMORY_AGENT_MEMORY_ALLOW_AUTO_DETECT_WRITE` | Allow L0 projection into an auto-detected memory file | `false` |
 | `LAYERED_MEMORY_CHANGELOG_ENABLED` | Record semantic L0/L1 mutations to the memory changelog | `true` |
@@ -256,22 +259,88 @@ Skills, the user profile and other agent-owned content are **suggestion-only by 
 agent_extensions:
   enabled: false                 # master switch (default false)
   mode: suggest                  # suggest | apply_with_confirmation | apply
-  adapter: null                  # name of your integration, e.g. generic / command / custom
+  adapter: null                  # label for your integration, e.g. generic_file / custom
+  root: null                     # optional base dir for relative handler paths
   surfaces:
     skill:
       enabled: false
       handler: null              # name of a registered adapter
+      path: null                 # explicit target for file-writing handlers
     user_profile:
       enabled: false
       handler: null
+      path: null
     agent_other:
       enabled: false
       handler: null
+      path: null
 ```
 
-All four conditions must hold before the framework will apply anything to a surface: `enabled: true` at the top level, `enabled: true` for that surface, a `handler` naming a registered adapter, and a `mode` other than `suggest`. Anything missing or malformed falls back, key by key, to "classify and suggest". **Opting in does not transfer ownership**: `get_memory_surface_capabilities` keeps reporting `owned_by: agent` for those surfaces and only flips `can_apply`. The framework is an orchestrator there, never the owner.
+Five conditions must hold before the framework will apply anything to a surface: `enabled: true` at the top level, `enabled: true` for that surface, a `handler` naming an actually **registered** adapter, a `mode` other than `suggest`, and a handler that can resolve a safe target. Anything missing or malformed falls back, key by key, to "classify and suggest". **Opting in does not transfer ownership**: `get_memory_surface_capabilities` keeps reporting `owned_by: agent` and `default_behavior: suggest` for those surfaces and only flips `can_apply`. The framework is an orchestrator there, never the owner.
 
-No adapter ships with the package — `apply_agent_action` refuses with `status: "unsupported"` until an integration registers one (`layered_memory_mcp.adapters`).
+`can_apply` reports *real* readiness, not just the switches: a handler you named but never registered reports `handler_registered: false`, and `apply_blockers` lists the same reason codes `apply_agent_action` would refuse with (`extensions_disabled`, `surface_disabled`, `mode_suggest`, `no_handler`, `handler_not_registered`, `no_configured_path`, …). `registered_handlers` names what you may configure.
+
+#### `apply_agent_action` — the write-capable tool, off by default
+
+```
+apply_agent_action(
+  surface="skill", operation="create", title="发布流程",
+  source_content="<your text>", rationale="repeatable action protocol",
+  confirmed=false, dry_run=false,
+  action=null,            # a JSON AgentAction; replaces the flat fields
+)
+```
+
+It returns `{applied, status, surface, operation, handler, adapter, mode, dry_run, confirmed, target, blockers, detail, error, metadata}`. `status` is one of:
+
+| status | wrote anything? | meaning |
+| --- | --- | --- |
+| `disabled` | no | `agent_extensions` (or this surface) is off, or `mode: suggest` — recommendation only |
+| `unsupported` | no | no handler configured, not registered, or it does not support the surface |
+| `refused` | no | not an extension surface, or the handler declined (no explicit path, unsafe target, …) |
+| `invalid_action` | no | `kind` / `surface` / `operation` / `source_content` did not validate — never repaired |
+| `confirmation_required` | no | `mode: apply_with_confirmation` (or the action asked for it) and `confirmed` was false |
+| `would_apply` | no | `dry_run: true` — reports the target, byte count and heading |
+| `applied` | **yes** | the handler wrote it |
+| `error` | no | the handler raised; the exception is in `error` |
+
+The three modes: `suggest` (default) classifies and hands you the `AgentAction`; `apply_with_confirmation` resolves and reports the target but needs a second call with `confirmed=true`; `apply` writes on the first call, except for an action whose own `requires_user_confirmation` is set, which always needs confirming.
+
+Applying an agent-owned action does **not** record a `MEMORY_CHANGELOG` event. That log is provenance for framework-owned L0/L1 mutations; these writes are the agent's.
+
+#### The `generic_file` reference handler
+
+One handler ships registered, and registration is not permission — it writes nothing until the chain above is configured *and* a target path resolves:
+
+```yaml
+agent_extensions:
+  enabled: true
+  mode: apply_with_confirmation
+  adapter: generic_file
+  surfaces:
+    skill:
+      enabled: true
+      handler: generic_file
+      path: /srv/agent/extensions/skills.md
+```
+
+It appends one bounded Markdown `##` section per action — your `source_content` under a short metadata block (surface, operation, handler, timestamp, rationale, `shape_hint`, action metadata), opened by a `<!-- layered-memory:agent-action -->` marker so the sections stay machine-findable. `create`, `append` and `update` **all append**; `update` records what it `supersedes` rather than attempting a fuzzy in-place edit, because rewriting a file the framework does not own is the one behaviour that could destroy content. Content over 8000 chars is truncated with an explicit marker.
+
+Path rules, all of them refusals rather than guesses:
+
+| situation | outcome |
+| --- | --- |
+| no `path` and no `root` | refused, `no_configured_path` — there is no default location, on purpose |
+| `root` only | `<root>/<surface>.md` |
+| relative `path` | resolved under `root`, else under `LAYERED_MEMORY_HOME`; must stay inside it (`path_escapes_base`) |
+| absolute `path` | accepted — naming the file *is* the explicitness this gate wants |
+| a directory (existing, or trailing `/`) | `<dir>/<surface>.md` |
+| inside `/etc`, `/usr`, `/sys`, `/var/lib`, `C:\Windows`, … | refused, `unsafe_system_target` |
+| a `.py` / `.yaml` / `.json` / `.db` / `.env` / dotfile target | refused, `unsafe_file_type` — appending Markdown would corrupt it |
+
+Parent directories are created only for a path you configured. There is no command adapter and no shell execution anywhere in this path. Writing a Hermes-native skill or profile file is **not** implemented and remains out of scope.
+
+A custom handler is a class with `name`, `supports(surface)`, an optional `readiness(surface, config)` and `apply(action, config=None, *, dry_run=False)`, registered via `layered_memory_mcp.adapters.registry.register(...)`. An adapter that declares no `dry_run` parameter is never called under `dry_run=True` — the framework refuses instead of risking a write it promised not to make.
 
 ## Usage
 
@@ -382,6 +451,7 @@ For direct file manipulation:
 | `create_knowledge_file` | Create a new .md file (auto L0 sync) |
 | `update_knowledge_file` | Overwrite an existing file (auto L0 sync) |
 | `delete_knowledge_file` | Delete a file (auto L0 sync) |
+| `apply_agent_action` | Apply an agent-owned extension action (`skill` / `user_profile` / `agent_other`) through a configured handler. **Disabled by default** — returns `status: "disabled"` until `agent_extensions` is opted into; supports `dry_run` and `confirmed`, and records no `MEMORY_CHANGELOG` event |
 
 ### Management Tools
 

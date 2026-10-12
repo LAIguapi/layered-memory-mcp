@@ -30,13 +30,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the current config, which surfaces the framework may write and which it can
   only suggest.
 - **Opt-in agent extensions.** A new `agent_extensions:` config section
-  (default: disabled, `suggest`, no adapter, no per-surface handler) lets an
-  operator have the framework apply extension actions on their behalf. All four
-  conditions — master switch, per-surface switch, a `handler` naming a
-  registered adapter, and a mode other than `suggest` — must hold, and each
-  falls back independently to suggestion-only when missing or malformed.
-  Opting in does **not** move ownership: those surfaces stay `owned_by: agent`
-  and only `can_apply` changes.
+  (default: disabled, `suggest`, no adapter, no per-surface handler, no path)
+  lets an operator have the framework apply extension actions on their behalf.
+  All five conditions — master switch, per-surface switch, a `handler` naming a
+  **registered** adapter, a mode other than `suggest`, and a handler that can
+  resolve a safe target — must hold, and each falls back independently to
+  suggestion-only when missing or malformed. Opting in does **not** move
+  ownership: those surfaces stay `owned_by: agent` with
+  `default_behavior: suggest`, and only `can_apply` changes.
+- **`apply_agent_action` (write-capable MCP tool, off by default).** Turns an
+  `AgentAction` recommendation into a real write — but only as an explicitly
+  configured orchestrator. Out of the box it returns `status: "disabled"` and
+  writes nothing. The gates, each reported rather than silent: the action must
+  validate (`kind`, `surface`, `operation`, non-empty `source_content` — an
+  invalid action is refused, never repaired); the surface must be an extension
+  surface; both `enabled` switches must be true; `mode` must not be `suggest`;
+  the configured `handler` must be registered and support the surface; the
+  handler must resolve a safe target; `apply_with_confirmation` (and any action
+  whose own `requires_user_confirmation` is set) needs `confirmed=True`; and
+  `dry_run=True` reports `would_apply` and returns before writing. The result
+  is `{applied, status, surface, operation, handler, adapter, mode, dry_run,
+  confirmed, target, blockers, detail, error, metadata}` with statuses
+  `applied` / `would_apply` / `confirmation_required` / `disabled` /
+  `unsupported` / `refused` / `invalid_action` / `error`, and `blockers`
+  carrying stable reason codes. Applying an agent-owned action records **no**
+  `MEMORY_CHANGELOG` event: that log is L0/L1 provenance only.
+- **`generic_file` reference handler (`adapters/generic_file.py`).** The one
+  adapter that ships registered — and registration is not permission. It
+  appends a single bounded Markdown `##` section per action (the caller's own
+  `source_content` under a short metadata block, opened by a
+  `<!-- layered-memory:agent-action -->` marker) to a file the operator named
+  in `agent_extensions.surfaces.<surface>.path`, or `<root>/<surface>.md` under
+  `agent_extensions.root`. `create` / `append` / `update` all append; `update`
+  records what it `supersedes` instead of attempting a fuzzy in-place edit,
+  because rewriting a file the framework does not own is the one behaviour that
+  could destroy content. Path safety is refusal, not repair:
+  `no_configured_path` when nothing explicit is set (there is no default
+  location, on purpose), `path_escapes_base` for a relative path leaving its
+  root/home, `unsafe_system_target` for `/etc`, `/usr`, `/sys`, `C:\Windows`
+  and friends, and `unsafe_file_type` for code / config / database / dotfile
+  targets that appended Markdown would corrupt. Parent directories are created
+  only for a configured path. No command adapter and no shell execution exist
+  on this path, and writing a Hermes-native skill or profile file remains out
+  of scope.
 - **`routing:` config section.** `enabled` (default true) and `mode` (default
   `advisory`), plus marker extensions in the same style as `governance:`
   (`extra_skill_markers`, `extra_todo_markers`, `extra_profile_markers`,
@@ -44,10 +80,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `LAYERED_MEMORY_ROUTING_ENABLED` / `LAYERED_MEMORY_ROUTING_MODE` /
   `LAYERED_MEMORY_AGENT_EXTENSIONS_ENABLED`.
 - **Adapter interface (`layered_memory_mcp.adapters`).** The protocol, registry
-  and `apply_agent_action` entry point for applying extension actions. The
-  registry ships empty, so `apply_agent_action` refuses with
-  `status: "unsupported"` until an integration registers an adapter. This is
-  the only place product-specific paths may live; the routing core knows none.
+  and `apply_agent_action` entry point for applying extension actions, plus an
+  optional `readiness(surface, config)` hook an adapter uses to say whether it
+  could write right now. An adapter that declares no `dry_run` parameter is
+  never called under `dry_run=True` — the framework refuses rather than risk a
+  write it promised not to make. This is the only place product-specific paths
+  may live; the routing core knows none.
 - **`MEMORY_CHANGELOG`, with a persistent backend
   (`layered_memory_mcp.memory_changelog`).** The provenance record for semantic
   L0/L1 mutations, with explicit inclusion and exclusion rules
@@ -148,6 +186,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`can_apply` for an extension surface now reports real readiness, not just
+  the config switches.** Previously an enabled surface with a `handler` string
+  and a non-`suggest` mode reported `can_apply: true` even if no adapter had
+  ever been registered under that name — a promise `apply_agent_action` would
+  then refuse. `routing.extension_readiness` is now the single computation
+  behind both the capability output and the execution path, so they cannot
+  disagree. `SurfaceCapability` gains `handler_registered` and `apply_blockers`
+  (and reuses `store_path` for the handler's resolved target);
+  `MemorySurfaceCapabilities` gains `agent_extensions_root` and
+  `registered_handlers`. `RoutingDecision.framework_can_apply` follows the same
+  rule. `configured_handler` is now reported verbatim even while the surface is
+  disabled, so a handler name nobody registered is visible rather than hidden.
+- **`agent_extensions` config shape gains two keys.** `root` at the top level
+  and `path` per surface, both defaulting to `null`. They are the explicit
+  target a file-writing handler needs; nothing is defaulted, because an
+  implicit target is the hazard the whole opt-in chain exists to prevent. Also
+  readable from `LAYERED_MEMORY_AGENT_EXTENSIONS_ROOT`. Existing configs are
+  unaffected — a section without them behaves exactly as before.
 - **The common core holds no product paths.** `config.py`,
   `memory_compactor.py`, `routing.py`, `agent_memory_guard.py` and
   `memory_changelog.py` no longer contain a product path, product file name or

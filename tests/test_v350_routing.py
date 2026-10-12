@@ -22,6 +22,7 @@ nothing new, and advisory routing does not touch the existing write contracts.
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from pathlib import Path
 
 from layered_memory_mcp.adapters import apply_agent_action, registry, resolve_adapter
@@ -100,6 +101,31 @@ LOG_TEXT = """08:12:01 INFO: starting scan of 14 domains
 Traceback (most recent call last):
   File "injector.py", line 884
 """
+
+
+# --- a stand-in integration --------------------------------------------------
+# ``can_apply`` reports real readiness, so proving that opting in works needs an
+# adapter that is actually registered. This one writes nothing.
+
+class _StubAdapter:
+    def __init__(self, name: str = "my-skill-writer") -> None:
+        self.name = name
+
+    def supports(self, surface) -> bool:
+        return True
+
+    def apply(self, action):  # pragma: no cover — these tests never apply
+        raise AssertionError("stub adapter must not be invoked")
+
+
+@contextmanager
+def _registered(adapter):
+    """Register ``adapter`` for the duration of a block, then remove it."""
+    registry.register(adapter)
+    try:
+        yield adapter
+    finally:
+        registry.unregister(adapter.name)
 
 
 # --- A. classification -------------------------------------------------------
@@ -237,8 +263,13 @@ class TestConfigDefaults:
         assert ax["enabled"] is False
         assert ax["mode"] == "suggest"
         assert ax["adapter"] is None
+        assert ax["root"] is None
         for surface in ("skill", "user_profile", "agent_other"):
-            assert ax["surfaces"][surface] == {"enabled": False, "handler": None}
+            assert ax["surfaces"][surface] == {
+                "enabled": False,
+                "handler": None,
+                "path": None,
+            }
 
     def test_malformed_sections_fall_back_per_key_without_raising(self, tmp_path):
         cfg = _cfg(
@@ -320,13 +351,32 @@ class TestCapabilityReflection:
                 },
             },
         )
-        caps = surface_capabilities(cfg).to_dict()
+        with _registered(_StubAdapter()):
+            caps = surface_capabilities(cfg).to_dict()
         skill = caps["extension_surfaces"]["skill"]
         assert skill["can_apply"] is True
         assert skill["owned_by"] == "agent"          # ownership never moves
         assert skill["configured_handler"] == "my-skill-writer"
+        assert skill["handler_registered"] is True
+        assert skill["apply_blockers"] == []
         # a surface left disabled stays suggestion-only
         assert caps["extension_surfaces"]["user_profile"]["can_apply"] is False
+
+    def test_a_handler_nobody_registered_is_reported_not_promised(self, tmp_path):
+        """Config alone is not capability: an unknown handler cannot apply."""
+        cfg = _cfg(
+            tmp_path,
+            agent_extensions={
+                "enabled": True,
+                "mode": "apply",
+                "surfaces": {"skill": {"enabled": True, "handler": "ghost-writer"}},
+            },
+        )
+        skill = surface_capabilities(cfg).to_dict()["extension_surfaces"]["skill"]
+        assert skill["can_apply"] is False
+        assert skill["configured_handler"] == "ghost-writer"   # visible, not hidden
+        assert skill["handler_registered"] is False
+        assert skill["apply_blockers"] == ["handler_not_registered"]
 
     def test_enabled_surface_without_handler_cannot_be_applied(self, tmp_path):
         cfg = _cfg(
@@ -359,17 +409,16 @@ class TestCapabilityReflection:
         assert plain.agent_should_apply is True
         assert plain.application_mode == "suggest"
 
-        opted_in = classify_memory_item(
-            SKILL_TEXT,
-            config=_cfg(
-                tmp_path / "b",
-                agent_extensions={
-                    "enabled": True,
-                    "mode": "apply",
-                    "surfaces": {"skill": {"enabled": True, "handler": "writer"}},
-                },
-            ),
+        cfg = _cfg(
+            tmp_path / "b",
+            agent_extensions={
+                "enabled": True,
+                "mode": "apply",
+                "surfaces": {"skill": {"enabled": True, "handler": "writer"}},
+            },
         )
+        with _registered(_StubAdapter(name="writer")):
+            opted_in = classify_memory_item(SKILL_TEXT, config=cfg)
         assert opted_in.framework_can_apply is True
         assert opted_in.agent_should_apply is False
         assert opted_in.ownership is SurfaceOwnership.AGENT
@@ -387,8 +436,14 @@ class TestAgentActionApplication:
             rationale="test",
         )
 
-    def test_no_adapter_is_registered_by_default(self):
-        assert registry.names() == []
+    def test_only_the_inert_reference_handler_is_registered_by_default(self):
+        """One handler ships, and registration is not permission.
+
+        ``generic_file`` exists so the apply contract is real and testable; it
+        still writes nothing without the full opt-in chain plus an explicit
+        target path (see ``tests/test_v354_apply_agent_action.py``).
+        """
+        assert registry.names() == ["generic_file"]
 
     def test_apply_refuses_when_extensions_are_disabled(self, tmp_path):
         res = apply_agent_action(self._action(), _cfg(tmp_path))
