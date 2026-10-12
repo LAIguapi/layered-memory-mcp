@@ -159,6 +159,8 @@ layered-memory-mcp --verbose
 | `LAYERED_MEMORY_AGENT_EXTENSIONS_ENABLED` | Let the framework apply agent-surface actions | `false` |
 | `LAYERED_MEMORY_AGENT_MEMORY_PATH` | The agent's own memory file (explicit write target) | auto-detected |
 | `LAYERED_MEMORY_AGENT_MEMORY_ALLOW_AUTO_DETECT_WRITE` | Allow L0 projection into an auto-detected memory file | `false` |
+| `LAYERED_MEMORY_CHANGELOG_ENABLED` | Record semantic L0/L1 mutations to the memory changelog | `true` |
+| `LAYERED_MEMORY_CHANGELOG_PATH` | Changelog file location | `<home>/data/memory_changelog.jsonl` |
 
 ### config.yaml
 
@@ -189,6 +191,11 @@ routing:
 agent_memory:
   path: null                                   # the agent's own memory file (explicit target)
   allow_auto_detect_write: false               # or opt back into auto-detected projection writes
+
+memory_changelog:
+  enabled: true                                # kill switch; off = nothing is recorded
+  path: null                                   # defaults to <home>/data/memory_changelog.jsonl
+  retention_days: null                         # reported, NOT enforced — nothing prunes the log
 ```
 
 `mode: advisory` is the default: routing reports its opinion alongside the normal result and changes nothing about what a write does. A classifier that started rejecting writes on upgrade would be a data-loss event, not a feature, so `enforce` is opt-in — and today exactly one path gates on it, `compact_memory` (see [Routing on the Compaction Path](#routing-on-the-compaction-path)). `inject_knowledge` still writes L1 in either mode and says so in its `routing_warning`.
@@ -320,6 +327,8 @@ For direct file manipulation:
 | `get_l0_index` | Retrieve the full L0 index (agent-agnostic) |
 | `classify_memory_item` | Route a candidate item to a surface (`l1_knowledge` / `todo` / `skill` / `user_profile` / `agent_other` / `undecided` / `ephemeral`). Read-only, deterministic, no model call |
 | `get_memory_surface_capabilities` | Report which surfaces the framework may write and which it can only suggest, under the current config |
+| `get_memory_changelog` | Read the provenance log of semantic L0/L1 mutations (filter by domain / operation / surface / since; newest-first, bounded) |
+| `get_memory_changelog_stats` | Summarise the changelog: counts by operation / surface / domain, time span, configured state |
 
 ### Write Tools
 
@@ -389,7 +398,15 @@ Two distinctions do the real work here:
 
 It is explicitly *not* the repository `CHANGELOG.md`, not raw session logs, not a generic event log, and not TODO lifecycle history. Derived-data rebuilds (vector reindex, search index) are not recorded either: the semantic content did not change.
 
-This version ships the schema and the inclusion rules (`layered_memory_mcp.memory_changelog`) without a persistent store. The capability output says so rather than implying a backend that does not exist.
+**Storage.** Append-only JSONL at `<home>/data/memory_changelog.jsonl`, one event per line. Recording is best-effort and silent on failure — provenance must never be able to fail the write it describes — and nothing in the framework rewrites or deletes a line. `retention_days` is read from config and reported, but **not enforced**: pruning provenance is destructive, so removing history stays a manual decision.
+
+**What an event carries.** Structure, not content: `schema_version`, `event_id`, `at` (UTC ISO), `operation`, `surface`, `domain`, `section`, `actor` / `agent_id`, `tool`, a structural `summary` and `reason`, an optional `source_ref`, `before_hash` / `after_hash` of the affected body, and a `metadata` dict of byte counts and write-path details. **Never the body text.** The knowledge files are the source of truth for content, and copying bodies into a provenance log would hand every secret a user ever wrote into their notes a second, unindexed home. `metadata` accepts scalars and short strings only; a nested container is dropped rather than serialised.
+
+**What is recorded today.** `inject_knowledge` (and so `compact_memory`'s L1 writes and `batch_inject_knowledge_tool`) for create / section-create / update / merge / replace / fusion write-back / consolidation write-back; `create_knowledge_file`, `update_knowledge_file` and `delete_knowledge_file` for whole-file mutations; `sync_l0_index` and `manage_l0_entry_tool` for L0 entries that actually appeared, vanished or changed.
+
+**What is not recorded.** A deferred-fusion or deferred-consolidate handshake, a `fuse_conflict` or `consolidate_refused` refusal, a skipped duplicate, a validation failure, a failed write, a `dry_run=True` pass, an L0 resync whose entry set did not move, and a write whose content hash came out unchanged. Single-section deletion has no event yet because no tool deletes one section — see `ROADMAP.md`.
+
+**Reading it.** `get_memory_changelog(domain, operation, surface, since, limit)` returns newest-first, bounded entries (default 50, hard ceiling 500); `get_memory_changelog_stats()` summarises counts by operation / surface / domain and the time span. Both are read-only. `get_memory_surface_capabilities` reports `memory_changelog` with `can_apply` reflecting whether the backend is actually enabled, plus the resolved `store_path`.
 
 ### Write-Once, Fully-Visible Pipeline (v0.5.0)
 

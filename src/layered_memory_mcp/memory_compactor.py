@@ -365,9 +365,10 @@ _AGENT_OWNED_SURFACES = ("skill", "user_profile", "agent_other")
 def _candidate_bucket(surface: str | None) -> str:
     """Which result bucket a non-L1 surface is reported under.
 
-    ``l0_index`` and ``memory_changelog`` land in ``rejected`` on purpose: both
-    are framework-owned *derived* surfaces, and user content must never be
-    written into them by a compaction pass.
+    ``l0_index`` and ``memory_changelog`` land in ``rejected`` on purpose: the
+    L0 index is derived from L1 and the changelog is provenance the framework
+    writes about its own mutations. Neither is a destination for user content,
+    so a compaction pass must never put an entry there.
     """
     if surface == _TODO_SURFACE:
         return "todo_candidates"

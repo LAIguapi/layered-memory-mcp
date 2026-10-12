@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
+from .memory_changelog import hash_text, record as record_memory_change
 from .recall import generate_l0_index, invalidate_scan_cache, scan_knowledge_files
 
 if TYPE_CHECKING:
@@ -106,6 +107,7 @@ def sync_l0_index(
 
     # --- Read existing L0 entries (for diff report) ---
     existing_entries: set[str] = set()
+    existing_text = ""
     if l0_file and l0_file.exists():
         try:
             existing_text = l0_file.read_text(encoding="utf-8")
@@ -154,7 +156,70 @@ def sync_l0_index(
         report["l0_file"] = None
         report["note"] = "L0 index file not configured — sync skipped (L1 files are up to date)"
 
+    # --- MEMORY_CHANGELOG: only when the semantic map actually moved ---
+    # A resync that rewrites the same entry set is a derived-data rebuild, not
+    # a memory change, so it records nothing (cf. NOT_RECORDED's
+    # ``l0_index_resync_no_semantic_change``). Likewise an unconfigured L0
+    # file: the index was computed but never persisted anywhere.
+    if l0_file and report.get("success") and (added or removed):
+        _record_l0_entry_changes(
+            config,
+            added=added,
+            removed=removed,
+            tool="sync_l0_index",
+            l0_format=effective_format,
+            before_hash=hash_text(existing_text) if existing_text else None,
+            after_hash=hash_text(new_content),
+            total_entries=len(new_domains),
+        )
+
     return report
+
+
+def _record_l0_entry_changes(
+    config,
+    *,
+    added: set[str],
+    removed: set[str],
+    tool: str,
+    l0_format: str,
+    before_hash: str | None,
+    after_hash: str | None,
+    total_entries: int,
+) -> None:
+    """One changelog event per L0 entry that appeared or disappeared.
+
+    Per entry rather than per sync, because ``l0_entry_added`` /
+    ``l0_entry_removed`` are the vocabulary the surface defines — a single
+    "index synced" event would be the generic rebuild log this changelog is
+    explicitly not. The index-wide before/after hashes are repeated on each
+    event of the same pass so the pass can be reconstructed. Never raises.
+    """
+    try:
+        for operation, domains in (
+            ("l0_entry_added", sorted(added)),
+            ("l0_entry_removed", sorted(removed)),
+        ):
+            for domain in domains:
+                record_memory_change(
+                    config,
+                    operation,
+                    domain,
+                    surface="l0_index",
+                    tool=tool,
+                    summary=f"L0 entry '{domain}' {operation.rsplit('_', 1)[-1]}",
+                    reason="L0 index resynced from the L1 knowledge files",
+                    before_hash=before_hash,
+                    after_hash=after_hash,
+                    metadata={
+                        "l0_format": l0_format,
+                        "total_entries": total_entries,
+                        "entries_added": len(added),
+                        "entries_removed": len(removed),
+                    },
+                )
+    except Exception as e:  # noqa: BLE001 — provenance never breaks a sync
+        logger.warning("memory changelog record failed (non-critical): %s", e)
 
 
 
@@ -268,6 +333,10 @@ def manage_entry(
 
     lines = [l for l in content.split("\n") if l.strip()]
 
+    # The before/after entry text, kept for the MEMORY_CHANGELOG record below.
+    old_line: str | None = None
+    new_line: str | None = None
+
     if action == "add":
         if not summary:
             return {"success": False, "error": "summary is required for 'add'"}
@@ -282,12 +351,19 @@ def manage_entry(
             if _entry_matches_domain(line, domain, config.l0_format, config):
                 return {"success": False, "error": f"Entry for '{domain}' already exists. Use 'replace'."}
         lines.append(new_line)
+        operation = "l0_entry_added"
 
     elif action == "remove":
-        original_count = len(lines)
-        lines = [l for l in lines if not _entry_matches_domain(l, domain, config.l0_format, config)]
-        if len(lines) == original_count:
+        kept = []
+        for line in lines:
+            if _entry_matches_domain(line, domain, config.l0_format, config):
+                old_line = old_line or line
+            else:
+                kept.append(line)
+        if len(kept) == len(lines):
             return {"success": False, "error": f"No entry found for '{domain}'"}
+        lines = kept
+        operation = "l0_entry_removed"
 
     elif action == "replace":
         if not summary:
@@ -301,11 +377,22 @@ def manage_entry(
         found = False
         for i, line in enumerate(lines):
             if _entry_matches_domain(line, domain, config.l0_format, config):
+                old_line = line
                 lines[i] = new_line
                 found = True
                 break
         if not found:
             lines.append(new_line)
+        # A replace that re-states the same line moved nothing semantically; a
+        # replace of an absent entry is an addition, and saying "renamed" would
+        # misdescribe it.
+        operation = (
+            "l0_entry_renamed"
+            if found and old_line != new_line
+            else "l0_entry_added"
+            if not found
+            else None
+        )
 
     else:
         return {"success": False, "error": f"Unknown action: {action}"}
@@ -315,6 +402,27 @@ def manage_entry(
         l0_file.write_text(new_content, encoding="utf-8")
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+    if operation:
+        try:
+            record_memory_change(
+                config,
+                operation,
+                domain,
+                surface="l0_index",
+                tool="manage_l0_entry",
+                summary=f"L0 entry '{domain}': single-entry {action}",
+                reason="explicit single-entry L0 edit",
+                before_hash=hash_text(old_line) if old_line else None,
+                after_hash=hash_text(new_line) if new_line else None,
+                metadata={
+                    "l0_action": action,
+                    "l0_format": config.l0_format,
+                    "total_entries": len(lines),
+                },
+            )
+        except Exception as e:  # noqa: BLE001 — provenance never breaks an edit
+            logger.warning("memory changelog record failed (non-critical): %s", e)
 
     return {
         "success": True,

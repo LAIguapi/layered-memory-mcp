@@ -9,7 +9,6 @@ Provides high-level write operations that handle:
   - File size warnings and content validation
 """
 
-import hashlib
 import json
 import logging
 import re
@@ -21,6 +20,7 @@ from typing import TYPE_CHECKING
 from filelock import FileLock
 
 from .heading import heading_skeleton
+from .memory_changelog import hash_text, record as record_memory_change
 from .recall import find_similar_knowledge, invalidate_scan_cache, knowledge_health, scan_knowledge_files
 
 if TYPE_CHECKING:
@@ -313,9 +313,13 @@ def _hash_body(body: str) -> str:
     Normalizes line endings and strips trailing whitespace so cosmetic churn
     (a trailing newline added by a reader) doesn't spuriously invalidate a
     pending deferred-fusion handshake. Returns a short hex digest.
+
+    Shares one definition with the MEMORY_CHANGELOG hashes on purpose: a
+    recorded ``before_hash`` for a fusion write-back is then exactly the
+    ``expected_hash`` the handshake was issued under, so provenance and the
+    optimistic lock cannot describe the same write differently.
     """
-    norm = (body or "").replace("\r\n", "\n").replace("\r", "\n").strip()
-    return hashlib.sha256(norm.encode("utf-8")).hexdigest()[:16]
+    return hash_text(body)
 
 
 def _semantic_thresholds(config) -> tuple[float, float, float]:
@@ -663,6 +667,120 @@ def _routing_advisory(
     return result
 
 
+# ---------------------------------------------------------------------------
+# MEMORY_CHANGELOG — provenance of what this write path actually changed
+# ---------------------------------------------------------------------------
+#: ``write_action`` (what ``_do_write`` did) → changelog operation. Only write
+#: actions that changed semantic content appear here; the deferral handshakes
+#: (``deferred_fusion`` / ``deferred_consolidate``), the refusals
+#: (``fuse_conflict`` / ``consolidate_refused``), ``skipped`` and the
+#: validation errors all return before the write and so are absent by
+#: construction, not by filtering.
+_CHANGELOG_OPERATIONS: dict[str, str] = {
+    "created": "l1_domain_created",
+    "section_created": "l1_section_created",
+    "appended": "l1_section_updated",
+    "merged": "l1_section_merged",
+    "replaced": "l1_section_replaced",
+    "consolidated": "l1_consolidation_writeback",
+}
+
+#: Write actions that report success having changed nothing on disk.
+_CHANGELOG_NO_CHANGE: tuple[str, ...] = ("merged_no_change", "append_no_change")
+
+#: Write actions where an unchanged body hash means the write was semantically
+#: a no-op. A create is exempt: the file/section did not exist before, so there
+#: is no "before" to be equal to.
+_CHANGELOG_HASH_GATED: tuple[str, ...] = ("appended", "merged", "replaced")
+
+
+def _record_l1_mutation(
+    config,
+    *,
+    domain: str,
+    section: str,
+    filepath: Path,
+    write_action: str,
+    write_result: dict,
+    dedup_result: dict,
+    body_before: str | None,
+    expected_hash: str | None,
+    agent_id: str | None,
+    mode: str,
+) -> None:
+    """Append one MEMORY_CHANGELOG event for a completed L1 write.
+
+    Best-effort and structural: the event carries the operation, the heading,
+    byte counts and before/after body hashes — never the body. Never raises;
+    a provenance failure must not undo a successful knowledge write.
+    """
+    try:
+        if write_action in _CHANGELOG_NO_CHANGE:
+            return
+        operation = _CHANGELOG_OPERATIONS.get(write_action)
+        if operation is None:
+            return
+        if (
+            write_action == "replaced"
+            and (dedup_result or {}).get("match_kind") == "fusion_writeback"
+        ):
+            operation = "l1_fusion_writeback"
+
+        before = hash_text(body_before) if body_before is not None else None
+        if operation == "l1_consolidation_writeback":
+            # A consolidation replaces a whole heading *family*, usually under a
+            # canonical heading that did not exist before — so there is no
+            # single prior section body to hash. The handshake's expected_hash
+            # IS the family hash it was issued under, which is the right
+            # "before" for this operation.
+            before = expected_hash or before
+        body_after = _current_section_body(filepath, section)
+        after = hash_text(body_after) if body_after is not None else None
+        if (
+            before is not None
+            and before == after
+            and write_action in _CHANGELOG_HASH_GATED
+        ):
+            return  # same body in, same body out — nothing semantic happened
+
+        bytes_written = write_result.get("bytes_written", 0)
+        record_memory_change(
+            config,
+            operation,
+            domain,
+            section=section,
+            agent_id=agent_id,
+            tool="inject_knowledge",
+            summary=(
+                f"{write_action} '## {section}' in {domain} "
+                f"({bytes_written} bytes written)"
+            ),
+            reason={
+                "l1_fusion_writeback": (
+                    "fusion write-back committed under the optimistic lock"
+                ),
+                "l1_consolidation_writeback": (
+                    "same-skeleton heading family collapsed into one section"
+                ),
+            }.get(operation, f"inject_knowledge mode={mode}"),
+            before_hash=before,
+            after_hash=after,
+            metadata={
+                "write_action": write_action,
+                "mode": mode,
+                "file": filepath.name,
+                "bytes_written": bytes_written,
+                "file_size_bytes": write_result.get("file_size_bytes", 0),
+                "match_kind": (dedup_result or {}).get("match_kind"),
+                "similarity": (dedup_result or {}).get("similarity"),
+                "family_size_before": write_result.get("family_size_before"),
+                "sections_removed": write_result.get("sections_removed"),
+            },
+        )
+    except Exception as e:  # noqa: BLE001 — provenance never breaks a write
+        logger.warning("memory changelog record failed (non-critical): %s", e)
+
+
 def inject_knowledge(
     config: "MemoryConfig",
     domain: str,
@@ -958,6 +1076,10 @@ def _inject_knowledge_core(
     # honor it verbatim so we replace the right block.
 
     # --- 4. Execute write (with file lock) ---
+    # Captured before the write so the MEMORY_CHANGELOG event can carry a
+    # before/after hash pair. Same normalisation as the fuse optimistic lock.
+    body_before = _current_section_body(filepath, section_clean)
+
     write_result = _execute_write(
         filepath=filepath,
         filename=filename,
@@ -971,6 +1093,22 @@ def _inject_knowledge_core(
     if not write_result.get("success"):
         return write_result
 
+    # --- 4b. MEMORY_CHANGELOG provenance (best-effort, never fails a write) ---
+    write_action = write_result.get("write_action", effective_action)
+    _record_l1_mutation(
+        config,
+        domain=domain_clean,
+        section=section_clean,
+        filepath=filepath,
+        write_action=write_action,
+        write_result=write_result,
+        dedup_result=dedup_result,
+        body_before=body_before,
+        expected_hash=expected_hash,
+        agent_id=agent_id,
+        mode=mode,
+    )
+
     # Invalidate scan cache across ALL knowledge dirs so subsequent recalls see fresh file listing
     for kdir in config.knowledge_dirs:
         invalidate_scan_cache(str(kdir))
@@ -980,7 +1118,7 @@ def _inject_knowledge_core(
     sync_report = auto_sync_if_enabled(config)
 
     # --- 6. Build result ---
-    write_action = write_result.get("write_action", effective_action)
+    # (`write_action` was resolved above, before the changelog record.)
 
     # --- 6b. Vector store sync (v2.2.0 → v3.1.0) ---
     # v3.1.0: rebuild the whole domain per-section (replace_domain=True) instead

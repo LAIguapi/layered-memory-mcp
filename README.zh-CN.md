@@ -142,6 +142,8 @@ layered-memory-mcp --verbose
 | `LAYERED_MEMORY_AGENT_EXTENSIONS_ENABLED` | 允许框架代写代理自有面 | `false` |
 | `LAYERED_MEMORY_AGENT_MEMORY_PATH` | 代理自己的记忆文件（显式写入目标） | 自动探测 |
 | `LAYERED_MEMORY_AGENT_MEMORY_ALLOW_AUTO_DETECT_WRITE` | 允许向自动探测到的记忆文件投射 L0 指针 | `false` |
+| `LAYERED_MEMORY_CHANGELOG_ENABLED` | 把 L0/L1 的语义变更记入记忆变更日志 | `true` |
+| `LAYERED_MEMORY_CHANGELOG_PATH` | 变更日志文件位置 | `<home>/data/memory_changelog.jsonl` |
 
 ### config.yaml
 
@@ -172,6 +174,11 @@ routing:
 agent_memory:
   path: null                                   # 代理自己的记忆文件（显式写入目标）
   allow_auto_detect_write: false               # 或显式允许向自动探测到的文件投射
+
+memory_changelog:
+  enabled: true                                # 总开关；关掉就什么都不记
+  path: null                                   # 默认 <home>/data/memory_changelog.jsonl
+  retention_days: null                         # 只报告，不执行 —— 没有任何逻辑会清理它
 ```
 
 `mode: advisory` 是默认值：路由只在正常结果旁边附上它的判断，不改变写入行为。升级后突然开始拒写，那是数据丢失事故，不是功能，所以 `enforce` 必须显式开启 —— 目前只有一条路径会据此拦截：`compact_memory`（见[压实路径上的路由](#压实路径上的路由)）。`inject_knowledge` 在两种模式下都照常写 L1，并在 `routing_warning` 里说明这一点。
@@ -303,6 +310,8 @@ Agent: "数据库连接字符串是什么？"
 | `get_l0_index` | 获取完整 L0 索引（Agent 无关） |
 | `classify_memory_item` | 把一条候选内容路由到某个记忆面（`l1_knowledge` / `todo` / `skill` / `user_profile` / `agent_other` / `undecided` / `ephemeral`）。只读、确定性、不调用模型 |
 | `get_memory_surface_capabilities` | 按当前配置报告哪些面框架可以代写、哪些只能给建议 |
+| `get_memory_changelog` | 读取 L0/L1 语义变更的来源记录（可按 domain / operation / surface / since 过滤；默认倒序、有上限） |
+| `get_memory_changelog_stats` | 汇总变更日志：按操作 / 面 / 领域计数、时间跨度、后端配置状态 |
 
 ### 写入工具
 
@@ -372,7 +381,15 @@ Agent: "数据库连接字符串是什么？"
 
 它明确**不是**仓库的 `CHANGELOG.md`，不是原始会话日志，不是通用事件日志，也不是 TODO 的生命周期历史。派生数据重建（向量重建索引、搜索索引）同样不记录 —— 语义内容并没有变。
 
-本版本提供 schema 与收录规则（`layered_memory_mcp.memory_changelog`），但**尚未实现持久化存储**；能力反射接口会如实说明这一点，而不是暗示一个并不存在的后端。
+**存储。** 仅追加的 JSONL，位于 `<home>/data/memory_changelog.jsonl`，一行一条事件。记录是尽力而为的，失败时静默 —— 来源记录绝不能让它所描述的那次写入失败；框架也不会重写或删除任何一行。`retention_days` 会从配置读取并如实报告，但**不会执行**：清理来源记录是破坏性操作，删除历史始终是人工决定。
+
+**一条事件带什么。** 只带结构，不带内容：`schema_version`、`event_id`、`at`（UTC ISO）、`operation`、`surface`、`domain`、`section`、`actor` / `agent_id`、`tool`、结构化的 `summary` 与 `reason`、可选的 `source_ref`、受影响正文的 `before_hash` / `after_hash`，以及一个装字节数和写入细节的 `metadata`。**绝不带正文本身。** 知识文件才是内容的真相源；把正文拷进来源记录，等于给用户写进笔记里的每一个密钥再建一份没人当成敏感文件的副本。`metadata` 只接受标量和短字符串，嵌套容器会被丢弃而不是序列化。
+
+**当前已接入的写入路径。** `inject_knowledge`（因此也覆盖 `compact_memory` 的 L1 写入与 `batch_inject_knowledge_tool`）的新建 / 新建章节 / 更新 / 合并 / 替换 / 融合写回 / 家族合并写回；`create_knowledge_file`、`update_knowledge_file`、`delete_knowledge_file` 的整文件变更；`sync_l0_index` 与 `manage_l0_entry_tool` 中条目真的增删改名的那些变化。
+
+**不记录的。** 延迟融合 / 延迟合并的握手、`fuse_conflict` 或 `consolidate_refused` 的拒绝、跳过的重复内容、参数校验失败、写入失败、`dry_run=True` 的试跑、条目集合没有变化的 L0 重新同步，以及内容哈希没变的写入。单个章节删除暂时没有事件，因为目前没有任何工具只删一个章节 —— 见 `ROADMAP.md`。
+
+**怎么读。** `get_memory_changelog(domain, operation, surface, since, limit)` 返回倒序、有上限的条目（默认 50，硬上限 500）；`get_memory_changelog_stats()` 汇总按操作 / 面 / 领域的计数与时间跨度。两者都是只读。`get_memory_surface_capabilities` 报告的 `memory_changelog` 中，`can_apply` 如实反映后端是否真的启用，并给出解析后的 `store_path`。
 
 ### 写即可见流水线（v0.5.0）
 

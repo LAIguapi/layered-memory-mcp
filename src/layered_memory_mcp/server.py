@@ -157,6 +157,56 @@ def _domain_from_file(filename: str) -> str:
     return base[:-3] if base.endswith(".md") else base
 
 
+# ---------------------------------------------------------------------------
+# MEMORY_CHANGELOG: provenance for the whole-file write tools
+# ---------------------------------------------------------------------------
+# inject_knowledge records its own section-level events inside the injector;
+# this helper covers the three tools that replace a whole domain file.
+
+def _record_file_mutation(
+    config: MemoryConfig,
+    operation: str,
+    filename: str,
+    *,
+    tool: str,
+    summary: str,
+    reason: str,
+    before_text: str | None = None,
+    after_text: str | None = None,
+) -> dict | None:
+    """Record one whole-file L1 mutation. Never raises.
+
+    Passes hashes, byte counts and the filename — never the file text. A write
+    whose content hash did not move records nothing: provenance tracks meaning,
+    not mtimes.
+    """
+    try:
+        from .memory_changelog import hash_text, record as record_memory_change
+
+        before_hash = hash_text(before_text) if before_text is not None else None
+        after_hash = hash_text(after_text) if after_text is not None else None
+        if before_hash is not None and before_hash == after_hash:
+            return None
+        return record_memory_change(
+            config,
+            operation,
+            _domain_from_file(filename),
+            tool=tool,
+            summary=summary,
+            reason=reason,
+            before_hash=before_hash,
+            after_hash=after_hash,
+            metadata={
+                "file": filename,
+                "before_bytes": len(before_text.encode("utf-8")) if before_text else 0,
+                "after_bytes": len(after_text.encode("utf-8")) if after_text else 0,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 — provenance never breaks a write
+        logger.warning("memory changelog record failed (non-critical): %s", exc)
+        return None
+
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -707,6 +757,19 @@ async def create_knowledge_file(filename: str, content: str) -> str:
         await asyncio.to_thread(filepath.write_text, content, "utf-8")
         logger.info("Created knowledge file: %s (%d bytes)", filename, len(content.encode("utf-8")))
 
+        # MEMORY_CHANGELOG: recorded before the derived L0/vector sync below, so
+        # the L1 mutation precedes the index entries it causes.
+        await asyncio.to_thread(
+            _record_file_mutation,
+            config,
+            "l1_domain_created",
+            filename,
+            tool="create_knowledge_file",
+            summary=f"knowledge file '{filename}' created",
+            reason="whole-file create",
+            after_text=content,
+        )
+
         # v0.5.0: auto-sync L0 index
         sync_report = await asyncio.to_thread(auto_sync_if_enabled, config)
 
@@ -783,13 +846,35 @@ async def update_knowledge_file(filename: str, content: str) -> str:
 
     try:
         old_size = filepath.stat().st_size
+        # Read once and reuse: the backup below and the MEMORY_CHANGELOG
+        # before_hash both need the outgoing text.
+        try:
+            old_text = await asyncio.to_thread(filepath.read_text, "utf-8")
+        except OSError:
+            old_text = None
         # v0.6.0: back up before overwriting. v3.4.7: under
         # <home>/data/backups/knowledge, not as a .bak beside the live file.
         # Never raises — a backup failure shouldn't block updates.
-        backup = await asyncio.to_thread(backup_knowledge_file, config, filepath)
+        backup = await asyncio.to_thread(
+            backup_knowledge_file, config, filepath, old_text
+        )
         await asyncio.to_thread(filepath.write_text, content, "utf-8")
         new_size = len(content.encode("utf-8"))
         logger.info("Updated knowledge file: %s (%d → %d bytes)", filename, old_size, new_size)
+
+        # MEMORY_CHANGELOG. An overwrite with byte-identical content records
+        # nothing — the file's mtime moved, its meaning did not.
+        await asyncio.to_thread(
+            _record_file_mutation,
+            config,
+            "l1_domain_updated",
+            filename,
+            tool="update_knowledge_file",
+            summary=f"knowledge file '{filename}' overwritten ({old_size} → {new_size} bytes)",
+            reason="whole-file update",
+            before_text=old_text,
+            after_text=content,
+        )
 
         # v0.5.0: auto-sync L0 index
         sync_report = await asyncio.to_thread(auto_sync_if_enabled, config)
@@ -872,8 +957,25 @@ async def delete_knowledge_file(filename: str) -> str:
 
     try:
         old_size = filepath.stat().st_size
+        try:
+            old_text = await asyncio.to_thread(filepath.read_text, "utf-8")
+        except OSError:
+            old_text = None
         await asyncio.to_thread(filepath.unlink)
         logger.info("Deleted knowledge file: %s (%d bytes)", filename, old_size)
+
+        # MEMORY_CHANGELOG: what the knowledge base used to say, and that it no
+        # longer says it. The content itself lives on in data/backups/knowledge.
+        await asyncio.to_thread(
+            _record_file_mutation,
+            config,
+            "l1_domain_deleted",
+            filename,
+            tool="delete_knowledge_file",
+            summary=f"knowledge file '{filename}' deleted ({old_size} bytes)",
+            reason="whole-file delete",
+            before_text=old_text,
+        )
 
         # Clean up a legacy adjacent .bak if one exists (new writes no longer
         # create them; the backup under data/backups is left as a recovery copy).
@@ -1407,6 +1509,77 @@ async def get_memory_surface_capabilities() -> str:
     config = _get_config()
     caps = await asyncio.to_thread(_surface_capabilities, config)
     return json.dumps(caps.to_dict(), ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def get_memory_changelog(
+    domain: str | None = None,
+    operation: str | None = None,
+    surface: str | None = None,
+    since: str | None = None,
+    limit: int = 50,
+) -> str:
+    """Read the provenance log of semantic L0/L1 memory changes. READ-ONLY.
+
+    Answers "why does my knowledge base say this now?". Every entry is one
+    semantic mutation of a framework-owned durable surface: an L1 section
+    created / updated / merged / replaced, a fusion or consolidation
+    write-back, a whole-file create / update / delete, or an L0 entry added /
+    removed / renamed when the map actually moved.
+
+    What is deliberately NOT in here: raw session content, TODO lifecycle,
+    skill / user-profile / agent-other suggestions, derived-data rebuilds
+    (vector reindex, search index), deferred or refused writes, and writes that
+    changed no semantic content. An entry carries structure only — operation,
+    domain, section heading, tool, byte counts and `before_hash` / `after_hash`
+    — never the body text; the knowledge files remain the source of truth for
+    content.
+
+    Args:
+        domain: only entries for this domain (the L1 file minus `.md`).
+        operation: exact operation filter, e.g. `l1_section_replaced`.
+        surface: `l1_knowledge` or `l0_index`.
+        since: ISO timestamp or date ("2026-10-01") — entries at or after it.
+        limit: max entries (default 50, hard ceiling 500).
+
+    Returns:
+        JSON: {enabled, path, total_events, matched, returned, limit, order,
+        filters, entries}. `order` is `newest_first`.
+    """
+    config = _get_config()
+    from .memory_changelog import read_events
+
+    report = await asyncio.to_thread(
+        read_events,
+        config,
+        domain=domain,
+        operation=operation,
+        surface=surface,
+        since=since,
+        limit=limit,
+    )
+    return json.dumps(report, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def get_memory_changelog_stats() -> str:
+    """Summarise the memory changelog: counts, span, and what it records. READ-ONLY.
+
+    Use this before `get_memory_changelog` to see whether a domain has any
+    provenance at all, and to confirm the backend's configured state.
+
+    Returns:
+        JSON: {enabled, path, total_events, by_operation, by_surface,
+        by_domain (top 10), first_event_at, last_event_at, size_bytes,
+        malformed_lines, retention_days, retention_enforced, retention_note,
+        recordable_operations, not_recorded}. The log is append-only and this
+        version never prunes it — `retention_days` is reported, not applied.
+    """
+    config = _get_config()
+    from .memory_changelog import changelog_stats
+
+    report = await asyncio.to_thread(changelog_stats, config)
+    return json.dumps(report, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()

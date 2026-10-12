@@ -469,6 +469,9 @@ class MemoryConfig:
         # Unreleased — agent-memory write safety (see agent_memory_guard.py).
         # Raw YAML section shape: {path, allow_auto_detect_write}.
         agent_memory: dict | None = None,
+        # Unreleased — MEMORY_CHANGELOG backend (see memory_changelog.py).
+        # Raw YAML section shape: {enabled, path, retention_days}.
+        memory_changelog: dict | None = None,
     ):
         self.home = Path(home) if home else default_home()
         self.knowledge_dir = Path(knowledge_dir) if knowledge_dir else default_knowledge_dir(self.home)
@@ -979,6 +982,51 @@ class MemoryConfig:
             or _am_yaml.get("separator")
         )
         self.agent_memory_separator: str = str(_ams) if _ams else "§"
+
+        # Unreleased: MEMORY_CHANGELOG backend (see memory_changelog.py). The
+        # append-only provenance record of semantic L0/L1 mutations:
+        #
+        #   memory_changelog:
+        #     enabled: true          # kill switch; off = nothing is recorded
+        #     path: null             # defaults to <home>/data/memory_changelog.jsonl
+        #     retention_days: null   # read and reported, NOT enforced
+        #
+        # Enabled by default: the surface was already declared framework-owned,
+        # and a provenance record that only exists when somebody remembered to
+        # turn it on cannot answer "why does my knowledge base say this now?".
+        # `retention_days` is deliberately inert — pruning provenance is
+        # destructive, so this version never deletes a line and says so rather
+        # than shipping a silent sweep.
+        # Precedence: constructor → env → config.yaml → default.
+        _cl_yaml = (
+            memory_changelog
+            if isinstance(memory_changelog, dict)
+            else _load_yaml_section(self.home, "memory_changelog")
+        )
+        _env_cl = os.environ.get("LAYERED_MEMORY_CHANGELOG_ENABLED")
+        self.memory_changelog_enabled: bool = (
+            _env_bool("LAYERED_MEMORY_CHANGELOG_ENABLED", True)
+            if _env_cl is not None
+            else _coerce_bool(_cl_yaml.get("enabled"), True)
+        )
+        _clp = (
+            os.environ.get("LAYERED_MEMORY_CHANGELOG_PATH")
+            or _cl_yaml.get("path")
+        )
+        self.memory_changelog_path: Path = (
+            Path(str(_clp)).expanduser()
+            if _clp
+            else self.home / "data" / "memory_changelog.jsonl"
+        )
+        _clr = os.environ.get("LAYERED_MEMORY_CHANGELOG_RETENTION_DAYS")
+        if _clr is None:
+            _clr = _cl_yaml.get("retention_days")
+        try:
+            self.memory_changelog_retention_days: int | None = (
+                int(_clr) if _clr is not None else None
+            )
+        except (TypeError, ValueError):
+            self.memory_changelog_retention_days = None
 
         # Resolve namespace-aware knowledge directories
         if self.namespace != "shared":

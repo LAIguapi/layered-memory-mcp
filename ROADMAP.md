@@ -4,17 +4,34 @@ Remaining work on the surface model introduced in `[Unreleased]`, in the order
 it should be taken. Each item states what exists today and what "done" means,
 so none of them has to be re-derived later.
 
-## 1. Persistent `MEMORY_CHANGELOG` backend
+## 1. Persistent `MEMORY_CHANGELOG` backend — done, with two gaps
 
-Today `layered_memory_mcp.memory_changelog` ships the schema and the inclusion
-rules (`RECORDABLE_OPERATIONS` / `NOT_RECORDED`) only; there is no store, and
-`get_memory_surface_capabilities` says so. Provenance for semantic L0/L1
-mutations is the one common-core surface the framework claims to own but cannot
-yet write.
+**Done.** `memory_changelog` now has an append-only JSONL store at
+`<home>/data/memory_changelog.jsonl` (`storage.MemoryChangelogStore`), written
+from `inject_knowledge` (and therefore from `compact_memory` and the batch
+tool), from the whole-file create/update/delete tools, and from the two L0 entry
+paths (`sync_l0_index`, `manage_entry`). It is readable through
+`get_memory_changelog` / `get_memory_changelog_stats`, configurable through
+`memory_changelog:`, and `get_memory_surface_capabilities` reports `can_apply`
+from the backend's actual state instead of from ownership.
 
-Done when: a durable append-only store under `<home>/data/`, written from the
-L1 write paths, readable by a tool, with a retention policy — and the
-capability output flipped to `can_write`.
+**Gap 1 — retention is inert.** `retention_days` is parsed and reported, and
+nothing applies it. That is deliberate for one release: a sweep that deletes
+provenance is destructive and a silent one is worse than none. Done when a
+prune exists that is explicit (its own tool or an opt-in flag), reports what it
+removed, and is documented as deleting history.
+
+**Gap 2 — `l1_section_deleted` has no producer.** The operation is in
+`RECORDABLE_OPERATIONS` because section deletion is a semantic mutation, but no
+tool deletes a single section today (`apply_safe_knowledge_cleanup` deliberately
+never removes L1 text). Done when a section-level delete exists and records it —
+or, if it never does, when the operation is dropped from the vocabulary rather
+than left as a slot nothing fills.
+
+Also left for whoever needs it: `sync_l0_index` diffs domain *sets*, so a
+rename shows up as an add plus a remove. Only `manage_entry` can emit
+`l0_entry_renamed`. Fixing this means the sync comparing entry lines per domain,
+which is more than the provenance value justifies right now.
 
 ## 2. Adapter extraction of the Hermes-specific paths
 

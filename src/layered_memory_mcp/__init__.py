@@ -8,7 +8,8 @@ Framework-owned common core (the framework may write these):
   L0_INDEX         -- knowledge map, injected every turn, pure pointers
   L1_KNOWLEDGE     -- durable domain cognition: facts, decisions, current state
   TODO             -- unfinished state: pending, blocked, needs validation
-  MEMORY_CHANGELOG -- provenance of semantic L0/L1 changes
+  MEMORY_CHANGELOG -- provenance of semantic L0/L1 changes, appended to
+                      <home>/data/memory_changelog.jsonl
 
 Agent-owned extension surfaces (classified and suggested, not written by
 default; opt in through ``agent_extensions`` to let the framework apply them):
@@ -22,6 +23,7 @@ This MCP server provides tools for:
   - Scanning recent sessions for knowledge candidates
   - Classifying what belongs where (``classify_memory_item``) and reflecting
     on what the framework may apply (``get_memory_surface_capabilities``)
+  - Reading why the knowledge base changed (``get_memory_changelog``)
   - Memory space statistics and health checks
   - Managing L1 knowledge file CRUD
 """

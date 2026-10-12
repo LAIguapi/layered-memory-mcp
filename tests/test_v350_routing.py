@@ -29,6 +29,7 @@ from layered_memory_mcp.config import MemoryConfig
 from layered_memory_mcp.injector import inject_knowledge
 from layered_memory_mcp.memory_changelog import (
     NOT_RECORDED,
+    SCHEMA_VERSION,
     build_entry,
     is_recordable,
 )
@@ -653,7 +654,9 @@ class TestMemoryChangelogSchema:
         assert entry is not None
         payload = entry.to_dict()
         assert payload["surface"] == "l1_knowledge"
-        assert payload["schema_version"] == 1
+        # schema_version 2 since the record gained a persistent backend; the
+        # rest of the shape is pinned in test_v352_memory_changelog.py.
+        assert payload["schema_version"] == SCHEMA_VERSION == 2
         assert payload["domain"] == "infra"
 
 

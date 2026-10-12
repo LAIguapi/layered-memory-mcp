@@ -259,6 +259,9 @@ class SurfaceCapability(BaseModel):
     configured_handler: str | None = None
     can_apply: bool = False
     application_mode: ApplicationMode = "suggest"
+    #: Resolved location of the surface's own durable store, when it has one
+    #: the caller can read directly (today: the memory changelog's JSONL file).
+    store_path: str | None = None
     notes: str = ""
 
 
@@ -1054,10 +1057,42 @@ _CORE_NOTES: dict[MemorySurface, str] = {
     MemorySurface.TODO: "unfinished state: pending / blocked / needs validation",
     MemorySurface.MEMORY_CHANGELOG: (
         "provenance of semantic L0/L1 mutations only — NOT the repository "
-        "CHANGELOG.md, not session logs, not TODO history. Modelled and "
-        "documented in this version; no persistent store yet"
+        "CHANGELOG.md, not session logs, not TODO history"
     ),
 }
+
+#: Appended to the changelog note depending on the backend's configured state,
+#: so the capability output never implies a store that is not recording.
+_CHANGELOG_ENABLED_NOTE = (
+    ". Append-only JSONL store; read it with get_memory_changelog / "
+    "get_memory_changelog_stats. Retention is manual — nothing prunes it"
+)
+_CHANGELOG_DISABLED_NOTE = (
+    ". DISABLED by config (memory_changelog.enabled: false): no event is "
+    "recorded and the read tools report an empty log"
+)
+
+
+def _changelog_capability(config: Any | None) -> tuple[bool, str, str | None]:
+    """``(can_write, note suffix, resolved store path)`` for the changelog.
+
+    Imported lazily: ``memory_changelog`` imports this module for the surface
+    enum, so a module-level import here would be a cycle.
+    """
+    try:
+        from .memory_changelog import changelog_settings
+
+        settings = changelog_settings(config)
+        enabled = bool(settings["enabled"]) and settings["path"] is not None
+        path = str(settings["path"]) if settings["path"] is not None else None
+    except Exception:  # noqa: BLE001 — reflection must never raise
+        return False, _CHANGELOG_DISABLED_NOTE, None
+    return (
+        enabled,
+        _CHANGELOG_ENABLED_NOTE if enabled else _CHANGELOG_DISABLED_NOTE,
+        path,
+    )
+
 
 _EXTENSION_NOTES: dict[MemorySurface, str] = {
     MemorySurface.SKILL: "action protocols, methods, runbooks, commands, pitfalls",
@@ -1072,6 +1107,7 @@ def surface_capabilities(config: Any | None = None) -> MemorySurfaceCapabilities
     """Describe every surface under ``config``. Read-only; touches no store."""
     enabled, mode = routing_settings(config)
     settings = agent_extension_settings(config)
+    changelog_can_write, changelog_note, changelog_path = _changelog_capability(config)
 
     caps = MemorySurfaceCapabilities(
         routing_enabled=enabled,
@@ -1088,13 +1124,25 @@ def surface_capabilities(config: Any | None = None) -> MemorySurfaceCapabilities
             "an orchestrator for them.",
             "Raw session data is source-owned, read-only evidence — the framework "
             "scans it but never writes it.",
-            "MEMORY_CHANGELOG records semantic L0/L1 mutations only; it is not a "
-            "generic event log and has no persistent backend in this version.",
+            "MEMORY_CHANGELOG records semantic L0/L1 mutations only — not raw "
+            "sessions, not TODO history, not derived-data rebuilds, and not a "
+            "generic event log.",
         ],
     )
 
     for surface in CORE_SURFACES:
         can_apply, _agent, app_mode, handler = _apply_capability(surface, config)
+        note = _CORE_NOTES.get(surface, "")
+        store_path = None
+        if surface is MemorySurface.MEMORY_CHANGELOG:
+            # The one core surface whose writability is a config question
+            # rather than a given: with the backend off nothing is recorded,
+            # and saying `can_apply: true` anyway would be the overclaim the
+            # previous version's "no store yet" note existed to avoid.
+            can_apply = changelog_can_write
+            app_mode = "apply" if changelog_can_write else "suggest"
+            note += changelog_note
+            store_path = changelog_path
         caps.core_surfaces[surface.value] = SurfaceCapability(
             surface=surface,
             owned_by=ownership_of(surface),
@@ -1102,7 +1150,8 @@ def surface_capabilities(config: Any | None = None) -> MemorySurfaceCapabilities
             configured_handler=handler,
             can_apply=can_apply,
             application_mode=app_mode,
-            notes=_CORE_NOTES.get(surface, ""),
+            store_path=store_path,
+            notes=note,
         )
 
     for surface in EXTENSION_SURFACES:

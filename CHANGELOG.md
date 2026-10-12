@@ -48,12 +48,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   registry ships empty, so `apply_agent_action` refuses with
   `status: "unsupported"` until an integration registers an adapter. This is
   the only place product-specific paths may live; the routing core knows none.
-- **`MEMORY_CHANGELOG` schema (`layered_memory_mcp.memory_changelog`).** The
-  provenance record for semantic L0/L1 mutations, with explicit inclusion and
-  exclusion rules (`RECORDABLE_OPERATIONS` / `NOT_RECORDED`). It is not the
-  repository `CHANGELOG.md`, not session logs, not a generic event log, and not
-  TODO lifecycle history. Schema and rules only — there is no persistent store
-  yet, and the capability output says so.
+- **`MEMORY_CHANGELOG`, with a persistent backend
+  (`layered_memory_mcp.memory_changelog`).** The provenance record for semantic
+  L0/L1 mutations, with explicit inclusion and exclusion rules
+  (`RECORDABLE_OPERATIONS` / `NOT_RECORDED`). It is not the repository
+  `CHANGELOG.md`, not session logs, not a generic event log, and not TODO
+  lifecycle history.
+  - **Store.** Append-only JSONL at `<home>/data/memory_changelog.jsonl`
+    (`storage.MemoryChangelogStore`), one event per line. Recording is
+    best-effort and swallows its own failures: provenance must never be able to
+    fail the write it describes. Nothing rewrites or deletes a line —
+    `retention_days` is read and reported but **not enforced**, because pruning
+    provenance is destructive and silently dropping history is worse than not
+    pruning.
+  - **Event (`schema_version: 2`).** `event_id`, `at` (UTC ISO), `operation`,
+    `surface`, `domain`, `section`, `actor` / `agent_id`, `tool`, `summary`,
+    `reason`, `source_ref`, `before_hash` / `after_hash`, `metadata`. Structure
+    only: the body text is never copied, and `metadata` keeps scalars and short
+    strings while dropping nested containers — the one way content leaks into a
+    provenance log is a caller handing over a whole result dict. The hash
+    normalisation is shared with the deferred-fusion optimistic lock, so a
+    fusion write-back's `before_hash` *is* the `expected_hash` the handshake was
+    issued under.
+  - **Recorded paths.** `inject_knowledge` (hence `compact_memory`'s L1 writes
+    and `batch_inject_knowledge_tool`) for create / section-create / update /
+    merge / replace / fusion write-back / consolidation write-back;
+    `create_knowledge_file` / `update_knowledge_file` / `delete_knowledge_file`
+    for whole-file mutations; `sync_l0_index` and `manage_l0_entry_tool` for L0
+    entries that actually moved.
+  - **Not recorded.** A deferral handshake, a `fuse_conflict` or
+    `consolidate_refused` refusal, a skipped duplicate, a validation failure, a
+    failed write, `dry_run=True`, an L0 resync whose entry set did not change,
+    and any write whose content hash came out identical. Derived-data rebuilds
+    (vector reindex, search index) and TODO lifecycle stay out by design.
+- **`get_memory_changelog` / `get_memory_changelog_stats` (read-only MCP
+  tools).** Filtered newest-first reads (domain / operation / surface / since,
+  default 50 entries, hard ceiling 500) and a summary of counts by operation,
+  surface and domain plus the time span. A corrupt line is counted and skipped,
+  not fatal.
+- **`memory_changelog:` config section.** `enabled` (default true), `path`
+  (default `<home>/data/memory_changelog.jsonl`) and `retention_days` (default
+  none, reported not enforced). Also readable from
+  `LAYERED_MEMORY_CHANGELOG_ENABLED` / `LAYERED_MEMORY_CHANGELOG_PATH`.
 - **Procedure-contamination governance check.** `post_write_governance` now
   reports L1 sections that read as action protocols rather than durable
   knowledge. A section is flagged only when action markers *and* procedural
@@ -97,6 +133,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A failed pass (missing memory file, or a guard-declined target) returns
   `success: false` with the error, hint and `agent_memory_write` block instead
   of "Memory compaction completed."
+- **`get_memory_surface_capabilities` reports `memory_changelog` honestly.** Its
+  `can_apply` now follows the backend's configured state rather than being
+  `true` because the surface is framework-owned: with
+  `memory_changelog.enabled: false` it reports `can_apply: false` and says so in
+  `notes`. `SurfaceCapability` gained an optional `store_path`, which the
+  changelog fills with its resolved JSONL path.
 - **Test isolation covers `Path.open`.** `pathlib.Path.open` calls `io.open`
   directly, so it never went through the `builtins.open` backstop in
   `conftest.py` — every `path.write_text(...)` in the framework, which is how
