@@ -122,17 +122,43 @@ cannot interleave their sections, but nothing removes the lock file afterwards
 owns. Done when the write paths clean up their own locks, or when the `.lock`
 convention moves somewhere out of the user's directory.
 
-## 4. `inject_knowledge` enforce behaviour — decide it
+## 4. `inject_knowledge` enforce behaviour — decided, with two gaps
 
-`compact_memory` gates on `routing.mode: enforce`; `inject_knowledge` does not.
-A direct L1 write of non-L1-looking content is annotated (`routing_warning`)
-and written anyway. That asymmetry is deliberate for now — a classifier that
-starts rejecting explicit writes on upgrade is a data-loss event — but it is an
-open decision, not a settled design.
+**Decided, and encoded as two independent switches.** `routing.mode` keeps
+gating `compact_memory` only — the path where the *framework* picks the target —
+and still never refuses an explicit write. The new
+`routing.enforce_direct_writes` (default **false**, env
+`LAYERED_MEMORY_ROUTING_ENFORCE_DIRECT_WRITES`) is the only switch that can
+refuse one. With it on, an `inject_knowledge` whose content classifies as
+anything but `l1_knowledge`/`l0_index` returns
+`{success: false, action: "routing_refused", error:
+"routing_enforce_direct_write_refused", routing, routing_warning,
+suggested_action, routing_enforcement, hint}` — classified *before* the write,
+so no file, no section, no `MEMORY_CHANGELOG` event and no agent-owned write.
+`routing_override="force_l1"` (on `inject_knowledge`, `inject_knowledge_tool`
+and `batch_inject_knowledge_tool`) writes anyway and reports
+`routing_override_applied: true`; an unknown value is ignored rather than read
+as permission. `routing.enabled: false` makes the flag inert, a classifier
+failure fails **open**, and compaction passes `direct_write=False` so one config
+key never silently re-decides two behaviours. README / README.zh-CN carry the
+behaviour matrix, and `get_memory_surface_capabilities` reports both switches
+plus an `l1_knowledge` note saying which one is live.
+`tests/test_v355_inject_enforce.py` locks all of it.
 
-Done when: either enforce gates direct writes too (with an override argument),
-or the asymmetry is documented as permanent and `routing_warning` is the whole
-contract. Either way the capability output and README must state it.
+**Gap 1 — the fuse/consolidate handshake is gated on both halves.** Under the
+strict gate the second call (`fuse=True`) is classified like any other direct
+write, so a fused body that reads as a runbook is refused mid-handshake and the
+caller has to re-submit with the override. That is consistent (it *is* a direct
+L1 write) but it means a handshake can dead-end on content the first half
+accepted. Done when either the gate recognises a handshake continuation by its
+`expected_hash`, or the limitation is documented as intended.
+
+**Gap 2 — the whole-file tools are not gated.** `create_knowledge_file` /
+`update_knowledge_file` write L1 without passing through the router at all, so
+`enforce_direct_writes` does not reach them. They are blunt instruments by
+design, but "strict common-core purity" is not strict while that door is open.
+Done when they classify too, or when the flag's documentation says explicitly
+that it governs `inject_knowledge` only.
 
 ## 5. ja/ko README routing-section translation pass
 

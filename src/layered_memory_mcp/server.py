@@ -43,6 +43,7 @@ from .session_scanner import (
 )
 from .l0_manager import sync_l0_index, auto_sync_if_enabled, manage_entry, check_l0_l1_consistency
 from .injector import inject_knowledge, sync_to_vector_store, remove_from_vector_store, reindex_vector_store, vector_store_needs_reindex, calibrate_thresholds
+from .injector import normalize_routing_override as _normalize_routing_override
 from .promotion import scan_split_candidates, scan_cross_domain_duplicates
 from .backups import backup_knowledge_file
 from .governance import post_write_governance, build_validation_extras
@@ -1049,6 +1050,7 @@ async def inject_knowledge_tool(
     agent_id: str | None = None,
     fuse: bool = False,
     expected_hash: str | None = None,
+    routing_override: str = "none",
 ) -> str:
     """Smart knowledge injection with dedup, section targeting, and auto L0 sync.
 
@@ -1091,18 +1093,42 @@ async def inject_knowledge_tool(
               write; the framework refuses the overwrite if the section changed
               since the token was issued (lost-update guard). Omitting it keeps
               the legacy unlocked behavior for backward compatibility.
+        routing_override: "none" (default) or "force_l1". Only has an effect
+              when the operator set `routing.enforce_direct_writes: true`, which
+              makes this tool REFUSE a write whose content the router classifies
+              as something other than L1 knowledge (action="routing_refused",
+              error="routing_enforce_direct_write_refused", nothing written).
+              Pass "force_l1" when the classification is wrong and the content
+              really is durable L1 knowledge: the write proceeds and reports
+              `routing_override_applied: true`. Do NOT use it to push a runbook,
+              a user preference or a raw log into L1 — those have their own
+              surfaces, and the refusal names the one to use. With the default
+              config (`enforce_direct_writes: false`) this argument changes
+              nothing: the write happens and carries a `routing_warning`.
 
     Returns:
         JSON with action taken, dedup info, L0 sync status, and warnings.
         May instead return action="deferred_fusion" (needs_fusion=True) carrying
         the fusion contract + expected_hash, or action="fuse_conflict" when the
         optimistic lock rejects a stale fuse. May also carry a passive
-        title_diff_hint / stale_residue_hint (same-file advisories only).
+        title_diff_hint / stale_residue_hint (same-file advisories only), and —
+        under `routing.enforce_direct_writes` — action="routing_refused" with
+        the `routing` decision, a `suggested_action` for the agent-owned surface
+        it belongs to, and `routing_enforcement` describing the gate.
     """
     config = _get_config()
 
     if mode not in ("upsert", "append", "merge"):
         return json.dumps({"success": False, "error": f"Invalid mode: {mode!r}. Must be 'upsert', 'append', or 'merge'."})
+
+    if _normalize_routing_override(routing_override)[1] is not None:
+        return json.dumps({
+            "success": False,
+            "error": (
+                f"Invalid routing_override: {routing_override!r}. "
+                "Must be 'none' or 'force_l1'."
+            ),
+        })
 
     result = await asyncio.to_thread(
         inject_knowledge,
@@ -1114,6 +1140,7 @@ async def inject_knowledge_tool(
         agent_id=agent_id,
         fuse=fuse,
         expected_hash=expected_hash,
+        routing_override=routing_override,
     )
     return json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -1295,6 +1322,7 @@ async def batch_inject_knowledge_tool(
     items: list,
     mode: str = "upsert",
     agent_id: str | None = None,
+    routing_override: str = "none",
 ) -> str:
     """Batch knowledge injection — inject multiple knowledge entries in one call.
 
@@ -1309,19 +1337,36 @@ async def batch_inject_knowledge_tool(
                - content: Knowledge content (markdown text)
         mode: Write mode for ALL items — "upsert" (default), "append", or "merge".
         agent_id: Optional agent identifier for provenance tracking.
+        routing_override: "none" (default) or "force_l1", applied to ALL items.
+               Same meaning as in inject_knowledge_tool, and the same reason to
+               be wary of it: under `routing.enforce_direct_writes` it is the
+               difference between a refused item and an item in L1. Prefer
+               re-submitting the one item that was misclassified over forcing a
+               whole batch.
 
     Returns:
         JSON with per-item results, total counts, and any errors. Each item
         carries the same `routing` advisory as a single inject (plus
         `routing_warning` when the router would have sent it to another
-        surface), and a `deferred_fusion` item carries its full handshake
-        (`needs_fusion`, `expected_hash`, `fusion`) — batching is a convenience,
-        never a way to skip the contracts a single write has to honour.
+        surface), a `deferred_fusion` item carries its full handshake
+        (`needs_fusion`, `expected_hash`, `fusion`), and a routing-refused item
+        carries its `message` / `suggested_action` / `routing_enforcement` —
+        batching is a convenience, never a way to skip the contracts a single
+        write has to honour.
     """
     config = _get_config()
 
     if mode not in ("upsert", "append", "merge"):
         return json.dumps({"success": False, "error": f"Invalid mode: {mode!r}. Must be 'upsert', 'append', or 'merge'."})
+
+    if _normalize_routing_override(routing_override)[1] is not None:
+        return json.dumps({
+            "success": False,
+            "error": (
+                f"Invalid routing_override: {routing_override!r}. "
+                "Must be 'none' or 'force_l1'."
+            ),
+        })
 
     results = []
     success_count = 0
@@ -1364,6 +1409,7 @@ async def batch_inject_knowledge_tool(
                 content=content,
                 mode=mode,
                 agent_id=agent_id,
+                routing_override=routing_override,
             )
             item_result = {
                 "index": idx,
@@ -1378,6 +1424,19 @@ async def batch_inject_knowledge_tool(
             }
             if result.get("routing_warning"):
                 item_result["routing_warning"] = result["routing_warning"]
+            # A refused item wrote nothing. Carrying only `error` would make the
+            # batch path the quiet one: the caller needs the surface it belongs
+            # to and the action to take instead, same as a single write.
+            for key in (
+                "message",
+                "suggested_action",
+                "routing_enforcement",
+                "routing_override_applied",
+                "todo_candidate",
+                "hint",
+            ):
+                if result.get(key) is not None:
+                    item_result[key] = result[key]
             # A batched deferred_fusion is still a two-step handshake. Dropping
             # the contract here would make the batch path the one place where an
             # update can be silently lost, so carry it through verbatim.
@@ -1517,6 +1576,13 @@ async def get_memory_surface_capabilities() -> str:
         about the host agent's own files (`configured` is the requested id or
         `auto`, `resolved` is what the probe settled on, `known` lists the
         registered ids). The common core holds no product paths of its own.
+
+    Two separate enforcement switches are reported, and neither implies the
+    other: `routing_mode` (`advisory` / `enforce`) gates `compact_memory`, where
+    the framework picks the target, while `routing_enforce_direct_writes`
+    (default false) is the only thing that can make `inject_knowledge` refuse an
+    explicit write of non-L1 content. The `l1_knowledge` capability note says
+    which one you are living under right now.
 
     Returns:
         JSON MemorySurfaceCapabilities (schema_version, routing mode,

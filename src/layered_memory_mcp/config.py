@@ -877,6 +877,16 @@ class MemoryConfig:
         # returns the other surfaces as candidates. inject_knowledge still
         # writes L1 in either mode (and says so in its routing_warning).
         #
+        # `enforce_direct_writes` is the *second*, independent gate, and it is
+        # the only one that can refuse an explicit inject_knowledge call. It
+        # defaults to false because a direct write is a caller naming its own
+        # target: the framework honours it and warns. An operator who wants
+        # strict common-core purity turns this on, and then a non-L1
+        # classification refuses the write before touching L1 (overridable
+        # per call with routing_override="force_l1"). `mode` and this flag are
+        # deliberately separate: one gates the framework's own routing
+        # decisions, the other gates the caller's.
+        #
         # Precedence: constructor → env → `routing:` in config.yaml → default.
         # Malformed values fall back per key rather than raising: routing is an
         # advisory layer, and nothing about it justifies a failed start-up.
@@ -897,6 +907,14 @@ class MemoryConfig:
         _routing_mode = str(_routing_mode).strip().lower()
         self.routing_mode: str = (
             _routing_mode if _routing_mode in ROUTING_MODES else "advisory"
+        )
+        _env_enforce_direct = os.environ.get(
+            "LAYERED_MEMORY_ROUTING_ENFORCE_DIRECT_WRITES"
+        )
+        self.routing_enforce_direct_writes: bool = (
+            _env_bool("LAYERED_MEMORY_ROUTING_ENFORCE_DIRECT_WRITES", False)
+            if _env_enforce_direct is not None
+            else _coerce_bool(_routing_yaml.get("enforce_direct_writes"), False)
         )
         # Marker extensions, in the same style as `governance:`: each list
         # EXTENDS the shipped vocabulary, `disabled_markers` removes defaults

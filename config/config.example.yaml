@@ -243,3 +243,54 @@ backend:
 #
 # The primary L1 write always succeeds regardless — only the projection stops.
 # =============================================================================
+
+# =============================================================================
+# Persistence routing: two enforcement switches (optional)
+# =============================================================================
+#
+# The router classifies every candidate item into a surface — the
+# framework-owned common core (l0_index / l1_knowledge / todo /
+# memory_changelog), an agent-owned extension recommendation (skill /
+# user_profile / agent_other), or no durable write. It is deterministic: marker
+# and structure rules, no model call.
+#
+# In <home>/config.yaml:
+#
+#     routing:
+#       enabled: true
+#       mode: advisory               # advisory | enforce
+#       enforce_direct_writes: false # strict gate for explicit writes
+#
+# The two switches are independent on purpose, because they govern two
+# different questions:
+#
+#   mode: enforce
+#       Gates compact_memory — the path where the FRAMEWORK picks the target.
+#       Only l1_knowledge entries are migrated into L1; TODO, skill, profile,
+#       agent-other, undecided and ephemeral entries are left in agent memory
+#       and returned as candidates. It never refuses an explicit write.
+#
+#   enforce_direct_writes: true
+#       Gates inject_knowledge — the path where the CALLER picks the target.
+#       Content that classifies as anything but l1_knowledge/l0_index is
+#       refused before the write (action="routing_refused"); nothing is
+#       written and no MEMORY_CHANGELOG event is recorded. The result carries
+#       the routing decision and the AgentAction to take instead.
+#
+#       Override one call with routing_override="force_l1" when the classifier
+#       is wrong about a piece of durable knowledge. It is not a way to push a
+#       runbook or a preference into L1 — those have their own surfaces.
+#
+# Defaults are the compatible ones (advisory + no direct-write gate): an
+# explicit write still lands in L1 and carries a routing_warning. With
+# routing.enabled: false, enforce_direct_writes is inert — there is no
+# classification to enforce.
+#
+# Env equivalents:
+#     LAYERED_MEMORY_ROUTING_ENABLED=true
+#     LAYERED_MEMORY_ROUTING_MODE=advisory
+#     LAYERED_MEMORY_ROUTING_ENFORCE_DIRECT_WRITES=false
+#
+# get_memory_surface_capabilities() reports both switches, and the
+# l1_knowledge note says which one you are living under.
+# =============================================================================

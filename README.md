@@ -156,7 +156,8 @@ layered-memory-mcp --verbose
 | `LAYERED_MEMORY_NAMESPACE` | Agent namespace for multi-agent isolation | `shared` |
 | `LAYERED_MEMORY_PROMOTION_WATCH_PATTERNS` | Comma-separated catch-all glob patterns for maintenance scans | built-in English + Chinese list |
 | `LAYERED_MEMORY_ROUTING_ENABLED` | Classify items and annotate write results | `true` |
-| `LAYERED_MEMORY_ROUTING_MODE` | `advisory` or `enforce` | `advisory` |
+| `LAYERED_MEMORY_ROUTING_MODE` | `advisory` or `enforce` — gates `compact_memory` only | `advisory` |
+| `LAYERED_MEMORY_ROUTING_ENFORCE_DIRECT_WRITES` | Refuse an explicit `inject_knowledge` write of non-L1 content | `false` |
 | `LAYERED_MEMORY_AGENT_EXTENSIONS_ENABLED` | Let the framework apply agent-surface actions | `false` |
 | `LAYERED_MEMORY_AGENT_EXTENSIONS_MODE` | `suggest` / `apply_with_confirmation` / `apply` | `suggest` |
 | `LAYERED_MEMORY_AGENT_EXTENSIONS_ROOT` | Base dir for a file-writing extension handler | unset (refuses) |
@@ -183,7 +184,8 @@ promotion:
 
 routing:
   enabled: true
-  mode: advisory                               # advisory | enforce (see below)
+  mode: advisory                               # advisory | enforce — gates compact_memory (see below)
+  enforce_direct_writes: false                 # true = inject_knowledge REFUSES non-L1 content
   # Each list EXTENDS the built-in vocabulary, same style as governance:
   extra_skill_markers: ["cookbook"]
   extra_todo_markers: ["needs sign-off"]
@@ -203,7 +205,9 @@ memory_changelog:
   retention_days: null                         # reported, NOT enforced — nothing prunes the log
 ```
 
-`mode: advisory` is the default: routing reports its opinion alongside the normal result and changes nothing about what a write does. A classifier that started rejecting writes on upgrade would be a data-loss event, not a feature, so `enforce` is opt-in — and today exactly one path gates on it, `compact_memory` (see [Routing on the Compaction Path](#routing-on-the-compaction-path)). `inject_knowledge` still writes L1 in either mode and says so in its `routing_warning`.
+`mode: advisory` is the default: routing reports its opinion alongside the normal result and changes nothing about what a write does. A classifier that started rejecting writes on upgrade would be a data-loss event, not a feature, so `enforce` is opt-in — and exactly one path gates on it, `compact_memory` (see [Routing on the Compaction Path](#routing-on-the-compaction-path)), because that is the path where the *framework* picks the target. `inject_knowledge` still writes L1 in either mode and says so in its `routing_warning`.
+
+`enforce_direct_writes` is the second, independent switch, and the only one that can refuse an explicit write (see [Strict Direct Writes](#strict-direct-writes-opt-in)). Setting `mode: enforce` does not turn it on, and turning it on does not change what compaction migrates. With `routing.enabled: false` it is inert — there is no classification to enforce.
 
 Omit a key to keep the defaults. If you set `watch_patterns`, your list replaces the built-in pattern list. Set it to `[]` to turn pattern matching off.
 
@@ -557,7 +561,44 @@ The same pass also reports **procedure contamination**: sections that read as ac
 
 ### Advisory Routing on the Write Path
 
-`inject_knowledge` writes L1 — that is its contract, and routing does not change it. What routing adds is visibility: every result carries a `routing` block, and a write the classifier would have sent elsewhere also carries a `routing_warning` saying so. The write still happens, with the same `action` it always had. Batched writes expose the same per-item `routing`, and a batched `deferred_fusion` carries its full handshake (`needs_fusion`, `expected_hash`, `fusion`) — batching is a convenience, never a quieter write path.
+`inject_knowledge` writes L1 — that is its contract, and by default routing does not change it. What routing adds is visibility: every result carries a `routing` block, and a write the classifier would have sent elsewhere also carries a `routing_warning` saying so. The write still happens, with the same `action` it always had. Batched writes expose the same per-item `routing`, and a batched `deferred_fusion` carries its full handshake (`needs_fusion`, `expected_hash`, `fusion`) — batching is a convenience, never a quieter write path.
+
+This is the deliberate asymmetry with compaction: an explicit `inject_knowledge` call is a caller naming its own target, and `mode: enforce` does not override that. An installation that wants the stricter rule opts into it separately.
+
+### Strict Direct Writes (opt-in)
+
+`routing.enforce_direct_writes: true` turns the warning above into a refusal. The classification then runs **before** the write — before dedup, before the vector store, before anything touches disk:
+
+| `routing.enabled` | `enforce_direct_writes` | `routing_override` | Content classified | Result |
+|---|---|---|---|---|
+| `true` | `false` (default) | — | anything | Written, `routing_warning` when non-L1 (unchanged behaviour) |
+| `true` | `true` | `"none"` (default) | `l1_knowledge` / `l0_index` | Written normally, `MEMORY_CHANGELOG` event recorded |
+| `true` | `true` | `"none"` | anything else | **Refused**, nothing written |
+| `true` | `true` | `"force_l1"` | anything else | Written, `routing_override_applied: true` |
+| `false` | `true` | — | not classified | Written, legacy result shape (no routing keys) |
+
+`routing.mode` is orthogonal throughout: it decides what `compact_memory` migrates and never refuses a direct write on its own.
+
+A refusal is structured, and it is not a validation error — the request was fine, the destination was not:
+
+```json
+{
+  "success": false,
+  "action": "routing_refused",
+  "error": "routing_enforce_direct_write_refused",
+  "message": "Content classified as 'skill' (owned by agent, score 0.88); direct L1 write to 'ops' / '## 发布流程' refused by routing.enforce_direct_writes. …",
+  "written": false,
+  "routing": {"surface": "skill", "ownership": "agent", "score": 0.88, "signals": ["…"]},
+  "routing_warning": "…re-submit with routing_override='force_l1' if it really is L1 knowledge.",
+  "suggested_action": {"kind": "agent_native_write", "surface": "skill", "shape_hint": ["…"]},
+  "routing_enforcement": {"gate_active": true, "override_requested": "none", "override_applied": false},
+  "hint": "Nothing was written: no L1 file, no section, no MEMORY_CHANGELOG event, and no agent-owned write."
+}
+```
+
+Nothing is written on a refusal: no file, no section, no `MEMORY_CHANGELOG` event (that log records mutations, and a refusal is not one), and no agent-owned write either — `suggested_action` is handed back for *you* to apply, exactly as on the compaction path. TODO-shaped content comes back as a `todo_candidate`; `add_todo` stays your call.
+
+`inject_knowledge_tool(..., routing_override="force_l1")` (and the same argument on `batch_inject_knowledge_tool`) writes anyway and marks the result `routing_override_applied: true`. Use it when the classifier is wrong about a piece of durable knowledge — not to push a runbook, a preference or a log into L1, because those have surfaces of their own and the refusal names them. An unknown value is ignored rather than read as permission. Both switches are reported by `get_memory_surface_capabilities` (`routing_mode`, `routing_enforce_direct_writes`, and the `l1_knowledge` note).
 
 ### Routing on the Compaction Path
 

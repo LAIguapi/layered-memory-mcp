@@ -342,14 +342,27 @@ async def inject_knowledge_endpoint(req: InjectKnowledgeRequest):
         return result
 
     result = await asyncio.to_thread(_inject)
-    return {
+    success = bool(result.get("success"))
+    payload = {
         "dry_run": False,
+        "success": success,
         "domain": req.domain,
         "section": req.section,
-        "action": result.get("write_action", "unknown"),
+        "action": result.get("write_action") or result.get("action") or "unknown",
         "l0_synced": result.get("l0_synced", False),
-        "message": result.get("message", "Knowledge injected successfully."),
+        "message": result.get(
+            "message",
+            "Knowledge injected successfully." if success else "Knowledge was NOT written.",
+        ),
     }
+    if not success:
+        # A refusal (routing gate) or a validation failure must not read as a
+        # successful write just because this endpoint only looked at `message`.
+        payload["error"] = result.get("error")
+        for key in ("routing", "suggested_action", "routing_enforcement"):
+            if result.get(key) is not None:
+                payload[key] = result[key]
+    return payload
 
 
 @router.post("/compact-memory")

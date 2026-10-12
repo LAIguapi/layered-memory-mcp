@@ -578,12 +578,295 @@ def _persist_calibration(config, report: dict) -> None:
         logger.debug("Could not persist calibration: %s", e)
 
 
+# ---------------------------------------------------------------------------
+# Routing on the explicit write path
+# ---------------------------------------------------------------------------
+#
+# Two layers live here, and they are deliberately not the same thing:
+#
+#   1. ``_routing_advisory`` — always on (when routing is enabled). It annotates
+#      the result and changes nothing.
+#   2. ``_direct_write_gate`` — off by default. With
+#      ``routing.enforce_direct_writes: true`` an explicit write of
+#      non-L1-classified content is REFUSED before the write, unless the caller
+#      passes ``routing_override="force_l1"``.
+#
+# The default is compatibility on purpose: an explicit ``inject_knowledge`` call
+# is a caller naming its own target, and a classifier that starts dropping those
+# on upgrade is a data-loss event, not a feature.
+
+#: The surfaces an L1 write is legitimately *about*. Everything else is what the
+#: advisory layer warns on, and what the strict gate refuses.
+_L1_WRITE_SURFACES: tuple[str, ...] = ("l1_knowledge", "l0_index")
+
+#: Per-surface explanation, keyed by ``MemorySurface`` *value* so this stays a
+#: plain data table and the router is still imported lazily (it is the lower
+#: layer, and a missing router must never break a write).
+_SURFACE_HINTS: dict[str, str] = {
+    "todo": (
+        "this reads as unfinished state — add_todo keeps it out of durable L1"
+    ),
+    "skill": (
+        "this reads as a repeatable action protocol — the SKILL surface is "
+        "agent-owned; L1 keeps the facts and rules"
+    ),
+    "user_profile": (
+        "this reads as a standing global user preference — the profile surface "
+        "is agent-owned and usually needs the user's confirmation"
+    ),
+    "agent_other": (
+        "this reads as agent-owned memory content the framework will not "
+        "classify further"
+    ),
+    "ephemeral": (
+        "this reads as one-off/raw output — durable L1 is for what still holds "
+        "later"
+    ),
+    "undecided": (
+        "not enough signal to say this belongs in durable L1 — check the target "
+        "domain/section"
+    ),
+}
+
+#: ``routing_override`` values. ``force_l1`` means "I know what the classifier
+#: thinks; this is L1 knowledge and I am naming the target".
+ROUTING_OVERRIDE_NONE = "none"
+ROUTING_OVERRIDE_FORCE_L1 = "force_l1"
+ROUTING_OVERRIDES: tuple[str, ...] = (
+    ROUTING_OVERRIDE_NONE,
+    ROUTING_OVERRIDE_FORCE_L1,
+)
+
+#: The refusal's ``action`` and ``error``. Stable strings: a caller branches on
+#: these, so they are part of the contract.
+ROUTING_REFUSED_ACTION = "routing_refused"
+ROUTING_REFUSED_ERROR = "routing_enforce_direct_write_refused"
+
+
+def normalize_routing_override(value: object) -> tuple[str, str | None]:
+    """``(override, warning)`` for a caller-supplied ``routing_override``.
+
+    Unknown values degrade to "no override" **with** a warning rather than
+    raising or being read as permission: mistaking a typo for an override is
+    precisely the write the gate exists to stop.
+    """
+    if value is None:
+        return ROUTING_OVERRIDE_NONE, None
+    token = str(value).strip().lower()
+    if token in ("", "none", "no", "false"):
+        return ROUTING_OVERRIDE_NONE, None
+    if token in ROUTING_OVERRIDES:
+        return token, None
+    return ROUTING_OVERRIDE_NONE, (
+        f"ignored unknown routing_override {value!r}; expected one of "
+        + ", ".join(repr(v) for v in ROUTING_OVERRIDES)
+    )
+
+
+def _write_request_error(domain: str, section: str, content: str) -> str | None:
+    """The cheap input-validation failure for a write request, or ``None``.
+
+    Shared by the strict gate and the write core so the gate can never turn a
+    plain validation error (empty content, empty heading, path traversal) into
+    a routing refusal — those have their own, long-standing result shape and
+    callers match on it.
+    """
+    if not content or not content.strip():
+        return "Content is empty"
+    if not str(section).strip().lstrip("#").strip():
+        return "Section heading cannot be empty"
+    filename = domain if str(domain).endswith(".md") else f"{domain}.md"
+    if "/" in filename or "\\" in filename or ".." in filename:
+        return f"Invalid filename (path traversal blocked): {filename}"
+    return None
+
+
+def _direct_write_gate(
+    config: "MemoryConfig",
+    *,
+    domain: str,
+    section: str,
+    content: str,
+    routing_override: object,
+    direct_write: bool,
+) -> dict:
+    """Decide whether this explicit L1 write may proceed. Never raises.
+
+    Returns ``{refused, override, override_applied, decision, enforcement}``:
+
+    * ``refused`` — the classification is not an L1 surface and no override was
+      given. The caller must return before writing.
+    * ``decision`` — the ``RoutingDecision``, reused by the advisory layer so a
+      write classifies once.
+    * ``enforcement`` — the block attached to the result. Present only when the
+      flag is configured, so a default install's result shape is unchanged.
+
+    Fails **open**: a classifier error leaves the gate inactive and the write
+    proceeds with a warning. Refusing a write because the thing that judges
+    writes is broken would lose data for a reason that has nothing to do with
+    the content.
+    """
+    gate: dict = {
+        "refused": False,
+        "override": ROUTING_OVERRIDE_NONE,
+        "override_applied": False,
+        "decision": None,
+        "enforcement": None,
+    }
+    try:
+        from .routing import classify_memory_item, direct_write_settings
+
+        override, override_warning = normalize_routing_override(routing_override)
+        gate["override"] = override
+        settings = direct_write_settings(config)
+        if not settings["enforce_direct_writes"]:
+            return gate  # default install: nothing added, nothing changed
+        if not settings["routing_enabled"]:
+            # No classification is being computed, so there is nothing to
+            # enforce — same precedence compact_memory applies to 'enforce'.
+            return gate
+
+        enforcement: dict = {
+            "enforce_direct_writes": True,
+            "routing_mode": settings["mode"],
+            "routing_enabled": True,
+            "direct_write": bool(direct_write),
+            "gate_active": bool(direct_write),
+            "override_requested": override,
+            "override_applied": False,
+        }
+        if override_warning:
+            enforcement["override_warning"] = override_warning
+        gate["enforcement"] = enforcement
+
+        if not direct_write:
+            enforcement["note"] = (
+                "not a direct write: the framework chose this target "
+                "(compact_memory), which is gated by routing.mode instead"
+            )
+            return gate
+        if _write_request_error(domain, section, content) is not None:
+            # Let the write core return its own validation error shape.
+            enforcement["gate_active"] = False
+            enforcement["note"] = (
+                "request failed input validation before classification; the "
+                "validation error is returned unchanged"
+            )
+            return gate
+
+        decision = classify_memory_item(
+            content, config=config, domain=domain, section=section
+        )
+        gate["decision"] = decision
+        if decision.surface.value in _L1_WRITE_SURFACES:
+            enforcement["note"] = (
+                f"classified '{decision.surface.value}' — an L1 surface, so the "
+                "strict gate allowed the write"
+            )
+            return gate
+        if override == ROUTING_OVERRIDE_FORCE_L1:
+            gate["override_applied"] = True
+            enforcement["override_applied"] = True
+            enforcement["note"] = (
+                f"classified '{decision.surface.value}', which "
+                "routing.enforce_direct_writes would refuse; written anyway "
+                "because the caller passed routing_override='force_l1'"
+            )
+            return gate
+        gate["refused"] = True
+        enforcement["note"] = (
+            f"classified '{decision.surface.value}': refused before any L1 "
+            "write. Nothing was written and no MEMORY_CHANGELOG event was "
+            "recorded"
+        )
+        return gate
+    except Exception as e:  # noqa: BLE001 — the gate must never break a write
+        logger.warning(
+            "direct-write routing gate failed (non-critical, write allowed): %s", e
+        )
+        gate["refused"] = False
+        gate["decision"] = None
+        gate["enforcement"] = {
+            "enforce_direct_writes": True,
+            "gate_active": False,
+            "override_requested": gate["override"],
+            "override_applied": False,
+            "error": str(e),
+            "note": (
+                "the strict gate could not classify this item; the write was "
+                "allowed rather than refused for a classifier failure"
+            ),
+        }
+        return gate
+
+
+def _routing_refusal(
+    gate: dict, *, domain: str, section: str, content: str
+) -> dict:
+    """The structured refusal for a gated direct write. Writes nothing.
+
+    Deliberately not shaped like a validation error: the request was valid, the
+    *destination* was not, so the caller gets the decision, the agent-owned
+    action to take instead, and the exact way to insist.
+    """
+    decision = gate["decision"]
+    summary = decision.advisory_summary()
+    surface = decision.surface.value
+    hint = _SURFACE_HINTS.get(surface, "")
+    action = getattr(decision, "suggested_action", None)
+    result: dict = {
+        "success": False,
+        "action": ROUTING_REFUSED_ACTION,
+        "error": ROUTING_REFUSED_ERROR,
+        "message": (
+            f"Content classified as '{surface}' (owned by "
+            f"{decision.ownership.value}, score {decision.score}); direct L1 "
+            f"write to '{domain}' / '## {section}' refused by "
+            f"routing.enforce_direct_writes. {hint}"
+        ).strip(),
+        "written": False,
+        "domain": domain,
+        "section": section,
+        "routing": summary,
+        "routing_warning": (
+            f"routing classified this as '{surface}' (owned by "
+            f"{decision.ownership.value}, score {decision.score}), not L1 "
+            "knowledge, and routing.enforce_direct_writes is true — so the "
+            "write was REFUSED, not annotated. Place the item on its own "
+            "surface, or re-submit with routing_override='force_l1' if it "
+            "really is L1 knowledge."
+        ),
+        "suggested_action": action.model_dump(mode="json") if action else None,
+        "routing_enforcement": gate["enforcement"],
+        "hint": (
+            "Nothing was written: no L1 file, no section, no MEMORY_CHANGELOG "
+            "event, and no agent-owned write. Either place the item on the "
+            "surface named above, or re-call with routing_override='force_l1'."
+        ),
+    }
+    if surface == "todo":
+        # Compaction reports TODO candidates rather than creating them; the
+        # write path keeps that boundary — add_todo stays the caller's call.
+        result["todo_candidate"] = {
+            "surface": "todo",
+            "title": section,
+            "content": (content or "").strip(),
+            "reason": decision.reason,
+            "hint": (
+                "create it with add_todo(...) — the framework never creates a "
+                "TODO on your behalf from a write"
+            ),
+        }
+    return result
+
+
 def _routing_advisory(
     config: "MemoryConfig",
     result: dict,
     domain: str,
     section: str,
     content: str,
+    gate: dict | None = None,
 ) -> dict:
     """Attach the persistence router's opinion to a write result. Advisory only.
 
@@ -595,11 +878,15 @@ def _routing_advisory(
 
     What this must NOT do, and does not do:
       - change ``action`` / ``success`` / any existing field;
-      - block, redirect or drop a write (even in ``enforce`` mode — this entry
-        point's contract is "the caller named the target", and the decision
-        says so; ``compact_memory`` is where ``enforce`` gates, because there
-        the *framework* picked the target);
+      - block, redirect or drop a write. Refusal is the strict gate's job
+        (:func:`_direct_write_gate`), it happens *before* the write, and it is
+        opt-in; ``routing.mode: enforce`` alone still never blocks an explicit
+        write, because there the caller named the target;
       - raise. A failure here is logged and the result is returned untouched.
+
+    ``gate`` is the strict gate's output for this same call, when there was
+    one: it carries the decision (so a write classifies once) and the
+    ``routing_enforcement`` block.
     """
     if not isinstance(result, dict):
         return result
@@ -608,59 +895,52 @@ def _routing_advisory(
     if not result.get("success") and not result.get("action"):
         return result
     try:
-        from .routing import MemorySurface, classify_memory_item, routing_settings
+        from .routing import classify_memory_item, routing_settings
 
         enabled, mode = routing_settings(config)
         if not enabled:
             return result
-        decision = classify_memory_item(
+        # Attached first, and independent of the classification: when the
+        # classifier is what broke, "the gate was armed but could not run" is
+        # exactly the thing the caller needs to be told.
+        enforcement = (gate or {}).get("enforcement")
+        if enforcement is not None:
+            result["routing_enforcement"] = enforcement
+        override_applied = bool((gate or {}).get("override_applied"))
+        if override_applied:
+            result["routing_override_applied"] = True
+        decision = (gate or {}).get("decision") or classify_memory_item(
             content, config=config, domain=domain, section=section
         )
         result["routing"] = decision.advisory_summary()
-        if decision.surface not in (
-            MemorySurface.L1_KNOWLEDGE,
-            MemorySurface.L0_INDEX,
-        ):
-            hint = {
-                MemorySurface.TODO: (
-                    "this reads as unfinished state — add_todo keeps it out of "
-                    "durable L1"
-                ),
-                MemorySurface.SKILL: (
-                    "this reads as a repeatable action protocol — the SKILL "
-                    "surface is agent-owned; L1 keeps the facts and rules"
-                ),
-                MemorySurface.USER_PROFILE: (
-                    "this reads as a standing global user preference — the "
-                    "profile surface is agent-owned and usually needs the user's "
-                    "confirmation"
-                ),
-                MemorySurface.AGENT_OTHER: (
-                    "this reads as agent-owned memory content the framework will "
-                    "not classify further"
-                ),
-                MemorySurface.EPHEMERAL: (
-                    "this reads as one-off/raw output — durable L1 is for what "
-                    "still holds later"
-                ),
-                MemorySurface.UNDECIDED: (
-                    "not enough signal to say this belongs in durable L1 — check "
-                    "the target domain/section"
-                ),
-            }.get(decision.surface, "")
-            result["routing_warning"] = (
+        if decision.surface.value not in _L1_WRITE_SURFACES:
+            hint = _SURFACE_HINTS.get(decision.surface.value, "")
+            head = (
                 f"routing suggests surface '{decision.surface.value}' "
                 f"(owned by {decision.ownership.value}, score {decision.score}), "
-                f"not L1 knowledge: {hint}. The write was NOT changed — routing "
-                f"mode is '{mode}' and advisory"
-                + (
-                    "; 'enforce' gates compact_memory, not this explicit write "
-                    "— you named the target, so the framework honours it"
-                    if mode == "enforce"
-                    else ""
-                )
-                + "."
+                f"not L1 knowledge: {hint}."
             )
+            if override_applied:
+                result["routing_warning"] = (
+                    head + " routing.enforce_direct_writes would have REFUSED "
+                    "this write; it happened because the caller passed "
+                    "routing_override='force_l1'. The item is now in L1 — if "
+                    "that was a mistake, move it to the surface named above."
+                )
+            else:
+                result["routing_warning"] = (
+                    head
+                    + f" The write was NOT changed — routing mode is '{mode}' "
+                    "and advisory"
+                    + (
+                        "; 'enforce' gates compact_memory, not this explicit "
+                        "write — you named the target, so the framework honours "
+                        "it"
+                        if mode == "enforce"
+                        else ""
+                    )
+                    + "."
+                )
     except Exception as e:  # noqa: BLE001 — advisory layer must never break a write
         logger.warning("routing advisory failed (non-critical): %s", e)
         result["routing_error"] = str(e)
@@ -790,15 +1070,52 @@ def inject_knowledge(
     agent_id: str | None = None,
     fuse: bool = False,
     expected_hash: str | None = None,
+    routing_override: str = ROUTING_OVERRIDE_NONE,
+    *,
+    direct_write: bool = True,
 ) -> dict:
     """Smart knowledge injection — the primary write entry point.
 
-    Thin wrapper over :func:`_inject_knowledge_core` that attaches the
-    persistence router's advisory classification (see :func:`_routing_advisory`)
-    to **every** return path, including the ``deferred_fusion`` /
-    ``fuse_conflict`` / family-gate handshakes, without altering any of them.
+    Wrapper over :func:`_inject_knowledge_core` that adds the two routing
+    layers, in this order:
+
+    1. the strict direct-write gate (:func:`_direct_write_gate`), which is off
+       unless ``routing.enforce_direct_writes`` is true. When it refuses, this
+       returns :func:`_routing_refusal` **before** the write — so no L1 file or
+       section is created, no dedup/vector work is done and no
+       ``MEMORY_CHANGELOG`` event is recorded;
+    2. the advisory classification (:func:`_routing_advisory`), attached to
+       **every** remaining return path — including the ``deferred_fusion`` /
+       ``fuse_conflict`` / family-gate handshakes — without altering any of
+       them.
+
     See the core function for the full write contract.
+
+    Args:
+        routing_override: ``"none"`` (default) or ``"force_l1"``. Only relevant
+            under ``routing.enforce_direct_writes``: ``force_l1`` says "I know
+            the classifier disagrees; this is L1 knowledge", and the write
+            proceeds with ``routing_override_applied: true``. An unknown value
+            is ignored (reported in ``routing_enforcement.override_warning``)
+            rather than read as permission.
+        direct_write: whether this is a caller-named write. ``False`` is for
+            the framework's own routed paths (``compact_memory``), which are
+            gated by ``routing.mode`` instead — applying both gates to one
+            write would mean a single config flag silently changing what
+            compaction does.
     """
+    gate = _direct_write_gate(
+        config,
+        domain=domain,
+        section=section,
+        content=content,
+        routing_override=routing_override,
+        direct_write=direct_write,
+    )
+    if gate["refused"]:
+        return _routing_refusal(
+            gate, domain=domain, section=section, content=content
+        )
     result = _inject_knowledge_core(
         config=config,
         domain=domain,
@@ -810,7 +1127,7 @@ def inject_knowledge(
         expected_hash=expected_hash,
     )
     return _routing_advisory(
-        config, result, domain=domain, section=section, content=content
+        config, result, domain=domain, section=section, content=content, gate=gate
     )
 
 
@@ -858,19 +1175,16 @@ def _inject_knowledge_core(
         fuse and re-submit with ``fuse=True`` + that ``expected_hash``.
     """
     # --- 1. Validate inputs ---
-    if not content or not content.strip():
-        return {"success": False, "error": "Content is empty"}
+    # Shared with the strict routing gate (_write_request_error), so the gate
+    # can never answer a request this layer would have rejected anyway:
+    # an empty body / heading or a traversal attempt keeps its own error shape.
+    request_error = _write_request_error(domain, section, content)
+    if request_error is not None:
+        return {"success": False, "error": request_error}
 
     # Normalize domain to filename
     filename = domain if domain.endswith(".md") else f"{domain}.md"
     section_clean = section.strip().lstrip("#").strip()
-    if not section_clean:
-        return {"success": False, "error": "Section heading cannot be empty"}
-
-    # Security: validate path to prevent traversal attacks
-    # Filename must not contain path separators or parent references
-    if "/" in filename or "\\" in filename or ".." in filename:
-        return {"success": False, "error": f"Invalid filename (path traversal blocked): {filename}"}
 
     # Find the actual file location across all knowledge dirs (namespace + shared).
     # If the file exists in a shared dir, write there instead of creating a duplicate.

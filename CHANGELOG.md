@@ -73,12 +73,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only for a configured path. No command adapter and no shell execution exist
   on this path, and writing a Hermes-native skill or profile file remains out
   of scope.
-- **`routing:` config section.** `enabled` (default true) and `mode` (default
-  `advisory`), plus marker extensions in the same style as `governance:`
-  (`extra_skill_markers`, `extra_todo_markers`, `extra_profile_markers`,
-  `extra_knowledge_markers`, `disabled_markers`). Also readable from
-  `LAYERED_MEMORY_ROUTING_ENABLED` / `LAYERED_MEMORY_ROUTING_MODE` /
+- **`routing:` config section.** `enabled` (default true), `mode` (default
+  `advisory`) and `enforce_direct_writes` (default false), plus marker
+  extensions in the same style as `governance:` (`extra_skill_markers`,
+  `extra_todo_markers`, `extra_profile_markers`, `extra_knowledge_markers`,
+  `disabled_markers`). Also readable from `LAYERED_MEMORY_ROUTING_ENABLED` /
+  `LAYERED_MEMORY_ROUTING_MODE` /
+  `LAYERED_MEMORY_ROUTING_ENFORCE_DIRECT_WRITES` /
   `LAYERED_MEMORY_AGENT_EXTENSIONS_ENABLED`.
+- **Strict direct writes — `routing.enforce_direct_writes` (opt-in, default
+  false).** The `inject_knowledge` enforce question is decided, as two
+  independent switches rather than one. `routing.mode` keeps gating
+  `compact_memory` only, where the *framework* picks the target, and still never
+  refuses an explicit write. `enforce_direct_writes` is the only switch that
+  can: with it on, a direct write whose content classifies as anything but
+  `l1_knowledge` / `l0_index` is refused **before** the write — before dedup,
+  before the vector store, before anything touches disk — and returns
+  `{success: false, action: "routing_refused", error:
+  "routing_enforce_direct_write_refused", message, written: false, routing,
+  routing_warning, suggested_action, routing_enforcement, hint}`, plus a
+  `todo_candidate` for TODO-shaped content. A refusal writes nothing at all: no
+  file, no section, no `MEMORY_CHANGELOG` event (a refusal is not a mutation)
+  and no agent-owned write — `suggested_action` is handed back for the caller to
+  apply, as on the compaction path. A new `routing_override` argument
+  (`"none"` / `"force_l1"`) on `inject_knowledge`, `inject_knowledge_tool` and
+  `batch_inject_knowledge_tool` writes anyway and reports
+  `routing_override_applied: true`; an unknown value is ignored rather than read
+  as permission. `routing.enabled: false` makes the flag inert, a classifier
+  failure fails open (a write must not be lost because the thing that judges
+  writes broke), and compaction is unaffected — it is gated by `routing.mode`,
+  so one config key never silently re-decides two behaviours.
+  `get_memory_surface_capabilities` reports both switches
+  (`routing_mode`, `routing_enforce_direct_writes`) and the `l1_knowledge` note
+  says which one is live. **Default behaviour is unchanged**: an explicit write
+  still lands in L1 with a `routing_warning`, and a default install's result
+  shape gains no new keys.
 - **Adapter interface (`layered_memory_mcp.adapters`).** The protocol, registry
   and `apply_agent_action` entry point for applying extension actions, plus an
   optional `readiness(surface, config)` hook an adapter uses to say whether it

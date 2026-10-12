@@ -52,6 +52,16 @@ is registered and whether it can resolve a safe target. A capability output that
 promised a write ``apply_agent_action`` then refuses would be worse than no
 capability output at all.
 
+TWO ENFORCEMENT SWITCHES, NOT ONE
+---------------------------------
+``routing.mode: enforce`` gates the path where the *framework* chose the target
+— ``compact_memory`` injects only ``L1_KNOWLEDGE`` and reports the rest.
+``routing.enforce_direct_writes`` (default false) is a separate, opt-in gate for
+the path where the *caller* chose the target: with it on, an explicit
+``inject_knowledge`` of non-L1-classified content is refused before the write,
+and the caller can still insist with ``routing_override="force_l1"``. Neither
+switch implies the other; see :func:`direct_write_settings`.
+
 This module never touches a filesystem path belonging to a specific agent
 product. Any such mapping belongs in an adapter (see ``adapters/base.py``).
 """
@@ -300,6 +310,11 @@ class MemorySurfaceCapabilities(BaseModel):
     schema_version: int = 1
     routing_enabled: bool = True
     routing_mode: RoutingMode = "advisory"
+    #: Whether an explicit ``inject_knowledge`` write of non-L1-classified
+    #: content is refused (``routing.enforce_direct_writes``). Independent of
+    #: ``routing_mode``, which gates ``compact_memory`` instead — see
+    #: :func:`direct_write_settings`.
+    routing_enforce_direct_writes: bool = False
     agent_extensions_enabled: bool = False
     agent_extensions_mode: ApplicationMode = "suggest"
     adapter: str | None = None
@@ -622,6 +637,37 @@ def routing_settings(config: Any | None) -> tuple[bool, RoutingMode]:
     if mode not in ("advisory", "enforce"):
         mode = "advisory"
     return enabled, mode  # type: ignore[return-value]
+
+
+def direct_write_settings(config: Any | None) -> dict[str, Any]:
+    """Strict-gate state for an **explicit** L1 write (``inject_knowledge``).
+
+    Returns ``{routing_enabled, mode, enforce_direct_writes, gate_active}``.
+
+    Two independent switches, on purpose:
+
+    * ``mode: enforce`` gates the path where the *framework* picked the target
+      (``compact_memory``). It says nothing about a caller-named write.
+    * ``routing.enforce_direct_writes`` is the only switch that can refuse an
+      explicit ``inject_knowledge`` call. Default false: on upgrade, a
+      classifier that starts rejecting writes somebody asked for is a data-loss
+      event, so the compatible behaviour (write + ``routing_warning``) stays
+      the default and strictness is opted into.
+
+    ``gate_active`` folds in ``routing.enabled``: with classification switched
+    off there is no decision to enforce, so the flag is inert rather than
+    blocking — the same precedence ``compact_memory`` applies to ``enforce``.
+    """
+    enabled, mode = routing_settings(config)
+    flag = False
+    if config is not None:
+        flag = bool(getattr(config, "routing_enforce_direct_writes", False))
+    return {
+        "routing_enabled": enabled,
+        "mode": mode,
+        "enforce_direct_writes": flag,
+        "gate_active": bool(enabled and flag),
+    }
 
 
 def agent_extension_settings(config: Any | None) -> dict[str, Any]:
@@ -1268,12 +1314,14 @@ _EXTENSION_NOTES: dict[MemorySurface, str] = {
 def surface_capabilities(config: Any | None = None) -> MemorySurfaceCapabilities:
     """Describe every surface under ``config``. Read-only; touches no store."""
     enabled, mode = routing_settings(config)
+    direct = direct_write_settings(config)
     settings = agent_extension_settings(config)
     changelog_can_write, changelog_note, changelog_path = _changelog_capability(config)
 
     caps = MemorySurfaceCapabilities(
         routing_enabled=enabled,
         routing_mode=mode,
+        routing_enforce_direct_writes=bool(direct["enforce_direct_writes"]),
         agent_extensions_enabled=bool(settings["enabled"]),
         agent_extensions_mode=settings["mode"],
         adapter=settings["adapter"],
@@ -1292,6 +1340,12 @@ def surface_capabilities(config: Any | None = None) -> MemorySurfaceCapabilities
             "MEMORY_CHANGELOG records semantic L0/L1 mutations only — not raw "
             "sessions, not TODO history, not derived-data rebuilds, and not a "
             "generic event log.",
+            (
+                "routing_mode gates compact_memory (the framework picks the "
+                "target there). It never refuses an explicit inject_knowledge "
+                "call — only routing_enforce_direct_writes does, and it is "
+                f"currently {str(direct['enforce_direct_writes']).lower()}."
+            ),
         ],
     )
 
@@ -1308,6 +1362,21 @@ def surface_capabilities(config: Any | None = None) -> MemorySurfaceCapabilities
             app_mode = "apply" if changelog_can_write else "suggest"
             note += changelog_note
             store_path = changelog_path
+        elif surface is MemorySurface.L1_KNOWLEDGE:
+            # The framework may always write L1 — but whether it will accept an
+            # *explicit* write of non-L1-looking content is a config question,
+            # and a caller planning a write deserves to read it here rather
+            # than discover it as a refusal.
+            note += (
+                ". Direct inject_knowledge writes of non-l1_knowledge content "
+                + (
+                    "are REFUSED (routing.enforce_direct_writes: true); pass "
+                    "routing_override='force_l1' to write anyway"
+                    if direct["gate_active"]
+                    else "are written with a routing_warning "
+                    "(routing.enforce_direct_writes: false)"
+                )
+            )
         caps.core_surfaces[surface.value] = SurfaceCapability(
             surface=surface,
             owned_by=ownership_of(surface),
@@ -1375,6 +1444,7 @@ __all__ = [
     "SurfaceOwnership",
     "agent_extension_settings",
     "classify_memory_item",
+    "direct_write_settings",
     "extension_readiness",
     "ownership_of",
     "routing_settings",

@@ -139,7 +139,8 @@ layered-memory-mcp --verbose
 | `LAYERED_MEMORY_NAMESPACE` | Agent 命名空间，用于多 Agent 隔离 | `shared` |
 | `LAYERED_MEMORY_PROMOTION_WATCH_PATTERNS` | 维护扫描使用的杂项文件 glob 模式（逗号分隔） | 内置中英文列表 |
 | `LAYERED_MEMORY_ROUTING_ENABLED` | 分类内容并为写入结果加注路由信息 | `true` |
-| `LAYERED_MEMORY_ROUTING_MODE` | `advisory`（建议）或 `enforce` | `advisory` |
+| `LAYERED_MEMORY_ROUTING_MODE` | `advisory`（建议）或 `enforce` —— 只作用于 `compact_memory` | `advisory` |
+| `LAYERED_MEMORY_ROUTING_ENFORCE_DIRECT_WRITES` | 显式 `inject_knowledge` 写入非 L1 内容时直接拒绝 | `false` |
 | `LAYERED_MEMORY_AGENT_EXTENSIONS_ENABLED` | 允许框架代写代理自有面 | `false` |
 | `LAYERED_MEMORY_AGENT_EXTENSIONS_MODE` | `suggest` / `apply_with_confirmation` / `apply` | `suggest` |
 | `LAYERED_MEMORY_AGENT_EXTENSIONS_ROOT` | 写文件类扩展处理器的基准目录 | 未设置（会拒绝） |
@@ -166,7 +167,8 @@ promotion:
 
 routing:
   enabled: true
-  mode: advisory                               # advisory | enforce（见下）
+  mode: advisory                               # advisory | enforce —— 只拦 compact_memory（见下）
+  enforce_direct_writes: false                 # true = inject_knowledge 拒写非 L1 内容
   # 以下列表同样是在内置词表基础上"追加"，风格与 governance 一致：
   extra_skill_markers: ["操作手册"]
   extra_todo_markers: ["待签字"]
@@ -186,7 +188,9 @@ memory_changelog:
   retention_days: null                         # 只报告，不执行 —— 没有任何逻辑会清理它
 ```
 
-`mode: advisory` 是默认值：路由只在正常结果旁边附上它的判断，不改变写入行为。升级后突然开始拒写，那是数据丢失事故，不是功能，所以 `enforce` 必须显式开启 —— 目前只有一条路径会据此拦截：`compact_memory`（见[压实路径上的路由](#压实路径上的路由)）。`inject_knowledge` 在两种模式下都照常写 L1，并在 `routing_warning` 里说明这一点。
+`mode: advisory` 是默认值：路由只在正常结果旁边附上它的判断，不改变写入行为。升级后突然开始拒写，那是数据丢失事故，不是功能，所以 `enforce` 必须显式开启 —— 只有一条路径会据此拦截：`compact_memory`（见[压实路径上的路由](#压实路径上的路由)），因为那是**框架**自己挑目标的路径。`inject_knowledge` 在两种模式下都照常写 L1，并在 `routing_warning` 里说明这一点。
+
+`enforce_direct_writes` 是第二个、相互独立的开关，也是唯一能拒绝显式写入的开关（见[严格直写](#严格直写可选开启)）。设 `mode: enforce` 不会顺带打开它，打开它也不会改变压实迁移什么。如果 `routing.enabled: false`，它是空转的 —— 没有分类就没有东西可强制。
 
 不写某个键就保持默认。如果设置了 `watch_patterns`，你的列表会替换内置模式列表；设为 `[]` 可关闭模式匹配。
 
@@ -540,7 +544,44 @@ L1 用来存放**长期知识**，也就是当前成立的规则和事实。未�
 
 ### 写入路径上的建议式路由
 
-`inject_knowledge` 写的是 L1，这一点路由不会改变。它增加的是可见性：每个结果都带一个 `routing` 块；如果分类器认为这条内容该去别处，还会带上 `routing_warning`。写入照常发生，`action` 与过去完全一致。批量写入同样逐条暴露 `routing`，批量里的 `deferred_fusion` 也会完整带上握手字段（`needs_fusion`、`expected_hash`、`fusion`）—— 批量只是省事，不是更安静的写入通道。
+`inject_knowledge` 写的是 L1，这一点路由默认不会改变。它增加的是可见性：每个结果都带一个 `routing` 块；如果分类器认为这条内容该去别处，还会带上 `routing_warning`。写入照常发生，`action` 与过去完全一致。批量写入同样逐条暴露 `routing`，批量里的 `deferred_fusion` 也会完整带上握手字段（`needs_fusion`、`expected_hash`、`fusion`）—— 批量只是省事，不是更安静的写入通道。
+
+这就是与压实之间那条刻意的不对称：显式调用 `inject_knowledge` 意味着调用方自己指定了目标，`mode: enforce` 不会替它改主意。想要更严格规则的安装，单独打开下面这个开关。
+
+### 严格直写（可选开启）
+
+`routing.enforce_direct_writes: true` 把上面那条警告变成拒绝。分类会在写入**之前**跑 —— 在去重之前、在向量库之前、在任何东西落盘之前：
+
+| `routing.enabled` | `enforce_direct_writes` | `routing_override` | 分类结果 | 行为 |
+|---|---|---|---|---|
+| `true` | `false`（默认） | — | 任意 | 照常写入，非 L1 时带 `routing_warning`（行为不变） |
+| `true` | `true` | `"none"`（默认） | `l1_knowledge` / `l0_index` | 照常写入，并记录 `MEMORY_CHANGELOG` 事件 |
+| `true` | `true` | `"none"` | 其他 | **拒绝**，什么都不写 |
+| `true` | `true` | `"force_l1"` | 其他 | 照写，并标记 `routing_override_applied: true` |
+| `false` | `true` | — | 不分类 | 照常写入，结果是旧的形状（没有任何 routing 字段） |
+
+`routing.mode` 全程与此正交：它决定 `compact_memory` 迁移什么，自己永远不会拒绝一次直写。
+
+拒绝结果是结构化的，而且不是校验错误 —— 请求本身没问题，问题在于**目标**：
+
+```json
+{
+  "success": false,
+  "action": "routing_refused",
+  "error": "routing_enforce_direct_write_refused",
+  "message": "Content classified as 'skill' (owned by agent, score 0.88); direct L1 write to 'ops' / '## 发布流程' refused by routing.enforce_direct_writes. …",
+  "written": false,
+  "routing": {"surface": "skill", "ownership": "agent", "score": 0.88, "signals": ["…"]},
+  "routing_warning": "…re-submit with routing_override='force_l1' if it really is L1 knowledge.",
+  "suggested_action": {"kind": "agent_native_write", "surface": "skill", "shape_hint": ["…"]},
+  "routing_enforcement": {"gate_active": true, "override_requested": "none", "override_applied": false},
+  "hint": "Nothing was written: no L1 file, no section, no MEMORY_CHANGELOG event, and no agent-owned write."
+}
+```
+
+被拒绝时什么都没写：没有文件、没有章节、没有 `MEMORY_CHANGELOG` 事件（那个日志记录的是变更，拒绝不是变更），也没有任何 agent 自有存储的写入 —— `suggested_action` 交回给**你**执行，和压实路径上的规矩一样。TODO 形状的内容会作为 `todo_candidate` 返回；`add_todo` 仍然由你来调。
+
+`inject_knowledge_tool(..., routing_override="force_l1")`（`batch_inject_knowledge_tool` 上是同名参数）会照写，并在结果里标记 `routing_override_applied: true`。只在分类器确实看错了一条长期知识时才用它 —— 不要用它把操作手册、用户偏好或日志塞进 L1，那些都有自己的面，拒绝信息里已经写明是哪一个。无法识别的取值会被忽略，而不是当成许可。两个开关都由 `get_memory_surface_capabilities` 报告（`routing_mode`、`routing_enforce_direct_writes`，以及 `l1_knowledge` 的说明）。
 
 ### 压实路径上的路由
 

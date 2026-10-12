@@ -690,6 +690,12 @@ def compact_memory(
                     section=suggestion["section"],
                     content=entry,
                     mode="append",
+                    # Not a caller-named write: this pass picked the target, and
+                    # what it may send to L1 is decided above by `mode`
+                    # (advisory migrates everything, enforce blocks non-L1).
+                    # routing.enforce_direct_writes gates the *caller's* writes,
+                    # so it must not silently re-decide compaction's own rule.
+                    direct_write=False,
                 )
                 if result.get("success"):
                     migrated.append({
