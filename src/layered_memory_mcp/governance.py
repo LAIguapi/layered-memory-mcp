@@ -428,6 +428,14 @@ def scan_procedure_contamination(
     Advisory only: nothing is moved, and the framework cannot write the SKILL
     surface unless the operator has opted in through ``agent_extensions``.
     """
+    # COST (on the write path): ``post_write_governance`` calls this after
+    # *every* L1 create/update, and it classifies every section of the file
+    # (not just the section written) — so the work is
+    # (sections × marker vocabulary), growing with the file and unbounded by any
+    # size check here. ``max_findings`` caps the report, not the scan. If write
+    # latency becomes a problem, bound the scan at this point (cap sections,
+    # skip unchanged ones, or sample) rather than dropping the advisory:
+    # procedure contamination is only ever caught here.
     from .routing import MemorySurface, classify_memory_item
 
     domain = domain_of(file_label)

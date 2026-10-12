@@ -441,6 +441,13 @@ _LOG_LINE_RE = re.compile(
 MIN_CHARS_FOR_FALLBACK = 80
 
 #: A surface must reach this rule-weight to win outright.
+#
+# NOTE: unreachable with the weights shipped today — the lowest base weight any
+# rule assigns is 0.38 + 0.04 per hit, i.e. 0.42 at one hit, already above the
+# floor. So the "weak signal … treating the item as unrouted" branch below has
+# never executed in production. Lower any rule weight under this floor and that
+# branch goes live for the first time, and it falls through to the length-only
+# L1 fallback further down — write tests before treating it as a safety net.
 SCORE_FLOOR = 0.40
 
 #: Share of non-empty lines that must look like log output before an item is
@@ -1270,6 +1277,18 @@ def classify_memory_item(
             # Substantive prose with no decisive marker: keep the long-standing
             # behaviour (durable knowledge) rather than invent a new default,
             # but say plainly that the call rests on nothing.
+            #
+            # INVARIANT: this is the *only* path that returns L1_KNOWLEDGE with
+            # no supporting signal — score is capped at 0.35 and is 0.0 whenever
+            # no rule scored at all (the live case, since SCORE_FLOOR is
+            # currently unreachable), with ``confidence_basis`` then
+            # "insufficient". The warning and the low score are the only markers
+            # of that; every downstream gate that inspects ``surface`` alone
+            # reads this as a positive L1 classification. Moving
+            # MIN_CHARS_FOR_FALLBACK therefore changes
+            # ``injector._direct_write_gate`` (what a strict direct write
+            # refuses) and ``compact_memory``'s enforce behaviour, not just this
+            # function's output.
             surface = MemorySurface.L1_KNOWLEDGE
             score = min(score, 0.35)
             reason = (

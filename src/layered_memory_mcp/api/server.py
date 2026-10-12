@@ -108,6 +108,14 @@ stores: dict[str, Any] = {}
 async def lifespan(app: FastAPI):
     """Initialize stores on startup."""
     cfg = get_config()
+    # These product-path defaults are legacy to this HTTP server and are the last
+    # such literals left outside the adapters. The framework's own layout is
+    # ``<LAYERED_MEMORY_HOME>/knowledge`` and ``/data`` via
+    # ``config.default_knowledge_dir``; this module predates that and is not
+    # covered by the AST product-path boundary test (which lists only the core
+    # modules), so the drift is invisible to the suite. Align it with
+    # ``default_knowledge_dir`` in a dedicated change — it moves where an
+    # existing deployment reads and writes.
     knowledge_dir = Path(cfg.get("knowledge_dir", "~/.hermes/knowledge")).expanduser()
     data_dir = Path(cfg.get("data_dir", "~/.hermes/data")).expanduser()
 

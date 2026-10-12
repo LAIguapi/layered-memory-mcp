@@ -97,6 +97,16 @@ class MemoryChangelogStore:
         if not self.exists():
             return [], 0
         try:
+            # TRADEOFF (known gap, left as-is deliberately): returning
+            # ``([], 0)`` makes an oversized changelog indistinguishable from an
+            # empty one to every caller — the only trace is this log line, which
+            # an MCP caller never sees, so `query`/report output reads as "no
+            # provenance recorded". And this branch is reachable over time, not
+            # just under misuse: ``retention_days`` is parsed and reported but
+            # never enforced (see ``memory_changelog.changelog_settings``), so
+            # the file only grows. The fix is to surface a flag/error in the read
+            # result rather than only logging; do not "fix" it by raising here,
+            # since the read path's contract is never-raises.
             if self.path.stat().st_size > MAX_READ_BYTES:
                 logger.warning(
                     "memory_changelog is larger than %d bytes (%s) — refusing to "

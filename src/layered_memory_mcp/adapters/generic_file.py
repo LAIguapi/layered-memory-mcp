@@ -240,8 +240,11 @@ def resolve_target(
 
     candidate = _normalise(candidate)
 
-    # A relative path (or a root-derived one) must stay inside its base; a
-    # configured root also contains an absolute path that claims to be under it.
+    # Only relative and root-derived paths get a containment base, so only they
+    # are confined here. An absolute ``path`` deliberately leaves ``base`` as
+    # None above: naming an absolute file *is* the explicitness this gate
+    # requires, and it is still checked by the system-directory and file-type
+    # rules below — a configured ``root`` does not confine it.
     if base is not None and not _is_within(candidate, base):
         return Target(
             None,

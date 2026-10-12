@@ -597,6 +597,15 @@ def _persist_calibration(config, report: dict) -> None:
 
 #: The surfaces an L1 write is legitimately *about*. Everything else is what the
 #: advisory layer warns on, and what the strict gate refuses.
+#
+# INVARIANT (deliberate asymmetry — tiny tuple, whole contract): ``undecided`` is
+# NOT a member. The strict gate therefore refuses on *absence of evidence* too,
+# and the refusal depends on length: a short unmarked fact (below
+# ``routing.MIN_CHARS_FOR_FALLBACK``) classifies ``undecided`` and is refused,
+# while longer unmarked prose is admitted as ``l1_knowledge`` through the
+# length-only fallback with score 0.0. Adding ``undecided`` here would flip the
+# contract to "refuse only on positive non-L1 classification" — a real policy
+# change, not a cleanup. Make that choice deliberately and add tests for it.
 _L1_WRITE_SURFACES: tuple[str, ...] = ("l1_knowledge", "l0_index")
 
 #: Per-surface explanation, keyed by ``MemorySurface`` *value* so this stays a
@@ -747,6 +756,13 @@ def _direct_write_gate(
             return gate
         if _write_request_error(domain, section, content) is not None:
             # Let the write core return its own validation error shape.
+            #
+            # This note is NOT observable today: the validation error shape is
+            # ``{success: False, error: ...}`` with no ``action``, and
+            # ``_routing_advisory`` returns such results early — dropping
+            # ``routing_enforcement`` with it. Keep the note (it costs nothing
+            # and documents the gate's reasoning in-process), but do not rely on
+            # it for user-visible reporting unless the result shape changes.
             enforcement["gate_active"] = False
             enforcement["note"] = (
                 "request failed input validation before classification; the "

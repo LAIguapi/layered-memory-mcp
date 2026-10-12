@@ -258,3 +258,35 @@ whose *only* live trigger is the interval one can wait out the attempt throttle
 the usage-ratio trigger, the critical trigger, an explicit `compact_memory` —
 sees it immediately, and the alternative (reading the state file and hashing
 the config on the trigger hot path) buys nothing a 7-day interval cares about.
+
+## 7. Final review annotations — comments only, no behaviour change
+
+A read-only review of the common-core routing work (verdict: pass, no P0) named
+a set of non-obvious invariants and latent gaps. They are now recorded **as
+comments at the code they constrain**, so the tradeoff is read by whoever edits
+the line rather than by whoever happens to open this file. Nothing below was
+fixed in that pass; each is a reminder, not a change.
+
+- `injector._L1_WRITE_SURFACES` — `undecided` is deliberately absent, so the
+  strict direct-write gate refuses on absence of evidence, and length decides:
+  short unmarked content is refused, long unmarked prose is admitted.
+- `routing.SCORE_FLOOR` — unreachable with shipped weights; the "treat as
+  unrouted" branch has never run and needs tests before it is relied on.
+- `routing.MIN_CHARS_FOR_FALLBACK` — the only path returning `l1_knowledge`
+  with no supporting signal; moving it moves the direct-write gate and
+  `compact_memory` enforce behaviour with it.
+- `storage.MemoryChangelogStore.load` — an oversized log reads as an empty one;
+  should surface a flag/error instead of only logging. Reachable because
+  `retention_days` is still reported and not enforced.
+- `injector._direct_write_gate` — the validation-failure `note` is not
+  observable through the current result shape; do not report from it.
+- `memory_compactor.detect_memory_bloat` — dereferences a possibly-`None` path
+  where `compact_memory` guards; the only in-tree caller swallows the
+  exception. Should return `compact_memory`'s `success: false` shape.
+- `memory_compactor._attempt_interval_seconds` — `auto_maintain_interval_days:
+  0` skips the clamp, so the interval trigger means "at most hourly while agent
+  memory is untouched"; the usage-ratio and critical triggers stay unthrottled.
+- `governance.scan_procedure_contamination` — runs on every L1 write at
+  sections × marker vocabulary; bound the scan before dropping the advisory.
+- `api/server.py` `lifespan` — legacy product-path defaults, the last ones
+  outside the adapters, and not covered by the AST boundary test.

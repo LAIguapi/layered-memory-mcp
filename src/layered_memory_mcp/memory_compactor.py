@@ -245,6 +245,15 @@ def detect_memory_bloat(
     """
     path = _resolve_memory_path(memory_path, config)
 
+    # LATENT BUG (not fixed in this pass): ``_resolve_memory_path`` may return
+    # None (no explicit path, and auto-detection found nothing), and this line
+    # then raises AttributeError instead of returning the error shape —
+    # ``compact_memory`` guards the same call with ``if not path or ...``. It
+    # stays invisible because the only in-tree caller
+    # (``injector`` → legacy bloat advisory) wraps it in a bare
+    # ``except Exception: pass``, so the crash silently becomes "no warning".
+    # The fix is to return the same ``{"success": False, ...}`` shape
+    # ``compact_memory`` returns, not to add another swallowing caller.
     if not path.exists():
         return {
             "success": False,
@@ -995,6 +1004,13 @@ def _attempt_interval_seconds(config: "MemoryConfig") -> float:
         interval_s = float(getattr(config, "auto_maintain_interval_days", 7.0) or 0.0) * 86400.0
     except (TypeError, ValueError):
         interval_s = 7.0 * 86400.0
+    # EDGE CASE (deliberate): ``auto_maintain_interval_days: 0`` — "compact on
+    # every write" — skips the clamp, because ``interval_s > 0`` is false, and
+    # the full attempt throttle (1h by default) applies. For the *interval*
+    # trigger that makes 0 mean "at most hourly while the agent memory file is
+    # untouched", not "every write". That is intended: re-deriving the same
+    # decision from an unchanged file is pure cost. The high-usage-ratio and
+    # critical-change triggers are not throttled, so urgent passes still run.
     return min(seconds, interval_s) if interval_s > 0 else seconds
 
 
