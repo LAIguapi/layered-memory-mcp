@@ -60,8 +60,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   structure both match, so an architecture note that merely mentions "验证" or
   "流程" is left alone. Advisory; nothing is moved.
 
+- **A write guard on the agent's own memory file
+  (`layered_memory_mcp.agent_memory_guard`).** The framework projects an L0
+  pointer / knowledge-index entry into the agent's native memory file
+  (`MEMORY.md`, `CLAUDE.md`, …), and when no path is configured it *auto-detects*
+  one from absolute user-level locations. Auto-detection is fine for reading and
+  reporting; as a silent write target it meant any ambiguous config resolved a
+  live file. A throwaway script on a bare `MemoryConfig(home=<tmpdir>)` called
+  `inject_knowledge`, the ride-along maintenance auto-detected
+  `~/.hermes/memories/MEMORY.md`, and a stray `[L0] misc: …` pointer landed in a
+  real agent's memory. A projection write now requires an **explicit target** or
+  an **explicit opt-in**: a caller-supplied `memory_path`, `agent_memory.path`,
+  `agent_memory.allow_auto_detect_write: true`, a detected file inside `<home>`,
+  or a `<home>` that is this install's real configured home and not a temp/test
+  sandbox (which is what keeps an existing deployment's projection working).
+  Anything else is refused and reported — never silently dropped.
+- **`agent_memory:` config section.** `path` (explicit target, recommended) and
+  `allow_auto_detect_write` (default `false`), also readable from
+  `LAYERED_MEMORY_AGENT_MEMORY_PATH` and
+  `LAYERED_MEMORY_AGENT_MEMORY_ALLOW_AUTO_DETECT_WRITE`. The pre-existing env
+  vars keep their priority; `separator` may now also be set in the section.
+
 ### Changed
 
+- **Agent-memory projections report refusals.** `_ensure_l0_pointer_in_memory`,
+  the `index_only` upsert and the pointer reap return
+  `{action: "skipped", reason: "unsafe_auto_detect_write", detected_path, trust,
+  hint}`; `auto_maintain_after_write` adds `agent_memory_write` and skips both
+  the dual-write and lazy compaction; `inject_knowledge` hoists the same block
+  to `agent_memory_write` so a skipped projection is visible at the top level.
+  The primary L1 write is never failed by a refused projection. `compact_memory`
+  refuses a real pass (`dry_run=False`) on an unguarded auto-detected file
+  before injecting anything into L1 — it would otherwise lift content out of a
+  file it is not allowed to clean afterwards; `dry_run=True` still reports on it.
+- **The dashboard's `/compact-memory` no longer reports a refusal as success.**
+  A failed pass (missing memory file, or a guard-declined target) returns
+  `success: false` with the error, hint and `agent_memory_write` block instead
+  of "Memory compaction completed."
+- **Test isolation covers `Path.open`.** `pathlib.Path.open` calls `io.open`
+  directly, so it never went through the `builtins.open` backstop in
+  `conftest.py` — every `path.write_text(...)` in the framework, which is how
+  all memory and L1 writes are actually performed, bypassed the production-path
+  guard. Both are patched now.
 - **`inject_knowledge` annotates, it does not redirect.** Every result now
   carries a `routing` block, and a write the router would have sent elsewhere
   also carries `routing_warning`. Existing fields, actions and handshakes are

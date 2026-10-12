@@ -157,6 +157,8 @@ layered-memory-mcp --verbose
 | `LAYERED_MEMORY_ROUTING_ENABLED` | Classify items and annotate write results | `true` |
 | `LAYERED_MEMORY_ROUTING_MODE` | `advisory` or `enforce` | `advisory` |
 | `LAYERED_MEMORY_AGENT_EXTENSIONS_ENABLED` | Let the framework apply agent-surface actions | `false` |
+| `LAYERED_MEMORY_AGENT_MEMORY_PATH` | The agent's own memory file (explicit write target) | auto-detected |
+| `LAYERED_MEMORY_AGENT_MEMORY_ALLOW_AUTO_DETECT_WRITE` | Allow L0 projection into an auto-detected memory file | `false` |
 
 ### config.yaml
 
@@ -183,11 +185,17 @@ routing:
   extra_profile_markers: ["addresses me as"]
   extra_knowledge_markers: ["service contract"]
   disabled_markers: ["script"]                 # drop a default that is noise for you
+
+agent_memory:
+  path: null                                   # the agent's own memory file (explicit target)
+  allow_auto_detect_write: false               # or opt back into auto-detected projection writes
 ```
 
 `mode: advisory` is the default: routing reports its opinion alongside the normal result and changes nothing about what a write does. A classifier that started rejecting writes on upgrade would be a data-loss event, not a feature, so `enforce` is opt-in — and today exactly one path gates on it, `compact_memory` (see [Routing on the Compaction Path](#routing-on-the-compaction-path)). `inject_knowledge` still writes L1 in either mode and says so in its `routing_warning`.
 
 Omit a key to keep the defaults. If you set `watch_patterns`, your list replaces the built-in pattern list. Set it to `[]` to turn pattern matching off.
+
+`agent_memory:` controls where the framework may project the L0 pointer / knowledge-index entry into the agent's *own* memory file (`MEMORY.md`, `CLAUDE.md`, …). With no path configured the framework auto-detects one, which is fine for reading but not for writing: any ambiguous config — a test, a throwaway script on a temp home — would otherwise resolve the real file and silently append to it. A projection write therefore needs an explicit target (`agent_memory.path`, or a `memory_path` argument), an explicit opt-in (`allow_auto_detect_write: true`), a detected file inside `<LAYERED_MEMORY_HOME>`, or a home that is this install's real configured home and not a temp/test sandbox. Anything else is refused and reported as `agent_memory_write: {status: "skipped", reason: "unsafe_auto_detect_write", detected_path, hint}` — the L1 write itself always succeeds, only the projection stops.
 
 ### Opt-in agent extensions
 

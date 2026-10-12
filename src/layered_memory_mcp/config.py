@@ -466,6 +466,9 @@ class MemoryConfig:
         # what config.yaml would hold (see _normalize_agent_extensions).
         routing: dict | None = None,
         agent_extensions: dict | None = None,
+        # Unreleased — agent-memory write safety (see agent_memory_guard.py).
+        # Raw YAML section shape: {path, allow_auto_detect_write}.
+        agent_memory: dict | None = None,
     ):
         self.home = Path(home) if home else default_home()
         self.knowledge_dir = Path(knowledge_dir) if knowledge_dir else default_knowledge_dir(self.home)
@@ -937,11 +940,45 @@ class MemoryConfig:
                     f"{_name} must be between 0.0 and 1.0, got {_val}"
                 )
 
-        # v1.0: Agent memory adapter — auto-detect or explicit
-        _amp = os.environ.get("LAYERED_MEMORY_AGENT_MEMORY_PATH")
-        self.agent_memory_path: Path | None = Path(_amp) if _amp else None
-        _ams = os.environ.get("LAYERED_MEMORY_AGENT_MEMORY_SEPARATOR")
-        self.agent_memory_separator: str = _ams if _ams else "§"
+        # v1.0: Agent memory adapter — auto-detect or explicit.
+        #
+        # Unreleased: the `agent_memory:` section of config.yaml joined the env
+        # vars as a resolution source, because these two knobs decide whether
+        # the framework may project L0 pointers into a file it does not own:
+        #
+        #   agent_memory:
+        #     path: null                      # explicit target (recommended)
+        #     allow_auto_detect_write: false  # opt back into auto-detect writes
+        #
+        # With neither set, an auto-detected production memory file is refused
+        # as a *write* target unless the home is clearly this install's own —
+        # see agent_memory_guard.resolve_write_target for the exact rule. That
+        # is what stops a bare temp config (a test, a sanity script) from
+        # silently appending a pointer to a live agent's memory.
+        # Precedence: constructor → env → config.yaml → none.
+        _am_yaml = (
+            agent_memory
+            if isinstance(agent_memory, dict)
+            else _load_yaml_section(self.home, "agent_memory")
+        )
+        _amp = (
+            os.environ.get("LAYERED_MEMORY_AGENT_MEMORY_PATH")
+            or _am_yaml.get("path")
+        )
+        self.agent_memory_path: Path | None = (
+            Path(str(_amp)).expanduser() if _amp else None
+        )
+        _env_aadw = os.environ.get("LAYERED_MEMORY_AGENT_MEMORY_ALLOW_AUTO_DETECT_WRITE")
+        self.agent_memory_allow_auto_detect_write: bool = (
+            _env_bool("LAYERED_MEMORY_AGENT_MEMORY_ALLOW_AUTO_DETECT_WRITE", False)
+            if _env_aadw is not None
+            else _coerce_bool(_am_yaml.get("allow_auto_detect_write"), False)
+        )
+        _ams = (
+            os.environ.get("LAYERED_MEMORY_AGENT_MEMORY_SEPARATOR")
+            or _am_yaml.get("separator")
+        )
+        self.agent_memory_separator: str = str(_ams) if _ams else "§"
 
         # Resolve namespace-aware knowledge directories
         if self.namespace != "shared":

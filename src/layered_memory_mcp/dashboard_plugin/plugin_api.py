@@ -369,12 +369,21 @@ async def compact_memory_endpoint(req: CompactRequest):
         return compact_memory(config=config, dry_run=False)
 
     result = await asyncio.to_thread(_compact)
-    return {
+    payload = {
         "dry_run": False,
         "migrated": result.get("migrated", 0),
         "removed": result.get("removed", 0),
         "message": result.get("message", "Memory compaction completed."),
     }
+    # A refusal (missing memory file, or the agent-memory write guard declining
+    # an auto-detected target) must not be reported as "completed".
+    if result.get("success") is False:
+        payload["success"] = False
+        payload["message"] = result.get("error", "Memory compaction failed.")
+        for key in ("hint", "agent_memory_write"):
+            if result.get(key):
+                payload[key] = result[key]
+    return payload
 
 
 @router.get("/health")

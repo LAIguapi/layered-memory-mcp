@@ -98,10 +98,18 @@ def _guard_production_paths(monkeypatch):
     guard can deploy into ``~/.hermes/plugins`` and ``hermes plugins enable``
     rewrites ``config.yaml``, so a test that forgot to redirect ``HOME`` would
     otherwise be able to reconfigure the developer's own host.
+
+    ``pathlib.Path.open`` is patched alongside ``builtins.open`` because it does
+    **not** go through it: ``Path.open`` calls ``io.open`` directly, so every
+    ``path.write_text(...)`` in the framework — which is how all agent-memory
+    and L1 writes are actually performed — used to sail straight past this
+    backstop.
     """
     import builtins
+    import pathlib
 
     real_open = builtins.open
+    real_path_open = pathlib.Path.open
     # Resolved once, from the real environment, before HOME is redirected.
     # Snapshotting at import time keeps this independent of fixture ordering.
     forbidden = tuple(
@@ -114,19 +122,28 @@ def _guard_production_paths(monkeypatch):
         )
     )
 
+    def _check(file, mode):
+        if not any(w in str(mode) for w in ("w", "a", "x", "+")):
+            return
+        target = os.path.abspath(str(file))
+        for bad in forbidden:
+            if target.startswith(bad):
+                raise AssertionError(
+                    "TEST ISOLATION VIOLATION: attempted write to "
+                    f"production path {target!r}. Use the sandbox from "
+                    "the _isolate_memory_home fixture instead."
+                )
+
     def guarded_open(file, mode="r", *args, **kwargs):
-        if any(w in str(mode) for w in ("w", "a", "x", "+")):
-            target = os.path.abspath(str(file))
-            for bad in forbidden:
-                if target.startswith(bad):
-                    raise AssertionError(
-                        "TEST ISOLATION VIOLATION: attempted write to "
-                        f"production path {target!r}. Use the sandbox from "
-                        "the _isolate_memory_home fixture instead."
-                    )
+        _check(file, mode)
         return real_open(file, mode, *args, **kwargs)
 
+    def guarded_path_open(self, mode="r", *args, **kwargs):
+        _check(self, mode)
+        return real_path_open(self, mode, *args, **kwargs)
+
     monkeypatch.setattr(builtins, "open", guarded_open)
+    monkeypatch.setattr(pathlib.Path, "open", guarded_path_open)
     yield
 
 

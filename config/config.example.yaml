@@ -170,3 +170,39 @@ backend:
 #     integrate_agent(action="install_guard")   # deploy + enable + silence nudge
 #     integrate_agent(action="remove_guard")    # uninstall + restore nudge
 # =============================================================================
+
+# =============================================================================
+# Agent memory write safety (optional)
+# =============================================================================
+#
+# The framework projects an L0 pointer / knowledge-index entry into the agent's
+# own memory file (Hermes MEMORY.md, Claude Code CLAUDE.md, ...). When no path
+# is configured it *auto-detects* one, which is fine for reading but dangerous
+# for writing: any ambiguous config — a test, a throwaway script built on a
+# temp home — resolves the real file and silently appends to it.
+#
+# So a projection write needs an explicit target or an explicit opt-in:
+#
+#     agent_memory:
+#       path: /root/.hermes/memories/MEMORY.md   # explicit target (recommended)
+#       allow_auto_detect_write: false           # or opt back into auto-detect
+#
+# Env equivalents (highest priority):
+#     LAYERED_MEMORY_AGENT_MEMORY_PATH=/path/to/MEMORY.md
+#     LAYERED_MEMORY_AGENT_MEMORY_ALLOW_AUTO_DETECT_WRITE=true
+#
+# With neither set, auto-detected writes are still allowed in exactly two
+# cases: the detected file lives inside <home> (the framework owns that dir),
+# or <home> is this install's real configured home and not a temp/test sandbox
+# — which is what keeps an existing deployment's projection working after an
+# upgrade. Anything else is refused and reported, e.g.
+#
+#     "agent_memory_write": {
+#       "status": "skipped",
+#       "reason": "unsafe_auto_detect_write",
+#       "detected_path": "/root/.hermes/memories/MEMORY.md",
+#       "hint": "Set agent_memory.path ..."
+#     }
+#
+# The primary L1 write always succeeds regardless — only the projection stops.
+# =============================================================================

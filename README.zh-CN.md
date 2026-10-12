@@ -140,6 +140,8 @@ layered-memory-mcp --verbose
 | `LAYERED_MEMORY_ROUTING_ENABLED` | 分类内容并为写入结果加注路由信息 | `true` |
 | `LAYERED_MEMORY_ROUTING_MODE` | `advisory`（建议）或 `enforce` | `advisory` |
 | `LAYERED_MEMORY_AGENT_EXTENSIONS_ENABLED` | 允许框架代写代理自有面 | `false` |
+| `LAYERED_MEMORY_AGENT_MEMORY_PATH` | 代理自己的记忆文件（显式写入目标） | 自动探测 |
+| `LAYERED_MEMORY_AGENT_MEMORY_ALLOW_AUTO_DETECT_WRITE` | 允许向自动探测到的记忆文件投射 L0 指针 | `false` |
 
 ### config.yaml
 
@@ -166,11 +168,17 @@ routing:
   extra_profile_markers: ["请称呼我"]
   extra_knowledge_markers: ["服务契约"]
   disabled_markers: ["脚本"]                   # 关闭对你来说是噪声的默认词
+
+agent_memory:
+  path: null                                   # 代理自己的记忆文件（显式写入目标）
+  allow_auto_detect_write: false               # 或显式允许向自动探测到的文件投射
 ```
 
 `mode: advisory` 是默认值：路由只在正常结果旁边附上它的判断，不改变写入行为。升级后突然开始拒写，那是数据丢失事故，不是功能，所以 `enforce` 必须显式开启 —— 目前只有一条路径会据此拦截：`compact_memory`（见[压实路径上的路由](#压实路径上的路由)）。`inject_knowledge` 在两种模式下都照常写 L1，并在 `routing_warning` 里说明这一点。
 
 不写某个键就保持默认。如果设置了 `watch_patterns`，你的列表会替换内置模式列表；设为 `[]` 可关闭模式匹配。
+
+`agent_memory:` 决定框架可以把 L0 指针 / 知识索引条目投射到哪个「代理自己的」记忆文件（`MEMORY.md`、`CLAUDE.md` 等）。没配路径时框架会自动探测 —— 用于读取没问题，用于写入就危险了：任何含糊的配置（一个测试、一个建在临时 home 上的试跑脚本）都会解析到真实文件并静默追加。所以投射写入必须满足其中之一：显式目标（`agent_memory.path`，或调用时传 `memory_path`）、显式开关（`allow_auto_detect_write: true`）、探测到的文件就在 `<LAYERED_MEMORY_HOME>` 之内、或者这个 home 确实是本次安装真正配置的 home 而非临时/测试沙箱。其余情况一律拒绝并上报 `agent_memory_write: {status: "skipped", reason: "unsafe_auto_detect_write", detected_path, hint}` —— L1 写入本身永远照常成功，只是投射停下。
 
 ### 可选的代理扩展执行层
 

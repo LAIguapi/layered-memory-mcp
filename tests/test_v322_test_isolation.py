@@ -81,6 +81,12 @@ class TestProductionWriteGuard:
             with open(f"{_REAL_L1}/knowledge/pwned.md", "w", encoding="utf-8") as fh:
                 fh.write("nope")
 
+    def test_path_write_text_to_production_raises(self):
+        """``Path.write_text`` bypasses ``builtins.open`` — and is the idiom the
+        framework actually uses for every memory/L1 write."""
+        with pytest.raises(AssertionError, match="TEST ISOLATION VIOLATION"):
+            Path(_REAL_MEMORY).write_text("this must never land\n", encoding="utf-8")
+
     def test_reading_production_is_still_allowed(self):
         """Read-only access stays legal — the guard targets writes only."""
         if Path(_REAL_MEMORY).exists():

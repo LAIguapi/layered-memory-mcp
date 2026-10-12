@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING
 from .injector import inject_knowledge as _inject_knowledge
 
 if TYPE_CHECKING:
+    from .agent_memory_guard import WriteTarget
     from .config import MemoryConfig
 
 logger = logging.getLogger("layered_memory_mcp.compactor")
@@ -126,6 +127,24 @@ def _resolve_memory_path(
     if config is not None:
         return config.detect_agent_memory_path()
     return None
+
+
+def _resolve_write_target(
+    memory_path: str | Path | None = None,
+    config: "MemoryConfig | None" = None,
+    *,
+    operation: str = "agent_memory_write",
+) -> "WriteTarget":
+    """Resolve the agent memory path for a **write**, honouring the guard.
+
+    Same inputs as :func:`_resolve_memory_path`, but an auto-detected path
+    outside this install's own home is refused instead of written (see
+    :mod:`.agent_memory_guard`). Every projection write in this module goes
+    through here, so the rule is defined once.
+    """
+    from .agent_memory_guard import resolve_write_target
+
+    return resolve_write_target(config, memory_path, operation=operation)
 
 
 def _resolve_separator(
@@ -459,6 +478,27 @@ def compact_memory(
 
     if not path or not path.exists():
         return {"success": False, "error": f"Memory file not found: {path or '(auto-detect failed)'}"}
+
+    # A real pass rewrites the agent's memory file (and backs it up next to it),
+    # so it needs the same permission as any other projection write. A dry run
+    # only reports, and reporting on an auto-detected file stays allowed.
+    if not dry_run:
+        target = _resolve_write_target(memory_path, config, operation="compact_memory")
+        if not target.allowed:
+            return {
+                "success": False,
+                "dry_run": False,
+                "error": (
+                    "refusing to rewrite an auto-detected agent memory file: "
+                    f"{target.reason}"
+                ),
+                "agent_memory_write": target.as_report("refused"),
+                "hint": (
+                    "Pass memory_path explicitly, or configure agent_memory.path "
+                    "/ agent_memory.allow_auto_detect_write. "
+                    "compact_memory(dry_run=True) still reports on this file."
+                ),
+            }
 
     try:
         raw = path.read_text(encoding="utf-8")
@@ -825,6 +865,8 @@ def _ensure_l0_pointer_in_memory(
       - "pointers"   → legacy per-domain pointer upsert (below).
 
     Returns a small report: {action: added|replaced|present|skipped, ...}.
+    Refused by the safety guard → ``{action: skipped, reason:
+    "unsafe_auto_detect_write", ...}`` (see :mod:`.agent_memory_guard`).
     """
     mode = getattr(config, "memory_mode", "pointers")
     if mode == "off":
@@ -832,9 +874,10 @@ def _ensure_l0_pointer_in_memory(
     if mode == "index_only":
         return _ensure_index_entry_in_memory(config, memory_path=memory_path)
 
-    path = memory_path or _resolve_memory_path(None, config)
-    if not path:
-        return {"action": "skipped", "reason": "memory path not resolvable"}
+    target = _resolve_write_target(memory_path, config, operation="l0_pointer_dual_write")
+    if not target.allowed:
+        return {"action": "skipped", **target.skip_fields()}
+    path = target.path
 
     # Extract the target L1 file from the pointer ("... → knowledge/<file>")
     target_file = None
@@ -928,9 +971,10 @@ def _ensure_index_entry_in_memory(
 
     Returns {action: added|upserted|skipped, index_entry, pointers_removed}.
     """
-    path = memory_path or _resolve_memory_path(None, config)
-    if not path:
-        return {"action": "skipped", "reason": "memory path not resolvable"}
+    target = _resolve_write_target(memory_path, config, operation="index_entry_dual_write")
+    if not target.allowed:
+        return {"action": "skipped", **target.skip_fields()}
+    path = target.path
 
     index_text = _knowledge_index_entry_text(config)
     separator = _resolve_separator(path, config)
@@ -991,8 +1035,14 @@ def _remove_l0_pointer_from_memory(
     Matches an entry if it is an L0 index pointer (carries the [L0] tag) AND
     references the target file (``knowledge/<file>`` or the bare domain after
     the tag). Returns {action: removed|absent|skipped, removed: N}.
+
+    Reaping is still a write, so it is guarded like the other projections: a
+    deletion we were not asked to make is as unwelcome as an insertion.
     """
-    path = memory_path or _resolve_memory_path(None, config)
+    target = _resolve_write_target(memory_path, config, operation="l0_pointer_reap")
+    if not target.allowed:
+        return {"action": "skipped", **target.skip_fields()}
+    path = target.path
     if not path or not path.exists():
         return {"action": "skipped", "reason": "memory path not resolvable"}
 
@@ -1234,11 +1284,18 @@ def auto_maintain_after_write(
         except Exception as e:  # noqa: BLE001 — maintenance must not raise
             logger.warning("Auto-maintain promotion detection failed: %s", e)
 
-    path = _resolve_memory_path(memory_path, config)
-    if not path:
+    # Everything below this point writes the agent's memory file (pointer
+    # dual-write, then possibly a full compaction rewrite), so the guard decides
+    # once, here, whether this config may touch it at all. Refusals are soft:
+    # the primary L1 write that triggered this ride-along has already succeeded
+    # and must not be failed by a projection we are not allowed to make.
+    target = _resolve_write_target(memory_path, config, operation="auto_maintain")
+    if not target.allowed:
         report["skipped"] = True
-        report["reason"] = "memory path not resolvable"
+        report["reason"] = target.reason or "memory path not resolvable"
+        report["agent_memory_write"] = target.as_report()
         return report
+    path = target.path
 
     # --- 1. Dual-write completion ---
     if l0_pointer:

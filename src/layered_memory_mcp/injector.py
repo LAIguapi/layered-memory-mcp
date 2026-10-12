@@ -1121,6 +1121,15 @@ def _inject_knowledge_core(
             dw = (maint or {}).get("dual_write") or {}
             if dw.get("action") in ("added", "replaced", "present"):
                 result["hint"] = "L0 pointer auto-written to agent memory by framework."
+            # The L1 write succeeded but the compatibility projection was
+            # refused (ambiguous config auto-detected someone else's memory
+            # file). Hoist it: a skipped dual-write buried in `auto_maintain`
+            # is how the pointer/L1 drift goes unnoticed.
+            from .agent_memory_guard import guard_refusal
+
+            refusal = guard_refusal(maint)
+            if refusal:
+                result["agent_memory_write"] = refusal
         except Exception as e:  # noqa: BLE001 — maintenance must not break writes
             # v2.9.3: was a silent `pass`, which hid dual-write/dedup failures
             # and let duplicate L0 pointers accumulate undetected. Log it (and
