@@ -189,8 +189,10 @@ routing:
   disabled_markers: ["script"]                 # drop a default that is noise for you
 
 agent_memory:
+  adapter: auto                                # which agent's file layout to assume (see below)
   path: null                                   # the agent's own memory file (explicit target)
   allow_auto_detect_write: false               # or opt back into auto-detected projection writes
+  separator: null                              # override the adapter's entry separator
 
 memory_changelog:
   enabled: true                                # kill switch; off = nothing is recorded
@@ -202,7 +204,49 @@ memory_changelog:
 
 Omit a key to keep the defaults. If you set `watch_patterns`, your list replaces the built-in pattern list. Set it to `[]` to turn pattern matching off.
 
-`agent_memory:` controls where the framework may project the L0 pointer / knowledge-index entry into the agent's *own* memory file (`MEMORY.md`, `CLAUDE.md`, …). With no path configured the framework auto-detects one, which is fine for reading but not for writing: any ambiguous config — a test, a throwaway script on a temp home — would otherwise resolve the real file and silently append to it. A projection write therefore needs an explicit target (`agent_memory.path`, or a `memory_path` argument), an explicit opt-in (`allow_auto_detect_write: true`), a detected file inside `<LAYERED_MEMORY_HOME>`, or a home that is this install's real configured home and not a temp/test sandbox. Anything else is refused and reported as `agent_memory_write: {status: "skipped", reason: "unsafe_auto_detect_write", detected_path, hint}` — the L1 write itself always succeeds, only the projection stops.
+`agent_memory:` controls where the framework may project the L0 pointer / knowledge-index entry into the agent's *own* memory file (`MEMORY.md`, `CLAUDE.md`, …). With no path configured the framework auto-detects one, which is fine for reading but not for writing: any ambiguous config — a test, a throwaway script on a temp home — would otherwise resolve the real file and silently append to it. A projection write therefore needs an explicit target (`agent_memory.path`, or a `memory_path` argument), an explicit opt-in (`allow_auto_detect_write: true`), a detected file inside `<LAYERED_MEMORY_HOME>`, or a home that is this install's real configured home and not a temp/test sandbox. Anything else is refused and reported as `agent_memory_write: {status: "skipped", reason: "unsafe_auto_detect_write", detected_path, hint}` — the L1 write itself always succeeds, only the projection stops. **Detection is not permission:** resolving a path through an adapter grants no right to write it.
+
+### The common core is agent-neutral
+
+The core owns L0, L1, TODO and `MEMORY_CHANGELOG` semantics, and nothing else. *Where* the host agent keeps its own memory file, which character separates the entries in it, where its live-session database lives and how many characters it allows are product facts, answered by an **environment adapter** in `src/layered_memory_mcp/adapters/`. Those facts used to be literals in `config.py`, `memory_compactor.py` and `agent_integrator.py`; they are not any more.
+
+```yaml
+agent_memory:
+  adapter: auto     # default
+```
+
+| value | resolves |
+| --- | --- |
+| `auto` *(default)* | probe the registry in order — `hermes`, `claude_code`, `cursor`, `cline`, `generic` — which is exactly the candidate chain the pre-adapter core hardcoded |
+| `hermes` | `~/.hermes/memories/MEMORY.md`, `§` separator, `~/.hermes/state.db`, `~/.hermes/sessions`, and the real limit read back from `~/.hermes/config.yaml` |
+| `claude_code` | `~/.claude/CLAUDE.md` |
+| `cursor` | `./.cursorrules` |
+| `cline` | `~/.cline/rules` |
+| `generic` | no product paths at all — only the framework-owned `<home>/agent-memory.md` |
+| `none` / `off` | alias for `generic` |
+
+**Hermes is the default adapter for backwards compatibility**, and is the first one probed, so an existing install resolves exactly the paths it always did. An unknown id falls back to `generic` with a warning — never silently to Hermes. Env equivalent: `LAYERED_MEMORY_AGENT_ADAPTER=hermes`.
+
+A second agent is supported by registering an adapter, not by editing the router, the compactor or the config:
+
+```python
+from layered_memory_mcp.adapters.environment import EnvironmentAdapterBase, environments
+
+class AcmeEnvironment(EnvironmentAdapterBase):
+    id = "acme"
+    display_name = "ACME Agent"
+    memory_relpath = (".acme", "brain.md")      # relative to the user's home
+    install_marker_relpath = (".acme",)
+    state_db_relpath = (".acme", "sessions.sqlite")
+    separator = "---"
+    path_tokens = (".acme", "brain.md")         # identifies an explicitly configured path
+
+environments.register(AcmeEnvironment(), priority=15)
+```
+
+`get_memory_surface_capabilities()` reports the outcome under `agent_environment: {configured, resolved, known, entry_separator, …}`. That is distinct from `adapter`, which names the optional extension-*action* handler bundle below.
+
+Two Hermes-specific pieces deliberately stay outside the adapter, in their own support packages: the `write_guard` plugin (payload, installer, `hermes` CLI probing) and `dashboard_plugin`. `integrate_agent`'s Hermes-only actions (`inject_soul`, `install_dashboard`, `install_guard`) refuse with a clear message on any other host.
 
 ### Opt-in agent extensions
 

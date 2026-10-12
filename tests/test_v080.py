@@ -94,7 +94,7 @@ class TestMemoryCompaction:
     def test_parse_hermes_entries(self):
         """Should correctly parse Hermes MEMORY.md format."""
         raw = "[L0索引] infra: proxy config → knowledge/infra.md\n§\nSome long content that is not an index"
-        entries = _parse_entries(raw)
+        entries = _parse_entries(raw, separator="§")
         assert len(entries) == 2
         assert entries[0].startswith("[L0索引]")
         assert "Some long content" in entries[1]

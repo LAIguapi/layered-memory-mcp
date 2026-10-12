@@ -249,12 +249,20 @@ def extract_session_summary(filepath: str, max_messages: int = 50) -> dict:
     return result
 
 
-def default_hermes_db() -> Path:
-    """Path of Hermes' live session database (env override honoured)."""
+def default_hermes_db() -> Path | None:
+    """Path of the agent's live session database (env override honoured).
+
+    The location comes from the environment adapter — this module owns the
+    SQL it runs against that database, not the path it lives at. ``None`` means
+    the resolved adapter has no such database, which callers already handle as
+    "no live-session source".
+    """
     env = os.environ.get("LAYERED_MEMORY_HERMES_DB")
     if env:
         return Path(env).expanduser()
-    return Path.home() / ".hermes" / "state.db"
+    from .adapters.environment import resolve_environment
+
+    return resolve_environment().detect_state_db()
 
 
 def _summarize_db_session(conn: sqlite3.Connection, row, max_messages: int = 50) -> dict:
@@ -382,7 +390,7 @@ def read_state_db_sessions(
         "generated_at": datetime.now(tz=timezone.utc).isoformat(),
         "scan_days": days,
         "source": "hermes_state_db",
-        "db_path": str(path),
+        "db_path": str(path) if path else None,
         "total_sessions": 0,
         "sessions": [],
         "stats": {
@@ -394,8 +402,11 @@ def read_state_db_sessions(
         },
     }
 
-    if not path.is_file():
-        output["error"] = f"state db not found: {path}"
+    if path is None or not path.is_file():
+        output["error"] = (
+            "state db not found: "
+            + (str(path) if path else "no live-session database for this agent")
+        )
         return output
 
     cutoff = time.time() - days * 86400
@@ -495,9 +506,12 @@ def search_state_db_sessions(
         "matches": [],
         "stats": {"rows_in_window": 0, "skipped_sources": 0, "excluded_sessions": 0},
     }
-    if not path.is_file():
+    if path is None or not path.is_file():
         out["success"] = False
-        out["error"] = f"state db not found: {path}"
+        out["error"] = (
+            "state db not found: "
+            + (str(path) if path else "no live-session database for this agent")
+        )
         return out
 
     cutoff = time.time() - days * 86400
@@ -582,7 +596,7 @@ def scan_sessions(
     """
     if prefer_state_db:
         db = Path(hermes_db_path).expanduser() if hermes_db_path else default_hermes_db()
-        if db.is_file():
+        if db is not None and db.is_file():
             result = read_state_db_sessions(
                 db,
                 days=days,

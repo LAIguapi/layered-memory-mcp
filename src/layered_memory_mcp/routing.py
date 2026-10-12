@@ -274,6 +274,11 @@ class MemorySurfaceCapabilities(BaseModel):
     agent_extensions_enabled: bool = False
     agent_extensions_mode: ApplicationMode = "suggest"
     adapter: str | None = None
+    #: Which *environment* adapter is answering the framework's questions about
+    #: the host agent's own files — ``{configured, resolved, known, ...}`` from
+    #: ``adapters.environment.describe_environment``. Distinct from ``adapter``
+    #: above, which names the optional extension-*action* handler bundle.
+    agent_environment: dict[str, Any] = Field(default_factory=dict)
     core_surfaces: dict[str, SurfaceCapability] = Field(default_factory=dict)
     extension_surfaces: dict[str, SurfaceCapability] = Field(default_factory=dict)
     no_write_surfaces: dict[str, SurfaceCapability] = Field(default_factory=dict)
@@ -1094,6 +1099,21 @@ def _changelog_capability(config: Any | None) -> tuple[bool, str, str | None]:
     )
 
 
+def _environment_capability(config: Any | None) -> dict[str, Any]:
+    """Reflect the resolved agent-environment adapter. Imported lazily.
+
+    The router must not depend on the adapter package at module level — that is
+    the boundary this whole layer exists to keep — and reflection must never
+    raise, so a broken adapter degrades to an empty dict.
+    """
+    try:
+        from .adapters.environment import describe_environment
+
+        return describe_environment(config)
+    except Exception:  # noqa: BLE001 — reflection must never raise
+        return {}
+
+
 _EXTENSION_NOTES: dict[MemorySurface, str] = {
     MemorySurface.SKILL: "action protocols, methods, runbooks, commands, pitfalls",
     MemorySurface.USER_PROFILE: "small global user preference / persona facts",
@@ -1115,6 +1135,7 @@ def surface_capabilities(config: Any | None = None) -> MemorySurfaceCapabilities
         agent_extensions_enabled=bool(settings["enabled"]),
         agent_extensions_mode=settings["mode"],
         adapter=settings["adapter"],
+        agent_environment=_environment_capability(config),
         source_owned_evidence=["raw_session"],
         derived_stores=["l0_index", "vector_store", "search_index"],
         notes=[

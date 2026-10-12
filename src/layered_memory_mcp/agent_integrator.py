@@ -1,18 +1,28 @@
 """
 Agent Integrator — inject layered-memory awareness into the agent's runtime.
 
-Problem: The agent sees L0 index through MEMORY.md (manually maintained),
-but the MCP Server maintains L0.md as the authoritative source. These two
-diverge over time — MEMORY.md stagnates, L0.md grows. The agent becomes
-blind to newly created knowledge domains.
+Problem: The agent sees L0 index through its own memory file (manually
+maintained), but the MCP Server maintains L0.md as the authoritative source.
+These two diverge over time — the memory file stagnates, L0.md grows. The agent
+becomes blind to newly created knowledge domains.
 
 Solution: At framework init time, inject a small rule into the agent's
 persona/memory so it knows to call get_l0_index() each session — bypassing
-the stale MEMORY.md L0 entirely.
+the stale L0 entries entirely.
+
+WHERE THE PRODUCT KNOWLEDGE LIVES
+---------------------------------
+This module is integration *support*, not common core, and it no longer probes
+for any product itself: :func:`detect_agent_type` delegates to the environment
+adapter registry (:mod:`.adapters.environment`), and the Hermes persona block
+lives with the Hermes adapter (:mod:`.adapters.hermes`). What stays here is
+product-agnostic: marker-delimited idempotent injection, and the recommendation
+payload ``init_framework`` returns — whose per-agent branch is keyed off the
+``agent_type`` the adapter reports.
 
 Supported agents:
-  - Hermes Agent: injects into ~/.hermes/SOUL.md (with BEGIN/END markers)
-  - Generic MCP agents: returns a memory snippet for the user to add manually
+  - any agent whose adapter reports a persona file (Hermes: ``SOUL.md``)
+  - generic MCP agents: returns a memory snippet for the user to add manually
 
 All injections are marked with BEGIN/END comments — identifiable and reversible.
 """
@@ -25,6 +35,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .adapters.hermes import SOUL_BLOCK
+
 if TYPE_CHECKING:
     from .config import MemoryConfig
 
@@ -34,19 +46,9 @@ logger = logging.getLogger("layered_memory_mcp.integrator")
 BEGIN_MARKER = "<!-- BEGIN layered-memory-mcp (auto-injected"
 END_MARKER = "<!-- END layered-memory-mcp -->"
 
-SOUL_BLOCK = """{begin_marker} by init_framework v{version} on {timestamp} -->
-
-## 记忆框架规则 (layered-memory-mcp)
-
-每个 session 开始时，调用 `get_l0_index()` 获取完整 L0 索引。
-L0.md 由 MCP Server 自动维护，是权威的知识地图。
-不要依赖 MEMORY.md 中的 [L0] 条目——它们可能过时。
-
-遇问题 → 扫 L0 → recall_knowledge 检索 L1 → 读懂了再行动。
-写入知识用 inject_knowledge，它自动处理去重、分段、L0 同步。
-
-{end_marker}
-"""
+# SOUL_BLOCK (re-exported above) is the Hermes-native persona text and lives in
+# adapters/hermes.py. The snippet below names no product file layout, so it is
+# the one offered to every host, including the ones nothing recognises.
 
 MEMORY_SNIPPET = """知识索引由 layered-memory MCP Server 管理。
 每 session 调用 get_l0_index() 获取完整 L0 索引。
@@ -54,36 +56,23 @@ L0.md 自动维护，不依赖 MEMORY.md 中的 [L0] 条目。
 写入用 inject_knowledge，检索用 recall_knowledge。"""
 
 
-def detect_agent_type() -> dict:
+def detect_agent_type(home: Path | None = None) -> dict:
     """Detect which agent is hosting this MCP server.
 
+    Delegates to the environment adapter registry — the probe used to be a
+    hardcoded ``~/.hermes`` walk right here. The first adapter that recognises
+    its own installation wins; an unrecognised host reports ``generic_mcp``
+    with every path ``None``.
+
     Returns a dict with keys:
-      - agent_type: "hermes" | "generic_mcp"
-      - soul_path: Path or None (only for hermes)
-      - memory_path: Path or None (only for hermes)
-      - home_dir: Path to the agent's home
+      - agent_type: the adapter's agent type ("hermes", ..., "generic_mcp")
+      - soul_path: Path or None (persona file, when the product has one)
+      - memory_path: Path or None (the agent's native memory file)
+      - home_dir: Path to the agent's own home, or None
     """
-    result = {
-        "agent_type": "generic_mcp",
-        "soul_path": None,
-        "memory_path": None,
-        "home_dir": None,
-    }
+    from .adapters.environment import integration_environment
 
-    home = Path.home()
-
-    # Hermes detection
-    hermes_home = home / ".hermes"
-    if hermes_home.exists():
-        soul_path = hermes_home / "SOUL.md"
-        memory_path = hermes_home / "memories" / "MEMORY.md"
-        if (hermes_home / "config.yaml").exists():
-            result["agent_type"] = "hermes"
-            result["home_dir"] = hermes_home
-            result["soul_path"] = soul_path if soul_path.exists() else None
-            result["memory_path"] = memory_path if memory_path.exists() else None
-
-    return result
+    return integration_environment(home)
 
 
 def is_soul_injected(soul_path: Path) -> bool:
@@ -103,7 +92,10 @@ def is_memory_injected(memory_path: Path) -> bool:
 
 
 def inject_soul(soul_path: Path, version: str) -> dict:
-    """Inject layered-memory rules into Hermes SOUL.md.
+    """Inject layered-memory rules into the agent's persona file.
+
+    ``soul_path`` comes from the adapter (``detect_agent_type()["soul_path"]``);
+    the block itself is :data:`SOUL_BLOCK`, owned by that adapter.
 
     Returns status dict. Idempotent — won't inject twice.
     """
@@ -210,6 +202,12 @@ def build_init_recommendation(
     """Build the recommendation payload for init_framework to return.
 
     The agent will present this to the user as interactive choices.
+
+    The per-agent branch below is keyed off the ``agent_type`` the environment
+    adapter reported, not off a probe of its own. The option *text* is still
+    written for Hermes (it names SOUL.md and the Hermes Dashboard) because
+    Hermes is the only host with those surfaces today; a second agent with a
+    persona file would add its own branch here rather than change the core.
     """
     agent_type = agent_info["agent_type"]
     recommendations = []

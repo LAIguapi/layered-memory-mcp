@@ -172,8 +172,10 @@ routing:
   disabled_markers: ["脚本"]                   # 关闭对你来说是噪声的默认词
 
 agent_memory:
+  adapter: auto                                # 假定哪个代理产品的文件布局（见下）
   path: null                                   # 代理自己的记忆文件（显式写入目标）
   allow_auto_detect_write: false               # 或显式允许向自动探测到的文件投射
+  separator: null                              # 覆盖适配器给出的条目分隔符
 
 memory_changelog:
   enabled: true                                # 总开关；关掉就什么都不记
@@ -185,7 +187,49 @@ memory_changelog:
 
 不写某个键就保持默认。如果设置了 `watch_patterns`，你的列表会替换内置模式列表；设为 `[]` 可关闭模式匹配。
 
-`agent_memory:` 决定框架可以把 L0 指针 / 知识索引条目投射到哪个「代理自己的」记忆文件（`MEMORY.md`、`CLAUDE.md` 等）。没配路径时框架会自动探测 —— 用于读取没问题，用于写入就危险了：任何含糊的配置（一个测试、一个建在临时 home 上的试跑脚本）都会解析到真实文件并静默追加。所以投射写入必须满足其中之一：显式目标（`agent_memory.path`，或调用时传 `memory_path`）、显式开关（`allow_auto_detect_write: true`）、探测到的文件就在 `<LAYERED_MEMORY_HOME>` 之内、或者这个 home 确实是本次安装真正配置的 home 而非临时/测试沙箱。其余情况一律拒绝并上报 `agent_memory_write: {status: "skipped", reason: "unsafe_auto_detect_write", detected_path, hint}` —— L1 写入本身永远照常成功，只是投射停下。
+`agent_memory:` 决定框架可以把 L0 指针 / 知识索引条目投射到哪个「代理自己的」记忆文件（`MEMORY.md`、`CLAUDE.md` 等）。没配路径时框架会自动探测 —— 用于读取没问题，用于写入就危险了：任何含糊的配置（一个测试、一个建在临时 home 上的试跑脚本）都会解析到真实文件并静默追加。所以投射写入必须满足其中之一：显式目标（`agent_memory.path`，或调用时传 `memory_path`）、显式开关（`allow_auto_detect_write: true`）、探测到的文件就在 `<LAYERED_MEMORY_HOME>` 之内、或者这个 home 确实是本次安装真正配置的 home 而非临时/测试沙箱。其余情况一律拒绝并上报 `agent_memory_write: {status: "skipped", reason: "unsafe_auto_detect_write", detected_path, hint}` —— L1 写入本身永远照常成功，只是投射停下。**能探测到不等于有权写入**：通过适配器解析出一个路径，并不授予写它的权限。
+
+### 公共内核与代理无关
+
+内核只拥有 L0、L1、TODO 和 `MEMORY_CHANGELOG` 的语义，别的都不拥有。宿主代理把自己的记忆文件放在哪、条目之间用什么字符分隔、它的实时会话数据库在哪、允许多少字符 —— 这些都是产品事实，由 `src/layered_memory_mcp/adapters/` 下的**环境适配器**回答。这些事实过去是写死在 `config.py`、`memory_compactor.py` 和 `agent_integrator.py` 里的字面量，现在不是了。
+
+```yaml
+agent_memory:
+  adapter: auto     # 默认
+```
+
+| 取值 | 解析为 |
+| --- | --- |
+| `auto`（默认） | 按顺序探测注册表 —— `hermes`、`claude_code`、`cursor`、`cline`、`generic` —— 与适配器抽取之前内核写死的候选链完全一致 |
+| `hermes` | `~/.hermes/memories/MEMORY.md`、`§` 分隔符、`~/.hermes/state.db`、`~/.hermes/sessions`，以及从 `~/.hermes/config.yaml` 读回的真实上限 |
+| `claude_code` | `~/.claude/CLAUDE.md` |
+| `cursor` | `./.cursorrules` |
+| `cline` | `~/.cline/rules` |
+| `generic` | 完全不涉及任何产品路径 —— 只认框架自己的 `<home>/agent-memory.md` |
+| `none` / `off` | `generic` 的别名 |
+
+**为向后兼容，Hermes 是默认适配器**，也是第一个被探测的，所以既有安装解析到的路径与过去完全相同。未知的 id 会带警告回落到 `generic` —— 绝不会静默落到 Hermes。环境变量等价写法：`LAYERED_MEMORY_AGENT_ADAPTER=hermes`。
+
+要支持第二个代理，注册一个适配器即可，不需要改路由器、压实器或配置层：
+
+```python
+from layered_memory_mcp.adapters.environment import EnvironmentAdapterBase, environments
+
+class AcmeEnvironment(EnvironmentAdapterBase):
+    id = "acme"
+    display_name = "ACME Agent"
+    memory_relpath = (".acme", "brain.md")      # 相对于用户 home
+    install_marker_relpath = (".acme",)
+    state_db_relpath = (".acme", "sessions.sqlite")
+    separator = "---"
+    path_tokens = (".acme", "brain.md")         # 用于识别显式配置的路径
+
+environments.register(AcmeEnvironment(), priority=15)
+```
+
+`get_memory_surface_capabilities()` 会在 `agent_environment: {configured, resolved, known, entry_separator, …}` 下报告结果。它与下面的 `adapter` 不是一回事 —— 后者命名的是可选的扩展**动作**处理器。
+
+有两块 Hermes 专属实现刻意留在适配器之外、各自独立的支撑包里：`write_guard` 插件（载荷、安装器、`hermes` CLI 探测）和 `dashboard_plugin`。`integrate_agent` 中仅限 Hermes 的动作（`inject_soul`、`install_dashboard`、`install_guard`）在其他宿主上会明确拒绝并说明原因。
 
 ### 可选的代理扩展执行层
 

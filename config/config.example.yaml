@@ -172,24 +172,61 @@ backend:
 # =============================================================================
 
 # =============================================================================
-# Agent memory write safety (optional)
+# Agent environment adapter + agent memory write safety (optional)
 # =============================================================================
 #
+# WHICH AGENT'S FILES
+# -------------------
+# The common core holds no product paths. Where the host agent keeps its own
+# memory file, which character separates the entries in it, where its live
+# session database lives and how many characters it allows are all answered by
+# an *environment adapter* (src/layered_memory_mcp/adapters/).
+#
+#     agent_memory:
+#       adapter: auto     # default
+#
+# Values:
+#   auto        probe the registry in order — hermes, claude_code, cursor,
+#               cline, then a generic adapter that knows only this framework's
+#               own home. This is the backward-compatible default and resolves
+#               exactly what the pre-adapter core resolved.
+#   hermes      pin Hermes: ~/.hermes/memories/MEMORY.md, '§' separator,
+#               ~/.hermes/state.db, the limit read back from ~/.hermes/config.yaml
+#   claude_code pin ~/.claude/CLAUDE.md
+#   cursor      pin ./.cursorrules
+#   cline       pin ~/.cline/rules
+#   generic     know no product paths at all; only <home>/agent-memory.md
+#   none / off  alias for generic
+#
+# An unknown id falls back to `generic` with a warning — never silently to
+# Hermes. Register your own with
+# `adapters.environment.environments.register(MyAdapter(), priority=15)`;
+# no core file needs editing.
+#
+# Env equivalent: LAYERED_MEMORY_AGENT_ADAPTER=hermes
+#
+# `get_memory_surface_capabilities()` reports the result as
+# `agent_environment: {configured, resolved, known, entry_separator, ...}`.
+#
+# WRITE SAFETY
+# ------------
 # The framework projects an L0 pointer / knowledge-index entry into the agent's
-# own memory file (Hermes MEMORY.md, Claude Code CLAUDE.md, ...). When no path
-# is configured it *auto-detects* one, which is fine for reading but dangerous
-# for writing: any ambiguous config — a test, a throwaway script built on a
-# temp home — resolves the real file and silently appends to it.
+# own memory file. When no path is configured it *auto-detects* one through the
+# adapter, which is fine for reading but dangerous for writing: any ambiguous
+# config — a test, a throwaway script built on a temp home — resolves the real
+# file and silently appends to it. Detection is not permission.
 #
 # So a projection write needs an explicit target or an explicit opt-in:
 #
 #     agent_memory:
 #       path: /root/.hermes/memories/MEMORY.md   # explicit target (recommended)
 #       allow_auto_detect_write: false           # or opt back into auto-detect
+#       separator: null                          # override the adapter's separator
 #
 # Env equivalents (highest priority):
 #     LAYERED_MEMORY_AGENT_MEMORY_PATH=/path/to/MEMORY.md
 #     LAYERED_MEMORY_AGENT_MEMORY_ALLOW_AUTO_DETECT_WRITE=true
+#     LAYERED_MEMORY_AGENT_MEMORY_SEPARATOR='§'
 #
 # With neither set, auto-detected writes are still allowed in exactly two
 # cases: the detected file lives inside <home> (the framework owns that dir),

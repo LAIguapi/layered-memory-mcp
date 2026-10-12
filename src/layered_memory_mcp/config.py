@@ -3,6 +3,17 @@ Configuration for Layered Memory MCP Server.
 
 All paths are configurable via environment variables or constructor arguments.
 No hardcoded personal paths.
+
+AGENT-NATIVE PATHS COME FROM AN ADAPTER
+---------------------------------------
+This module resolves the *framework's* own layout (``~/.layered-memory`` and
+everything under it). It deliberately knows nothing about where a particular
+agent product keeps its memory file, its session database or its session dumps:
+those used to be literals here (``~/.hermes/memories/MEMORY.md``,
+``~/.hermes/state.db``, ``~/.hermes/sessions``, the ``'§'`` separator) and now
+come from :mod:`.adapters.environment`. ``agent_memory.adapter`` selects which
+adapter answers; the default (``auto``) probes the registry Hermes-first, so an
+existing install resolves exactly the paths it always did.
 """
 
 import json
@@ -34,36 +45,43 @@ def default_knowledge_dir(home: Path | None = None) -> Path:
     return base / "knowledge"
 
 
-def default_hermes_db_path() -> Path:
-    """Path of Hermes' live session database.
+def default_state_db_path(adapter: object | None = None) -> Path | None:
+    """Path of the agent's live session database, per the environment adapter.
 
-    Hermes keeps sessions in a SQLite DB (``~/.hermes/state.db``), not in the
-    JSON directory :func:`default_sessions_dir` points at — that directory only
-    holds stale request dumps these days, which is why a directory scan can come
-    back with zero sessions while the agent has been busy for weeks.
+    An agent that keeps sessions in a SQLite DB (Hermes: ``~/.hermes/state.db``)
+    does *not* keep them in the JSON directory :func:`default_sessions_dir`
+    points at — that directory only holds stale request dumps these days, which
+    is why a directory scan can come back with zero sessions while the agent has
+    been busy for weeks.
+
+    ``None`` means the resolved adapter has no such database; callers treat that
+    as "no live-session source" rather than as an error.
     """
     env = os.environ.get("LAYERED_MEMORY_HERMES_DB")
     if env:
         return Path(env).expanduser()
-    return Path.home() / ".hermes" / "state.db"
+    from .adapters.environment import resolve_environment
+
+    return (adapter or resolve_environment()).detect_state_db()
 
 
-def default_sessions_dir() -> Path | None:
-    """Try to auto-detect agent sessions directory.
-    
-    Supports:
-      - Hermes Agent: ~/.hermes/sessions/
-      - Custom: LAYERED_MEMORY_SESSIONS_DIR env var
+#: Legacy alias — the Hermes-named entry point kept for external callers.
+default_hermes_db_path = default_state_db_path
+
+
+def default_sessions_dir(adapter: object | None = None) -> Path | None:
+    """Auto-detect the agent's session-dump directory.
+
+    Priority: ``LAYERED_MEMORY_SESSIONS_DIR`` → whatever the resolved
+    environment adapter reports (Hermes: ``~/.hermes/sessions``) → ``None``.
     """
     env = os.environ.get("LAYERED_MEMORY_SESSIONS_DIR")
     if env:
         return Path(env)
-    
-    hermes_sessions = Path.home() / ".hermes" / "sessions"
-    if hermes_sessions.exists():
-        return hermes_sessions
-    
-    return None
+
+    from .adapters.environment import resolve_environment
+
+    return (adapter or resolve_environment()).detect_sessions_dir()
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -244,7 +262,9 @@ def _load_session_scan_from_yaml(home: Path) -> dict:
     Shape (all keys optional)::
 
         session_scan:
-          hermes_db_path: ~/.hermes/state.db   # Hermes' live session database
+          hermes_db_path: ~/.hermes/state.db   # live session DB; defaults to
+                                               # whatever the environment
+                                               # adapter reports
           exclude_sources: [cron]              # session sources to skip
           exclude_markers: [...]               # substrings that drop a session
 
@@ -474,8 +494,18 @@ class MemoryConfig:
         memory_changelog: dict | None = None,
     ):
         self.home = Path(home) if home else default_home()
+
+        # Unreleased: the agent-native environment adapter. Resolved *first*,
+        # because everything product-shaped below (session DB, session dir,
+        # memory path, entry separator) now asks it instead of hardcoding a
+        # path. See adapters/environment.py for the selection rules.
+        self._load_agent_memory_settings(agent_memory)
+        _env_adapter = self._environment_adapter()
+
         self.knowledge_dir = Path(knowledge_dir) if knowledge_dir else default_knowledge_dir(self.home)
-        self.sessions_dir = Path(sessions_dir) if sessions_dir else default_sessions_dir()
+        self.sessions_dir = (
+            Path(sessions_dir) if sessions_dir else default_sessions_dir(_env_adapter)
+        )
         self.l0_index_file = Path(l0_index_file) if l0_index_file else None
         # Fallback to environment variable if not passed explicitly
         if self.l0_index_file is None:
@@ -491,8 +521,10 @@ class MemoryConfig:
             or os.environ.get("LAYERED_MEMORY_HERMES_DB")
             or _scan_cfg.get("hermes_db_path")
         )
-        self.hermes_db_path: Path = (
-            Path(str(_db_setting)).expanduser() if _db_setting else default_hermes_db_path()
+        self.hermes_db_path: Path | None = (
+            Path(str(_db_setting)).expanduser()
+            if _db_setting
+            else default_state_db_path(_env_adapter)
         )
         self.session_exclude_markers: list[str] = _coerce_str_list(
             session_exclude_markers
@@ -943,45 +975,9 @@ class MemoryConfig:
                     f"{_name} must be between 0.0 and 1.0, got {_val}"
                 )
 
-        # v1.0: Agent memory adapter — auto-detect or explicit.
-        #
-        # Unreleased: the `agent_memory:` section of config.yaml joined the env
-        # vars as a resolution source, because these two knobs decide whether
-        # the framework may project L0 pointers into a file it does not own:
-        #
-        #   agent_memory:
-        #     path: null                      # explicit target (recommended)
-        #     allow_auto_detect_write: false  # opt back into auto-detect writes
-        #
-        # With neither set, an auto-detected production memory file is refused
-        # as a *write* target unless the home is clearly this install's own —
-        # see agent_memory_guard.resolve_write_target for the exact rule. That
-        # is what stops a bare temp config (a test, a sanity script) from
-        # silently appending a pointer to a live agent's memory.
-        # Precedence: constructor → env → config.yaml → none.
-        _am_yaml = (
-            agent_memory
-            if isinstance(agent_memory, dict)
-            else _load_yaml_section(self.home, "agent_memory")
-        )
-        _amp = (
-            os.environ.get("LAYERED_MEMORY_AGENT_MEMORY_PATH")
-            or _am_yaml.get("path")
-        )
-        self.agent_memory_path: Path | None = (
-            Path(str(_amp)).expanduser() if _amp else None
-        )
-        _env_aadw = os.environ.get("LAYERED_MEMORY_AGENT_MEMORY_ALLOW_AUTO_DETECT_WRITE")
-        self.agent_memory_allow_auto_detect_write: bool = (
-            _env_bool("LAYERED_MEMORY_AGENT_MEMORY_ALLOW_AUTO_DETECT_WRITE", False)
-            if _env_aadw is not None
-            else _coerce_bool(_am_yaml.get("allow_auto_detect_write"), False)
-        )
-        _ams = (
-            os.environ.get("LAYERED_MEMORY_AGENT_MEMORY_SEPARATOR")
-            or _am_yaml.get("separator")
-        )
-        self.agent_memory_separator: str = str(_ams) if _ams else "§"
+        # v1.0 / Unreleased: the `agent_memory:` section is resolved at the top
+        # of __init__ (see _load_agent_memory_settings) because the adapter it
+        # selects decides every other product-shaped path.
 
         # Unreleased: MEMORY_CHANGELOG backend (see memory_changelog.py). The
         # append-only provenance record of semantic L0/L1 mutations:
@@ -1042,7 +1038,115 @@ class MemoryConfig:
         self.knowledge_dir.mkdir(parents=True, exist_ok=True)
         if self._shared_knowledge_dir:
             self._shared_knowledge_dir.mkdir(parents=True, exist_ok=True)
-    
+
+    # ------------------------------------------------------------------
+    # Agent-native environment (adapters/environment.py)
+    # ------------------------------------------------------------------
+
+    def _load_agent_memory_settings(self, agent_memory: dict | None) -> None:
+        """Resolve the ``agent_memory:`` section.
+
+        Unreleased: the section of config.yaml joined the env vars as a
+        resolution source, because these knobs decide whether the framework may
+        project L0 pointers into a file it does not own:
+
+            agent_memory:
+              adapter: auto                   # environment adapter id
+              path: null                      # explicit target (recommended)
+              allow_auto_detect_write: false  # opt back into auto-detect writes
+              separator: null                 # override the adapter's separator
+
+        With neither ``path`` nor ``allow_auto_detect_write`` set, an
+        auto-detected production memory file is refused as a *write* target
+        unless the home is clearly this install's own — see
+        ``agent_memory_guard.resolve_write_target`` for the exact rule. That is
+        what stops a bare temp config (a test, a sanity script) from silently
+        appending a pointer to a live agent's memory.
+
+        Precedence throughout: constructor → env → config.yaml → default.
+        """
+        _am_yaml = (
+            agent_memory
+            if isinstance(agent_memory, dict)
+            else _load_yaml_section(self.home, "agent_memory")
+        )
+        _amp = (
+            os.environ.get("LAYERED_MEMORY_AGENT_MEMORY_PATH")
+            or _am_yaml.get("path")
+        )
+        self.agent_memory_path: Path | None = (
+            Path(str(_amp)).expanduser() if _amp else None
+        )
+        _env_aadw = os.environ.get("LAYERED_MEMORY_AGENT_MEMORY_ALLOW_AUTO_DETECT_WRITE")
+        self.agent_memory_allow_auto_detect_write: bool = (
+            _env_bool("LAYERED_MEMORY_AGENT_MEMORY_ALLOW_AUTO_DETECT_WRITE", False)
+            if _env_aadw is not None
+            else _coerce_bool(_am_yaml.get("allow_auto_detect_write"), False)
+        )
+        # Which agent product's file layout to assume. "auto" (the default)
+        # probes the adapter registry Hermes-first, which is exactly the
+        # candidate chain this class used to hardcode.
+        _ada = (
+            os.environ.get("LAYERED_MEMORY_AGENT_ADAPTER")
+            or _am_yaml.get("adapter")
+        )
+        self.agent_adapter: str = str(_ada).strip() if _ada else "auto"
+        # An explicit separator override. None means "ask the adapter" — which
+        # is why this is stored separately from the resolved property below.
+        _ams = (
+            os.environ.get("LAYERED_MEMORY_AGENT_MEMORY_SEPARATOR")
+            or _am_yaml.get("separator")
+        )
+        self._agent_memory_separator: str | None = str(_ams) if _ams else None
+
+    def _environment_adapter(self, memory_path: Path | None = None):
+        """The resolved environment adapter for this config.
+
+        ``memory_path`` lets a caller already working on a specific file have
+        the adapter chosen by *that* file's layout rather than by a probe.
+
+        Resolved on every call rather than cached: adapter selection probes the
+        filesystem, and a long-lived server whose agent appears (or whose
+        operator fixes ``agent_memory.adapter``) mid-run should pick it up the
+        way the pre-adapter probe chain did.
+        """
+        from .adapters.environment import resolve_environment
+
+        return resolve_environment(self, memory_path=memory_path)
+
+    def describe_agent_environment(self) -> dict:
+        """Read-only reflection of the environment adapter. Never raises."""
+        from .adapters.environment import describe_environment
+
+        return describe_environment(self)
+
+    @property
+    def agent_state_db_path(self) -> Path | None:
+        """Product-neutral name for :attr:`hermes_db_path`.
+
+        The attribute, its ``session_scan.hermes_db_path`` config key and the
+        ``LAYERED_MEMORY_HERMES_DB`` env var keep their Hermes-era names so no
+        existing install breaks; the value itself comes from the environment
+        adapter. New code should read this.
+        """
+        return self.hermes_db_path
+
+    @property
+    def agent_memory_separator(self) -> str:
+        """Entry separator for the agent's memory file.
+
+        The configured override wins; otherwise the resolved adapter's default
+        (Hermes: ``§``; generic: a blank line).
+        """
+        if self._agent_memory_separator:
+            return self._agent_memory_separator
+        try:
+            return self._environment_adapter().default_separator()
+        except Exception:  # noqa: BLE001 — a separator must always resolve
+            from .adapters.environment import DEFAULT_SEPARATOR
+
+            return DEFAULT_SEPARATOR
+
     @property
     def knowledge_dirs(self) -> list[Path]:
         """All knowledge directories to search (namespace + shared).
@@ -1059,44 +1163,40 @@ class MemoryConfig:
         """Auto-detect the agent's memory file path.
 
         Priority:
-          1. Explicitly configured agent_memory_path
-          2. Hermes Agent: ~/.hermes/memories/MEMORY.md
-          3. Claude Code: ~/.claude/CLAUDE.md
-          4. Cursor: ./.cursorrules
-          5. Cline: ~/.cline/rules
-          6. Generic fallback: <home>/agent-memory.md
+          1. Explicitly configured ``agent_memory.path``
+          2. whatever the resolved environment adapter reports
 
-        Returns Path if found or configured, None if nothing exists.
+        Under the default ``adapter: auto`` the registry is probed in its
+        registered order — Hermes, Claude Code, Cursor, Cline, then the
+        framework-owned ``<home>/agent-memory.md`` fallback — which is the same
+        candidate chain this method used to spell out inline. Under an explicit
+        adapter id only that adapter is asked, so ``adapter: generic`` resolves
+        nothing outside the framework's own home.
+
+        Returns a ``Path`` if found or configured, ``None`` if nothing exists.
+        **Detection is not permission:** an auto-detected path is still refused
+        as a write target by ``agent_memory_guard.resolve_write_target`` unless
+        it was named explicitly or opted into.
         """
         # 1. Explicit config
         if self.agent_memory_path:
             return self.agent_memory_path
 
-        # 2-6. Auto-detect by existence
-        candidates = [
-            Path.home() / ".hermes" / "memories" / "MEMORY.md",     # Hermes
-            Path.home() / ".claude" / "CLAUDE.md",                   # Claude Code
-            Path.cwd() / ".cursorrules",                              # Cursor
-            Path.home() / ".cline" / "rules",                         # Cline
-            self.home / "agent-memory.md",                            # Generic fallback
-        ]
-        for p in candidates:
-            if p.exists():
-                return p
-
-        return None
+        # 2. Ask the adapter layer.
+        return self._environment_adapter().detect_memory_path(framework_home=self.home)
 
     def detect_agent_memory_separator(self, memory_path: Path | None = None) -> str:
         """Auto-detect the entry separator used in the agent's memory file.
 
-        Hermes uses '§', most others use blank-line separators.
-        Falls back to the configured separator.
+        The adapter decides per file (Hermes answers ``§`` for a ``MEMORY.md``
+        and declines to answer for anything else); an adapter with no opinion
+        falls through to :attr:`agent_memory_separator`.
         """
         path = memory_path or self.detect_agent_memory_path()
         if path and path.exists():
-            name = path.name.lower()
-            if "memory" in name:
-                return "§"  # Hermes convention
+            resolved = self._environment_adapter(path).memory_separator(path)
+            if resolved:
+                return resolved
         return self.agent_memory_separator
 
     # ------------------------------------------------------------------

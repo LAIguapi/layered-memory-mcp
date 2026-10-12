@@ -33,16 +33,50 @@ rename shows up as an add plus a remove. Only `manage_entry` can emit
 `l0_entry_renamed`. Fixing this means the sync comparing entry lines per domain,
 which is more than the provenance value justifies right now.
 
-## 2. Adapter extraction of the Hermes-specific paths
+## 2. Adapter extraction of the Hermes-specific paths — done, with named leftovers
 
-`adapters/` defines the protocol and an empty registry, but Hermes assumptions
-still sit in the core: `~/.hermes/memories/MEMORY.md` and `~/.hermes/state.db`
-defaults, the `§` separator heuristic, the `write_guard` plugin layout,
-`agent_integrator`'s SOUL/MEMORY snippets.
+**Done.** `adapters/environment.py` defines `AgentEnvironmentAdapter` plus a
+priority-ordered registry; `adapters/hermes.py` holds every Hermes fact
+(`~/.hermes` layout, `§`, the 2000-char fallback, the `config.yaml` limit
+reader, `SOUL.md` and `SOUL_BLOCK`); `adapters/editors.py` holds the Claude
+Code / Cursor / Cline layouts; a generic adapter knows only
+`<home>/agent-memory.md`. `agent_memory.adapter` selects one, default `auto`
+(probe Hermes-first, i.e. the pre-adapter chain verbatim); an unknown id falls
+back to `generic` with a warning, never silently to Hermes.
 
-Done when: those live behind an adapter/support layer, the core knows no
-product paths, and a second agent can be supported by registering an adapter
-rather than by editing the router or the compactor.
+`config.py`, `memory_compactor.py`, `routing.py`, `agent_memory_guard.py` and
+`memory_changelog.py` now carry **no** product path, product file name or `§`
+literal in operative code — `tests/test_v353_agent_adapters.py` asserts that
+over the AST, excluding docstrings. `detect_agent_type` delegates to the
+registry. `get_memory_surface_capabilities` reports
+`agent_environment: {configured, resolved, known, …}`. Registering an adapter
+is a complete integration: the test suite proves a fictional `acme` adapter
+redirects path, separator, state DB and char limit without a core edit.
+
+**Leftover 1 — Hermes-era public names.** `MemoryConfig.hermes_db_path`, the
+`session_scan.hermes_db_path` config key, the `LAYERED_MEMORY_HERMES_DB` env
+var, `session_scanner.default_hermes_db()` / `config.default_hermes_db_path()`
+and `scan_sessions(hermes_db_path=...)` keep their names. Their *values* come
+from the adapter, and `config.agent_state_db_path` is the neutral alias to read
+instead. Renaming them is a breaking config/API change, so it belongs to a
+major version, not here.
+
+**Leftover 2 — `l0_format: "hermes"`.** The L0 entry *format* token (and
+`_generate_hermes_index`) is a format name, not a path. Renaming it would
+invalidate every existing `config.yaml` and `LAYERED_MEMORY_L0_FORMAT`. Done
+when a major version renames it to something like `pointer`/`index` with an
+alias for the old value.
+
+**Leftover 3 — two Hermes support packages stay out of the adapter.**
+`write_guard/` (plugin payload, installer, `hermes` CLI candidates) and
+`dashboard_plugin/` are self-contained Hermes integrations; the Hermes adapter
+only points at the first (`HermesEnvironment.write_guard()`) so the core never
+names it. `agent_integrator.build_init_recommendation` and `integrate_agent`'s
+`inject_soul` / `install_dashboard` / `install_guard` branches still key off
+`agent_type == "hermes"` — the type comes from the adapter, but the option text
+and the installers are Hermes-only, and refuse clearly on any other host. Done
+when a second agent actually needs one of those surfaces and the branch becomes
+a capability lookup.
 
 ## 3. Optional `apply_agent_action` execution path
 

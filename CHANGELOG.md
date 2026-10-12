@@ -111,13 +111,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or a `<home>` that is this install's real configured home and not a temp/test
   sandbox (which is what keeps an existing deployment's projection working).
   Anything else is refused and reported — never silently dropped.
-- **`agent_memory:` config section.** `path` (explicit target, recommended) and
-  `allow_auto_detect_write` (default `false`), also readable from
+- **`agent_memory:` config section.** `adapter` (default `auto`), `path`
+  (explicit target, recommended) and `allow_auto_detect_write` (default
+  `false`), also readable from `LAYERED_MEMORY_AGENT_ADAPTER`,
   `LAYERED_MEMORY_AGENT_MEMORY_PATH` and
   `LAYERED_MEMORY_AGENT_MEMORY_ALLOW_AUTO_DETECT_WRITE`. The pre-existing env
   vars keep their priority; `separator` may now also be set in the section.
+- **Agent-environment adapters (`layered_memory_mcp.adapters.environment`).**
+  The second half of the adapter layer, and the one that makes the common core
+  agent-neutral. An `AgentEnvironmentAdapter` answers *where* the host agent
+  keeps its own memory file, which character separates its entries, where its
+  live-session database and session dumps live, how many characters it allows,
+  and which persona file to inject into. Read-only throughout: resolving a path
+  through an adapter grants no permission to write it.
+  - **Registry, probed in priority order.** Unlike the extension-action
+    registry, this one ships populated: `hermes` (10), `claude_code` (20),
+    `cursor` (30), `cline` (40), `generic` (90) — the same candidate order the
+    core used to hardcode. `EnvironmentAdapterBase` makes a declarative
+    integration (layout + separator + tokens) code-free.
+  - **`adapters.hermes`** owns every Hermes fact: the `~/.hermes` layout, `§`,
+    the 2000-char fallback, the dynamic read of
+    `memory.{memory,user}_char_limit` from `~/.hermes/config.yaml`, `SOUL.md`,
+    `SOUL_BLOCK`, and a pointer to the `write_guard` support package.
+    **Hermes remains the default adapter for backwards compatibility.**
+  - **`agent_memory.adapter`** selects one. `auto` (the default) reproduces the
+    pre-adapter probe chain exactly; an explicit id pins one adapter;
+    `generic` / `none` / `off` knows no product paths at all and resolves only
+    the framework-owned `<home>/agent-memory.md`; an unknown id falls back to
+    `generic` **with a warning**, never silently to Hermes.
+  - **`get_memory_surface_capabilities`** gained `agent_environment`
+    (`configured`, `resolved`, `known`, `entry_separator`, and the adapter's
+    capability flags). Distinct from `adapter`, which names the optional
+    extension-*action* handler bundle.
+  - **`MemoryConfig.agent_state_db_path`** — product-neutral alias for
+    `hermes_db_path`, whose Hermes-era name is kept so no install breaks.
 
 ### Changed
+
+- **The common core holds no product paths.** `config.py`,
+  `memory_compactor.py`, `routing.py`, `agent_memory_guard.py` and
+  `memory_changelog.py` no longer contain a product path, product file name or
+  `§` literal in operative code; `tests/test_v353_agent_adapters.py` asserts
+  that over the AST (docstrings excluded, since explaining what moved is the
+  point). What moved: `default_hermes_db_path` / `default_sessions_dir` /
+  `detect_agent_memory_path` / `detect_agent_memory_separator` now ask the
+  adapter; `agent_memory_separator` is a property that falls back to the
+  adapter's default instead of a hardcoded `§`;
+  `memory_compactor._get_memory_max_chars` asks the adapter for the product's
+  configured limit and then its fallback, dropping `_find_hermes_config`,
+  `_read_hermes_memory_limit`, `_is_hermes_memory_path` and
+  `_HERMES_DEFAULT_MEMORY_MAX_CHARS`; `agent_integrator.detect_agent_type`
+  delegates to the registry and re-exports `SOUL_BLOCK` from the Hermes
+  adapter; `session_scanner.default_hermes_db` takes the path from the adapter
+  and keeps only the SQL. Behaviour under Hermes is unchanged — a second agent
+  is now a registration, not a patch to the router, the compactor or the config.
+  `_parse_entries` lost its `separator="§"` default and now requires the
+  argument; every call site already resolved it through `_resolve_separator`.
+- **No live-session database is a reportable state, not a crash.** With an
+  adapter that has none, `config.hermes_db_path` is `None` and
+  `scan_sessions` / `search_sessions` / `read_state_db_sessions` report
+  "no live-session database for this agent" instead of assuming a path.
+- **Non-Hermes hosts get their own separator and their own limit.** Two
+  consequences of routing these through the adapter, both affecting non-Hermes
+  installs only. (1) With no `agent_memory.separator` configured, a Claude Code
+  / Cursor / Cline / generic memory file now falls back to a blank line instead
+  of `§` — the old default meant such a file parsed as one single entry, so the
+  compactor saw one giant bloat entry instead of its real contents. (2) The
+  dynamic limit read is no longer attempted against `~/.hermes/config.yaml`
+  when the resolved adapter is not Hermes; previously a stray Hermes config on
+  the host could cap an unrelated agent's memory file at 2000 characters.
+  Behaviour on a Hermes host is byte-for-byte unchanged.
 
 - **Agent-memory projections report refusals.** `_ensure_l0_pointer_in_memory`,
   the `index_only` upsert and the pointer reap return

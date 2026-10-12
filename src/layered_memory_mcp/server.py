@@ -506,11 +506,15 @@ async def scan_recent_sessions(
     db_available = config.hermes_db_path is not None and config.hermes_db_path.is_file()
     dir_available = bool(config.sessions_dir) and config.sessions_dir.exists()
     if not db_available and not dir_available:
+        # The DB location comes from the environment adapter; "none" means the
+        # resolved adapter has no live-session database at all.
+        db_shown = str(config.hermes_db_path) if config.hermes_db_path else "none"
         return json.dumps({
             "success": False,
-            "error": "No session source available: neither Hermes' state.db "
-                     f"({config.hermes_db_path}) nor a session directory exists. "
-                     "Set LAYERED_MEMORY_HERMES_DB or LAYERED_MEMORY_SESSIONS_DIR.",
+            "error": "No session source available: neither the agent's live "
+                     f"session database ({db_shown}) nor a session directory "
+                     "exists. Set LAYERED_MEMORY_HERMES_DB or "
+                     "LAYERED_MEMORY_SESSIONS_DIR.",
         })
 
     # scan_sessions prefers state.db and falls back to the directory; the privacy
@@ -1501,10 +1505,15 @@ async def get_memory_surface_capabilities() -> str:
       - `source_owned_evidence` — raw session data: scanned, never written.
       - `derived_stores` — L0 index, vector store, search index: rebuildable
         from the L1 markdown, which is the source of truth.
+      - `agent_environment` — which environment adapter is answering questions
+        about the host agent's own files (`configured` is the requested id or
+        `auto`, `resolved` is what the probe settled on, `known` lists the
+        registered ids). The common core holds no product paths of its own.
 
     Returns:
         JSON MemorySurfaceCapabilities (schema_version, routing mode,
-        agent_extensions state, and the four surface groups).
+        agent_extensions state, the resolved agent environment, and the four
+        surface groups).
     """
     config = _get_config()
     caps = await asyncio.to_thread(_surface_capabilities, config)
@@ -2303,8 +2312,11 @@ async def init_framework() -> str:
         guard_policy = getattr(config, "write_guard", "manual")
         if agent_info["agent_type"] == "hermes" and agent_info["home_dir"] and guard_policy != "off":
             from .write_guard import check_guard_status, ensure_guard_installed
+            # config_path stays None: the write-guard support package resolves
+            # the host config itself (env var, then the agent home it was
+            # handed), so the server names no product path or env var.
             guard_kwargs = {
-                "config_path": os.environ.get("HERMES_CONFIG_PATH") or None,
+                "config_path": None,
                 "state_path": config.home / "write_guard_state.json",
             }
             if guard_policy == "auto":
@@ -2455,8 +2467,11 @@ async def integrate_agent(action: str = "status") -> str:
             if not agent_info["home_dir"]:
                 return {"success": False, "error": "Hermes home directory not found."}
             from .write_guard import check_guard_status, install_guard, remove_guard
+            # config_path stays None: the write-guard support package resolves
+            # the host config itself (env var, then the agent home it was
+            # handed), so the server names no product path or env var.
             guard_kwargs = {
-                "config_path": os.environ.get("HERMES_CONFIG_PATH") or None,
+                "config_path": None,
                 "state_path": config.home / "write_guard_state.json",
             }
             if action == "guard_status":

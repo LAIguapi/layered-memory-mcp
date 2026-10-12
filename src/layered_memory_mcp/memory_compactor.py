@@ -1,11 +1,13 @@
 """
 Memory Compactor — Detect and migrate non-index entries in agent memory.
 
-Agent memory file formats vary by platform:
-  - Hermes: ~/.hermes/memories/MEMORY.md, entries separated by '§'
-  - Claude Code: ~/.claude/CLAUDE.md, entries separated by blank lines
-  - Cursor: ./.cursorrules
-  - Generic: any text file
+Agent memory file formats vary by platform — which file, which separator and
+which character limit are **adapter** questions, answered by
+:mod:`.adapters.environment` and not by this module. Before the extraction this
+file carried the Hermes answers directly (``~/.hermes/config.yaml``, the
+``'§'`` separator heuristic, the 2000-char fallback); now it asks the resolved
+adapter and keeps only the format-agnostic logic: what counts as an index
+entry, what counts as bloat, and where bloat should migrate to.
 
 The L0 index layer should only contain short pointer entries like:
     [L0] domain: summary → knowledge/file.md
@@ -100,16 +102,16 @@ MAX_INDEX_ENTRY_LENGTH = 120
 # Priority chain (see _get_memory_max_chars):
 #   1. explicit max_chars argument
 #   2. MEMORY_MAX_CHARS env var
-#   3. Hermes config.yaml (memory.memory_char_limit / user_char_limit) — dynamic
-#   4. smart default by memory-file type below
+#   3. the adapter's dynamic read of the agent product's own config — e.g.
+#      Hermes' memory.memory_char_limit / user_char_limit
+#   4. the adapter's own fallback default (Hermes: 2000)
+#   5. the generic default below
 #
-# The generic default (non-Hermes agents, blank-line separated) stays high.
-# Hermes-style memory (§-separated MEMORY.md / USER.md) defaults to the
-# Hermes built-in default of 2000 so we never *over*-estimate capacity and
-# silently skip compaction. This is only a fallback — the real limit is read
-# dynamically from config.yaml when available.
+# The generic default (an agent whose limit the framework cannot discover) stays
+# high: a low guess would make the compactor act on a limit nobody set. An
+# adapter that *does* know the product errs low instead — over-estimating
+# capacity silently skips compaction, which is how a memory file overflows.
 _DEFAULT_MEMORY_MAX_CHARS = 50_000
-_HERMES_DEFAULT_MEMORY_MAX_CHARS = 2_000
 
 def _resolve_memory_path(
     memory_path: str | Path | None = None,
@@ -154,19 +156,23 @@ def _resolve_separator(
     """Resolve the entry separator for the agent memory file.
 
     Priority:
-      1. config.detect_agent_memory_separator() (auto-detect)
-      2. File-name heuristic: files with 'memory' in the name
-         (case-insensitive) use '§' (Hermes convention)
-      3. Fallback to '\\n\\n' (blank-line separator — universal)
+      1. ``config.detect_agent_memory_separator()`` — the configured override,
+         else the environment adapter's answer for this file
+      2. with no config at all: the adapter resolved from the path's own layout
+      3. a blank line (the universal fallback)
+
+    No separator literal appears here: which character separates entries is a
+    property of the agent product, which is what the adapter describes.
     """
     if config is not None:
         return config.detect_agent_memory_separator(memory_path)
-    # No config — try simple heuristic from filename
+    # No config — ask the adapter layer directly, keyed off the path's layout.
+    from .adapters.environment import DEFAULT_SEPARATOR, resolve_environment
+
     if memory_path and memory_path.exists():
-        name = memory_path.name.lower()
-        if "memory" in name:
-            return "§"
-    return "\n\n"
+        adapter = resolve_environment(memory_path=memory_path)
+        return adapter.memory_separator(memory_path) or DEFAULT_SEPARATOR
+    return DEFAULT_SEPARATOR
 
 
 # ---------------------------------------------------------------------------
@@ -310,7 +316,8 @@ def detect_memory_bloat(
                     "hint": (
                         "Consider: (1) run compact_memory() to migrate bloat to L1, "
                         "(2) increase MEMORY_MAX_CHARS env var, "
-                        "(3) adjust Hermes config to allow more memory."
+                        "(3) raise the limit in the agent's own config "
+                        "(the environment adapter reads it back)."
                     ),
                     "usage_ratio": round(usage_ratio, 3),
                     "capacity_limit": _capacity_limit,
@@ -1395,12 +1402,15 @@ def auto_maintain_after_write(
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _parse_entries(raw: str, separator: str = "§") -> list[str]:
+def _parse_entries(raw: str, separator: str) -> list[str]:
     """Parse agent memory file into individual entries.
 
     Args:
         raw: The full text content of the memory file.
-        separator: Entry separator. Hermes uses '§', most others use '\\n\\n'.
+        separator: Entry separator. Required — it used to default to Hermes'
+            ``'§'``, which made a product convention part of a core signature.
+            Every call site resolves it through :func:`_resolve_separator`,
+            i.e. through the environment adapter.
     """
     # Split by separator and clean up
     parts = raw.split(f"\n{separator}\n")
@@ -1584,87 +1594,6 @@ def _summarize_brief(entry: str, max_chars: int = 60, config=None) -> str:
     return clean
 
 
-def _find_hermes_config() -> Path | None:
-    """Locate the Hermes config.yaml.
-
-    Resolution order:
-      1. HERMES_CONFIG_PATH env var (set by Hermes in the MCP server's env)
-      2. ~/.hermes/config.yaml (standard location)
-
-    Returns the path if it exists, else None.
-    """
-    import os
-
-    explicit = os.environ.get("HERMES_CONFIG_PATH")
-    if explicit:
-        p = Path(explicit).expanduser()
-        if p.is_file():
-            return p
-
-    standard = Path("~/.hermes/config.yaml").expanduser()
-    if standard.is_file():
-        return standard
-    return None
-
-
-def _read_hermes_memory_limit(is_user_profile: bool = False) -> int | None:
-    """Dynamically read the real memory char limit from Hermes config.yaml.
-
-    Hermes stores two independent limits under the ``memory:`` section:
-      - ``memory_char_limit``  → MEMORY.md
-      - ``user_char_limit``    → USER.md
-
-    Reading this keeps the framework in sync with whatever the user has
-    actually configured (default 2000, user-adjustable) instead of guessing
-    a fixed value that drifts from reality.
-
-    Args:
-        is_user_profile: When True, read ``user_char_limit`` (USER.md);
-            otherwise ``memory_char_limit`` (MEMORY.md).
-
-    Returns:
-        The configured limit as int, or None if unavailable/unparseable.
-    """
-    cfg_path = _find_hermes_config()
-    if not cfg_path:
-        return None
-    try:
-        import yaml
-
-        with cfg_path.open("r", encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
-        mem = data.get("memory") or {}
-        key = "user_char_limit" if is_user_profile else "memory_char_limit"
-        val = mem.get(key)
-        if val is not None:
-            limit = int(val)
-            if limit > 0:
-                return limit
-    except Exception as e:  # noqa: BLE001 — never let limit-detection break maintenance
-        logger.debug("Could not read Hermes memory limit from %s: %s", cfg_path, e)
-    return None
-
-
-def _is_hermes_memory_path(path: "str | Path | None") -> bool:
-    """Heuristic: does this memory path belong to a Hermes-style agent?
-
-    Hermes memory lives under ``.hermes/memories/`` and uses '§' separators.
-    Used to pick the Hermes-appropriate fallback default (2000) instead of
-    the generic 50000.
-    """
-    if not path:
-        return False
-    s = str(path).lower()
-    return "hermes" in s or "memory.md" in s or "user.md" in s
-
-
-def _is_user_profile_path(path: "str | Path | None") -> bool:
-    """Detect whether the memory path is the USER profile (USER.md) vs MEMORY.md."""
-    if not path:
-        return False
-    return "user.md" in str(path).lower()
-
-
 def _get_memory_max_chars(
     config=None,
     memory_path: "str | Path | None" = None,
@@ -1674,14 +1603,21 @@ def _get_memory_max_chars(
     Priority chain (most authoritative first):
       1. config.memory_char_limit (explicit, if the MemoryConfig carries one)
       2. MEMORY_MAX_CHARS env var
-      3. Hermes config.yaml memory.{memory,user}_char_limit — DYNAMIC, tracks
-         whatever the user actually set (e.g. they raised 2000 → 4000)
-      4. smart default: Hermes-style memory → 2000, generic → 50000
+      3. the environment adapter's dynamic read of the agent product's own
+         config — DYNAMIC, so it tracks whatever the user actually set (e.g.
+         they raised Hermes' 2000 to 4000)
+      4. the environment adapter's fallback default for this file
+      5. the generic default (_DEFAULT_MEMORY_MAX_CHARS)
+
+    Steps 3 and 4 used to be a ``~/.hermes/config.yaml`` read and a hardcoded
+    2000 in this module. They now belong to whichever adapter claims
+    ``memory_path``, so a second agent gets its own limit without touching the
+    compactor.
 
     Args:
         config: optional MemoryConfig (may carry an explicit limit).
-        memory_path: the memory file being evaluated; used to (a) pick the
-            right Hermes key (MEMORY vs USER) and (b) choose the fallback.
+        memory_path: the memory file being evaluated; the adapter uses it to
+            pick the right limit key and the right fallback.
     """
     import os
 
@@ -1706,15 +1642,21 @@ def _get_memory_max_chars(
         except ValueError:
             pass
 
-    # 3. dynamic: read the real limit from Hermes config.yaml
-    is_user = _is_user_profile_path(memory_path)
-    hermes_limit = _read_hermes_memory_limit(is_user_profile=is_user)
-    if hermes_limit:
-        return hermes_limit
+    # 3-4. ask the adapter: the product's own configured limit, then its default.
+    from .adapters.environment import resolve_environment
 
-    # 4. smart default by memory-file type
-    if _is_hermes_memory_path(memory_path):
-        return _HERMES_DEFAULT_MEMORY_MAX_CHARS
+    adapter = resolve_environment(config, memory_path=memory_path)
+    try:
+        dynamic = adapter.memory_char_limit(memory_path)
+        if dynamic:
+            return int(dynamic)
+        fallback = adapter.default_memory_char_limit(memory_path)
+        if fallback:
+            return int(fallback)
+    except Exception as e:  # noqa: BLE001 - limit detection must not break maintenance
+        logger.debug("adapter %s could not resolve a memory limit: %s", adapter.id, e)
+
+    # 5. generic default
     return _DEFAULT_MEMORY_MAX_CHARS
 
 
