@@ -2417,10 +2417,18 @@ async def compact_memory(
         routing_mode: Override `routing.mode` from config for this call:
                  "advisory" or "enforce". None (default) uses the config value.
 
+    An explicit call like this one always runs. The *lazy* pass that rides
+    along on writes backs off instead when `enforce` keeps blocking the same
+    entries: see `blocked_set` below, and `auto_compaction_backoff` in the
+    maintenance report.
+
     Returns:
         JSON with migration plan or execution report, including
         `routing_mode`, `routing_summary`, `routing_advisory`, `l1_candidates`,
-        `todo_candidates`, `agent_owned_candidates` and `rejected`.
+        `todo_candidates`, `agent_owned_candidates`, `rejected` and
+        `blocked_set` — `{count, fingerprint, by_surface}` identifying what
+        this pass could not place (`fingerprint: null` when nothing was
+        blocked).
     """
     config = _get_config()
     from .memory_compactor import compact_memory as _compact

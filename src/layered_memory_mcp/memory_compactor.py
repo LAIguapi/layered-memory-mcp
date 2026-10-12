@@ -22,6 +22,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .injector import inject_knowledge as _inject_knowledge
+from .storage.auto_compaction_state import (
+    AutoCompactionState,
+    blocked_set_fingerprint,
+    entry_content_hash,
+)
+from .storage.auto_compaction_state import source_digest as _memory_source_digest
+from .storage.auto_compaction_state import state_path as _auto_compaction_state_path
+from .storage.auto_compaction_state import target_key as _auto_compaction_target_key
 
 if TYPE_CHECKING:
     from .agent_memory_guard import WriteTarget
@@ -481,6 +489,14 @@ def compact_memory(
 
     Returns a report of migrated entries and the cleaned memory content.
     The agent should then write the cleaned content back to its memory.
+
+    The report also carries ``blocked_set`` — ``{count, fingerprint,
+    by_surface}`` over the entries this pass could not place, with
+    ``fingerprint: None`` when nothing was blocked. It is a property of the
+    set's content (order- and time-independent), which is what lets
+    :func:`auto_maintain_after_write` recognise "the same blocked entries
+    again" and stop re-running a pass that cannot move anything. An explicit
+    call like this one always runs.
     """
     path = _resolve_memory_path(memory_path, config)
 
@@ -549,6 +565,10 @@ def compact_memory(
         record = {
             "entry_preview": _preview(entry),
             "entry_length": len(entry),
+            # Whitespace-normalised content hash. Lets a caller (and the
+            # auto-compaction backoff state) identify this entry across passes
+            # without carrying its text.
+            "entry_hash": entry_content_hash(entry),
             "surface": routing["surface"] if routing else None,
             "ownership": routing["ownership"] if routing else None,
             "score": routing["score"] if routing else None,
@@ -750,12 +770,18 @@ def compact_memory(
     if kept:
         cleaned_content += "\n"
 
-    blocked = sum(
-        1
+    blocked_records = [
+        r
         for records in buckets.values()
         for r in records
         if r["status"] == "blocked_from_l1"
-    )
+    ]
+    blocked = len(blocked_records)
+    # Identity of the blocked set, independent of order and of when the pass
+    # ran. The lazy auto-maintain path compares it against the last recorded
+    # one to avoid re-running a pass that can only block the same entries
+    # again (see `_auto_compaction_decision`).
+    blocked_set = blocked_set_fingerprint(blocked_records)
     if enforce and blocked:
         routing_notes.append(
             f"{blocked} entr{'y' if blocked == 1 else 'ies'} were blocked from L1 "
@@ -799,6 +825,11 @@ def compact_memory(
             ),
             "blocked_from_l1": blocked,
         },
+        # Stable identity of what this pass could not place: `{count,
+        # fingerprint, by_surface}`, with `fingerprint: None` when nothing was
+        # blocked. Always present, so advisory callers can see the empty set
+        # rather than guess at a missing key.
+        "blocked_set": blocked_set,
         "routing_notes": routing_notes,
         **buckets,
         "cleaned_memory": cleaned_content,
@@ -858,6 +889,243 @@ def _write_last_compact_time(config: "MemoryConfig") -> None:
         _last_compact_marker(config).write_text(str(time.time()), encoding="utf-8")
     except OSError as e:
         logger.warning("Failed to write last-compact marker: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# Auto-compaction backoff — the blocked set under routing mode 'enforce'
+# ---------------------------------------------------------------------------
+# Under `enforce` a blocked entry is deliberately left in agent memory, so the
+# usage-ratio trigger below stays satisfied forever: every write re-ran a full
+# pass that migrated nothing. The state store remembers which blocked set was
+# already seen, so a lazy pass that can only repeat itself is skipped — and a
+# genuinely new bloat entry, which changes the fingerprint, still triggers one
+# on the very next write.
+#
+# Deliberately scoped to the *lazy* path: an explicit `compact_memory` call is
+# the caller stating intent, and intent is not noise to suppress.
+
+#: `status` reported when a lazy pass is skipped for an unchanged blocked set.
+BLOCKED_SET_UNCHANGED = "blocked_set_unchanged"
+
+#: Hint attached to every backoff report — the way out is to place the blocked
+#: entries, not to wait.
+_BACKOFF_HINT = (
+    "the blocked entries are still in agent memory and still reported by "
+    "compact_memory(dry_run=True); place them on their own surfaces (or switch "
+    "routing.mode to 'advisory') to clear the backoff. Adding new bloat "
+    "re-triggers a pass immediately, and an explicit compact_memory call always "
+    "runs."
+)
+
+
+def _auto_compaction_state(config: "MemoryConfig") -> AutoCompactionState:
+    return AutoCompactionState(_auto_compaction_state_path(config))
+
+
+def _pending_l1_work(report: dict) -> tuple[int, int]:
+    """``(migratable L1 candidates, entries refused for want of a heading)``.
+
+    Either number being non-zero means a pass still has work to do, so the
+    backoff must not swallow it: the first would migrate, the second must keep
+    reporting its refusal until an agent names the section.
+    """
+    summary = report.get("routing_summary") or {}
+    migratable = int(summary.get("l1_planned") or 0)
+    needs_title = sum(
+        1
+        for record in report.get("l1_candidates") or []
+        if record.get("status") == "refused_needs_title"
+    )
+    return migratable, needs_title
+
+
+def _auto_compaction_decision(
+    config: "MemoryConfig", path: Path, *, trigger_reason: str | None
+) -> dict:
+    """Would a lazy pass do anything, or only block the same entries again?
+
+    Returns ``{"skip": bool, "status": str, …}``. ``skip`` is True only in
+    ``enforce`` mode, only when a blocked set is already recorded for this
+    memory file under the same routing configuration, and only when the current
+    file would produce that same blocked set with nothing left to migrate.
+
+    Two ways to establish that, cheapest first:
+
+    1. the memory file is byte-identical to the one the recorded pass left
+       behind — classification is deterministic, so the outcome is too;
+    2. otherwise a dry run (classification only: no L1 write, no backup, no
+       rewrite of the memory file) re-derives the blocked set and compares
+       fingerprints.
+
+    Anything unexpected — no recorded state, a changed fingerprint, a failed
+    probe — resolves to ``skip: False``. The backoff may delay noise; it may
+    never delay work.
+    """
+    routing_enabled, mode, _notes = _resolve_routing_mode(config, None)
+    if mode != "enforce":
+        # Advisory migrates every non-index entry, so a pass always shrinks
+        # memory and the trigger stops firing on its own. Nothing to back off.
+        return {"skip": False, "status": "not_applicable", "routing_mode": mode}
+
+    store = _auto_compaction_state(config)
+    key = _auto_compaction_target_key(path)
+    previous = store.get(key) or {}
+    recorded_fingerprint = (previous.get("blocked_set") or {}).get("fingerprint")
+    digest = _memory_source_digest(path)
+    same_routing = (
+        previous.get("routing_mode") == mode
+        and previous.get("routing_enabled") == routing_enabled
+    )
+
+    def _skip(detail: str, *, probe: str, blocked_set: dict, refresh: str | None) -> dict:
+        record = store.note_skipped_pass(key, source_digest=refresh) or previous
+        return {
+            "skip": True,
+            "status": BLOCKED_SET_UNCHANGED,
+            "routing_mode": mode,
+            "trigger_reason": trigger_reason,
+            "detail": detail,
+            "probe": probe,
+            "blocked_set": blocked_set,
+            "migratable_l1_candidates": 0,
+            "first_seen_at": record.get("first_seen_at"),
+            "last_attempt_at": record.get("last_attempt_at"),
+            "skipped_passes": record.get("skipped_passes"),
+            "memory_target": key,
+            "state_file": str(store.path),
+            "hint": _BACKOFF_HINT,
+        }
+
+    if not recorded_fingerprint:
+        return {"skip": False, "status": "no_recorded_blocked_set", "routing_mode": mode}
+    if not same_routing:
+        return {"skip": False, "status": "routing_changed", "routing_mode": mode}
+
+    if digest and previous.get("source_digest") == digest:
+        return _skip(
+            "agent memory is byte-identical to the file the last enforced pass "
+            "left behind, and classification is deterministic — another pass "
+            "would block the same entries and migrate nothing",
+            probe="source_unchanged",
+            blocked_set=previous.get("blocked_set") or {},
+            refresh=None,
+        )
+
+    try:
+        probe_report = compact_memory(config, memory_path=path, dry_run=True)
+    except Exception as e:  # noqa: BLE001 — a failed probe must not skip work
+        logger.warning("Auto-compaction backoff probe failed: %s", e)
+        return {
+            "skip": False,
+            "status": "probe_failed",
+            "routing_mode": mode,
+            "error": str(e),
+        }
+    if not probe_report.get("success"):
+        return {
+            "skip": False,
+            "status": "probe_failed",
+            "routing_mode": mode,
+            "error": probe_report.get("error"),
+        }
+
+    blocked_set = probe_report.get("blocked_set") or {}
+    migratable, needs_title = _pending_l1_work(probe_report)
+
+    if blocked_set.get("fingerprint") != recorded_fingerprint:
+        return {
+            "skip": False,
+            "status": "blocked_set_changed",
+            "routing_mode": mode,
+            "blocked_set": blocked_set,
+            "recorded_fingerprint": recorded_fingerprint,
+            "migratable_l1_candidates": migratable,
+        }
+    if migratable or needs_title:
+        return {
+            "skip": False,
+            "status": "l1_work_pending",
+            "routing_mode": mode,
+            "blocked_set": blocked_set,
+            "migratable_l1_candidates": migratable,
+            "needs_title_count": needs_title,
+        }
+
+    return _skip(
+        "the blocked set is unchanged and no entry is migratable to L1, so a "
+        "pass would rewrite agent memory without moving anything",
+        probe="dry_run_classification",
+        blocked_set=blocked_set,
+        # The file changed (a new pointer, a reformat) without changing the
+        # blocked set — remember the new bytes so the next write takes the
+        # cheap path instead of classifying again.
+        refresh=digest,
+    )
+
+
+def _record_auto_compaction_state(
+    config: "MemoryConfig", path: Path, compact_result: dict
+) -> dict:
+    """Persist (or clear) the blocked set an enforced lazy pass just produced.
+
+    Clearing matters as much as recording: once the blocked entries are gone
+    the next bloat entry must trigger a pass immediately, with no stale
+    fingerprint to match against.
+    """
+    if compact_result.get("routing_mode") != "enforce":
+        return {"action": "not_applicable", "reason": "routing mode is not enforce"}
+
+    store = _auto_compaction_state(config)
+    key = _auto_compaction_target_key(path)
+    blocked_set = compact_result.get("blocked_set") or {}
+
+    try:
+        if not blocked_set.get("count"):
+            cleared = store.clear(key)
+            return {
+                "action": "cleared" if cleared else "nothing_to_clear",
+                "memory_target": key,
+                "state_file": str(store.path),
+            }
+
+        # The byte-identity shortcut is only honest when this pass ended in a
+        # pure no-op for everything that was not blocked. An error or a
+        # missing heading means a repeat might still accomplish something, so
+        # the next decision has to classify rather than trust the bytes.
+        _migratable, needs_title = _pending_l1_work(compact_result)
+        clean_pass = (
+            not compact_result.get("error_count")
+            and not needs_title
+            and compact_result.get("file_written") is not False
+        )
+        record = store.record(
+            key,
+            blocked_set=blocked_set,
+            routing_mode=compact_result.get("routing_mode"),
+            routing_enabled=compact_result.get("routing_enabled"),
+            source_digest=_memory_source_digest(path) if clean_pass else None,
+        )
+        if record is None:
+            return {
+                "action": "error",
+                "reason": "state file could not be written",
+                "state_file": str(store.path),
+            }
+        return {
+            "action": "recorded",
+            "fingerprint": record["blocked_set"]["fingerprint"],
+            "count": record["blocked_set"]["count"],
+            "by_surface": record["blocked_set"]["by_surface"],
+            "first_seen_at": record.get("first_seen_at"),
+            # The backoff is armed either way; this says whether the next
+            # decision can take the byte-identity shortcut or has to classify.
+            "source_pinned": bool(record.get("source_digest")),
+            "memory_target": key,
+            "state_file": str(store.path),
+        }
+    except Exception as e:  # noqa: BLE001 — maintenance must not raise
+        logger.warning("Auto-compaction state update failed: %s", e)
+        return {"action": "error", "reason": str(e)}
 
 
 def _ensure_l0_pointer_in_memory(
@@ -1272,7 +1540,19 @@ def auto_maintain_after_write(
     no background thread required). Fails silently — maintenance must never
     break the primary write.
 
+    Under ``routing.mode: enforce`` the lazy pass also backs off: entries the
+    router blocks from L1 stay in agent memory by design, so the trigger above
+    remains satisfied and a pass would repeat itself on every write. The
+    blocked set is fingerprinted and remembered, and an identical set with
+    nothing migratable reports ``compact.status: "backed_off"`` plus
+    ``auto_compaction_backoff`` instead of running. New bloat changes the
+    fingerprint and triggers a pass on the next write; an explicit
+    ``compact_memory`` call is never backed off.
+
     Returns a report dict; ``{"skipped": True, ...}`` when auto-maintain is off.
+    ``report["compact"]["status"]`` is one of ``not_triggered`` / ``migrated``
+    (entries reached L1) / ``blocked_only`` (the pass ran and only blocked
+    non-L1 entries) / ``no_changes`` / ``backed_off`` / ``error``.
     """
     if not getattr(config, "auto_maintain", True):
         return {"skipped": True, "reason": "auto_maintain disabled"}
@@ -1362,25 +1642,66 @@ def auto_maintain_after_write(
                     reason = f"CRITICAL usage {round(usage_ratio * 100, 1)}% >= {round(critical * 100)}% (hard safety net)"
 
         if should_compact:
-            compact_result = compact_memory(config, memory_path=path, dry_run=False)
-            _write_last_compact_time(config)
-            report["compact"] = {
-                "triggered": True,
-                "reason": reason,
-                "migrated_count": compact_result.get("migrated_count", 0),
-                "after_chars": compact_result.get("stats", {}).get("after_chars"),
-                # Under routing mode 'enforce' non-L1 entries stay in agent
-                # memory, so a non-zero count here explains why memory did not
-                # shrink as much as migrated_count suggests.
-                "blocked_from_l1": compact_result.get("routing_summary", {}).get(
+            # Under 'enforce' the trigger above can be permanently satisfied by
+            # entries the pass is not allowed to move, so ask first whether a
+            # pass could do anything at all. Advisory mode answers
+            # "not_applicable" without reading or writing any state.
+            decision = _auto_compaction_decision(config, path, trigger_reason=reason)
+            if decision.get("skip"):
+                backoff = {k: v for k, v in decision.items() if k != "skip"}
+                report["compact"] = {
+                    "triggered": False,
+                    "status": "backed_off",
+                    # The trigger that WOULD have fired — the condition has not
+                    # gone away, it just cannot be acted on.
+                    "reason": reason,
+                    "blocked_from_l1": (decision.get("blocked_set") or {}).get(
+                        "count", 0
+                    ),
+                    "backoff": backoff,
+                }
+                # Hoisted as well: a caller reading the top level should not
+                # have to dig to find out why maintenance went quiet.
+                report["auto_compaction_backoff"] = backoff
+            else:
+                compact_result = compact_memory(config, memory_path=path, dry_run=False)
+                _write_last_compact_time(config)
+                blocked_from_l1 = compact_result.get("routing_summary", {}).get(
                     "blocked_from_l1", 0
-                ),
-            }
+                )
+                migrated_count = compact_result.get("migrated_count", 0)
+                report["compact"] = {
+                    "triggered": True,
+                    # Three outcomes a caller has to be able to tell apart:
+                    # entries reached L1, nothing reached L1 because the router
+                    # blocked it, or there was simply nothing to do.
+                    "status": (
+                        "migrated"
+                        if migrated_count
+                        else "blocked_only"
+                        if blocked_from_l1
+                        else "no_changes"
+                    ),
+                    "reason": reason,
+                    "migrated_count": migrated_count,
+                    "after_chars": compact_result.get("stats", {}).get("after_chars"),
+                    # Under routing mode 'enforce' non-L1 entries stay in agent
+                    # memory, so a non-zero count here explains why memory did not
+                    # shrink as much as migrated_count suggests.
+                    "blocked_from_l1": blocked_from_l1,
+                    "blocked_set": compact_result.get("blocked_set"),
+                    "backoff_decision": decision.get("status"),
+                }
+                # Remember this blocked set (or forget the last one), so the
+                # next write can tell "same entries again" from "new bloat".
+                state = _record_auto_compaction_state(config, path, compact_result)
+                if state.get("action") != "not_applicable":
+                    report["compact"]["blocked_set_state"] = state
         else:
-            report["compact"] = {"triggered": False}
+            report["compact"] = {"triggered": False, "status": "not_triggered"}
     except Exception as e:  # noqa: BLE001 — maintenance must not raise
         logger.warning("Auto-maintain compaction failed: %s", e)
-        report["compact"] = {"triggered": False, "error": str(e)}
+        report["compact"] = {"triggered": False, "status": "error", "error": str(e)}
 
     # --- 3. L1 / vector-store dedup guard (v2.8.0) ---
     # The framework now owns L1 de-bloat too, not just MEMORY.md compaction.

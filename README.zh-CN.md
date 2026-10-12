@@ -617,6 +617,26 @@ enforce 模式不会往 L1 之外写任何东西，被拦下的条目只被报�
 
 旧字段（`migrated_count`、`migrated`、`errors`、`cleaned_memory`、`stats`）在两种模式下含义不变，已有调用方不需要改动。
 
+#### 对被拦条目集合的退避
+
+被拦下的条目会留在 agent 记忆里，于是**懒触发**的维护条件一直成立：`auto_maintain_after_write` 看的是用量比例，所以一个装满 `enforce` 不会搬动的条目的记忆文件，过去会在**每一次**写入时都重跑一整轮压实（备份、分类、回写），而每轮都一条都搬不动。
+
+现在压实会给被拦下的集合算一个指纹（`blocked_set: {count, fingerprint, by_surface}` —— 逐条内容哈希加上路由到的面，排序后计算，不含时间戳），并记在 `data/auto_compaction_state.json` 里。下一次懒触发会先比较、再决定要不要干活：
+
+| 情形 | 懒触发的行为 |
+|------|------|
+| 第一次拦下条目的 enforce 压实 | 照常运行，记录指纹，报告 `compact.status: "blocked_only"` |
+| 集合没变，也没有可迁移的条目 | **跳过** —— `compact.status: "backed_off"`，并附上 `auto_compaction_backoff: {status: "blocked_set_unchanged", probe, blocked_set, skipped_passes, first_seen_at, hint}` |
+| 新增一条被拦条目（指纹变了） | 下一次写入立刻重跑；`backoff_decision: "blocked_set_changed"` |
+| 新增一条可进 L1 的条目 | 照常运行并迁移它，无论被拦集合有没有变；`backoff_decision: "l1_work_pending"` |
+| 被拦条目已被安置到别处 | 照常运行；记录被清除，于是下一条冗余内容会立刻触发 |
+| `advisory` 模式 | 行为不变 —— 这个模式下不会拦下任何条目，也就无从退避，状态文件也不会被写出 |
+| 显式调用 `compact_memory(...)` | 一定会执行。退避只针对顺带跑的懒触发；显式调用是你在表达意图 |
+
+`compact.status` 把过去长得一样的三种结果分开了：`migrated`（有条目进了 L1）、`blocked_only`（跑过了，但只能拦下非 L1 条目）、`backed_off`（没跑，并说明原因），另外还有 `no_changes`、`not_triggered` 和 `error`。
+
+状态文件是派生的运行状态：带版本号（`schema_version`），以记忆文件路径的哈希为键，里面只有哈希和计数，不存记忆正文，也不存绝对路径。它既不是知识，也不是 `MEMORY_CHANGELOG` 溯源；删掉它的代价正好是多跑一次空压实。两个值得知道的细节：判断时先看记忆文件是否与上次记录的那份逐字节相同，只有不同才用一次 dry run 重新分类（所以退避本身很便宜，绝不会是一整轮压实）；而因为无法确定标题而被拒的条目（`refused_needs_title`）算作待办工作 —— 拒绝会继续被报告，不会被退避消音。
+
 ### 派生数据：L0 索引与向量
 
 L1 markdown 文件是唯一的事实来源。L0 索引和向量库（`data/vectors.db`）都是从这些文件**派生**出来的，随时可以重建（`sync_l0_index`、`reindex_vector_store_tool`）。写入向量的文本使用去噪后的标题：`## Release process 2026-10-01 (v3.2)` 会以 `Release process` 嵌入，这样周期性条目按主题而不是日期聚类。展示用标题和存储的元数据仍保留原文。升级后可以重建索引，让已有向量也用上更干净的标题。

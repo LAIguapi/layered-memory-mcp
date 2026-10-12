@@ -212,6 +212,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     extension-*action* handler bundle.
   - **`MemoryConfig.agent_state_db_path`** — product-neutral alias for
     `hermes_db_path`, whose Hermes-era name is kept so no install breaks.
+- **Blocked-set backoff for lazy compaction under `enforce`.** A blocked entry
+  is deliberately left in agent memory, so the usage-ratio trigger in
+  `auto_maintain_after_write` stayed satisfied forever and every write re-ran a
+  full pass (backup, classification, rewrite) that migrated nothing.
+  `compact_memory` now reports `blocked_set: {count, fingerprint, by_surface}` —
+  a sorted hash over each blocked entry's whitespace-normalised content plus its
+  routed surface and status, with no timestamps, so two passes over unchanged
+  content agree and ordering cannot change it. The lazy path remembers the last
+  one in `<home>/data/auto_compaction_state.json`
+  (`storage/auto_compaction_state.py`: `schema_version`, keyed by a hash of the
+  memory file path, hashes and counts only — no memory text and no absolute
+  path, written through an atomic replace) and skips a pass that could only
+  repeat itself, reporting `compact.status: "backed_off"` plus a top-level
+  `auto_compaction_backoff` (`status: "blocked_set_unchanged"`, `probe`,
+  `blocked_set`, `migratable_l1_candidates`, `first_seen_at`,
+  `last_attempt_at`, `skipped_passes`, `hint`). The decision is cheap: first a
+  byte-identity check against the file the recorded pass left behind, otherwise
+  a dry-run classification — never a full pass to learn nothing changed. New
+  bloat changes the fingerprint and triggers a pass on the next write; a new
+  L1-migratable entry (or one refused for want of a heading) counts as pending
+  work and runs regardless; placing the blocked entries clears the record; and
+  `advisory` mode neither reads nor writes any of it. This is derived
+  operational state — not L1 knowledge, and **not** a `MEMORY_CHANGELOG` event.
 
 ### Changed
 
@@ -325,6 +348,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to use the configured mode, so existing calls behave exactly as before. With
   `routing.enabled: false`, `enforce` degrades to advisory — enforcing on
   classifications the config forbids computing would block every entry.
+- **`auto_maintain_after_write`'s `compact` block gained a `status`.** Three
+  outcomes used to be indistinguishable from `triggered` plus a count:
+  `migrated` (entries reached L1), `blocked_only` (the pass ran and could only
+  block non-L1 entries) and `backed_off` (it did not run, and says why), next to
+  `no_changes`, `not_triggered` and `error`. A pass that ran also reports
+  `blocked_set`, `backoff_decision` and, under `enforce`, `blocked_set_state`.
+  `triggered` and every pre-existing key keep their meaning. Compaction
+  candidates additionally carry `entry_hash`, so a caller can follow one entry
+  across passes without storing its text.
 - **Docs corrected.** README (en / zh-CN / ja / ko), the package docstring, the
   `cognitive_decision_prompt`, and `init_framework`'s welcome text no longer
   present skills as an "L2" tier beneath L1. They describe the common core, the

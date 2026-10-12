@@ -190,14 +190,47 @@ ja/ko files use Japanese and Korean marker strings (`保持理由`, `手順書`,
 annotated in-line as extending the built-in vocabulary, which remains English +
 Chinese only.
 
-## 6. Lazy auto-compaction re-trigger under `enforce`
+## 6. Lazy auto-compaction re-trigger under `enforce` — done, with two gaps
 
-Under `routing.mode: enforce`, entries blocked from L1 are deliberately left in
-agent memory. `auto_maintain_after_write`'s trigger conditions are usage ratio
-and elapsed interval, so a memory file full of blocked entries stays over
-threshold and re-runs compaction on every write, each pass migrating nothing
-(`blocked_from_l1` is reported, but nothing backs off).
+**Done.** `compact_memory` reports `blocked_set: {count, fingerprint,
+by_surface}` — a sorted hash over each blocked entry's whitespace-normalised
+content plus its routed surface and status, with no timestamps, so it is a
+property of the set and not of the pass that saw it. Candidate records carry
+`entry_hash` for the same reason. `auto_maintain_after_write` remembers the last
+one per memory file in `<home>/data/auto_compaction_state.json`
+(`storage/auto_compaction_state.py`: versioned, keyed by a hash of the memory
+file path, hashes and counts only, atomic replace, every read/write
+best-effort) and skips a lazy pass that could only repeat itself, reporting
+`compact.status: "backed_off"` plus a top-level `auto_compaction_backoff`
+(`status: "blocked_set_unchanged"`, `probe`, `blocked_set`,
+`migratable_l1_candidates`, `first_seen_at`, `last_attempt_at`,
+`skipped_passes`, `hint`).
 
-Done when: a blocked set is remembered (hash + count) and does not re-trigger a
-pass until it changes, while a genuinely new bloat entry still triggers one
-immediately.
+The decision is deliberately cheap and deliberately conservative: first a
+byte-identity check against the file the recorded pass left behind, otherwise a
+dry-run classification — never a full write pass to learn nothing changed — and
+*anything* unexpected (no record, changed fingerprint, changed routing config,
+failed probe, a migratable entry, an entry refused for want of a heading)
+resolves to "run". The backoff may delay noise; it may never delay work.
+`compact.status` now separates the three outcomes that used to look alike
+(`migrated` / `blocked_only` / `backed_off`), advisory mode neither reads nor
+writes the state, and an explicit `compact_memory` call is never backed off.
+`tests/test_v356_auto_compaction_backoff.py` locks all of it; README (en /
+zh-CN / ja / ko) carries the behaviour matrix.
+
+**Gap 1 — the interval trigger is not reset on a backoff.** A skipped pass
+leaves `<home>/.last_auto_compact` alone on purpose (writing it would postpone
+the *next real* pass by a whole interval), so Trigger B keeps firing and the
+decision keeps answering it. That is cheap — a byte comparison on the hot path —
+but it is still a decision per write, and the L1 dedup step that rides on the
+same marker keeps running at its old frequency. Done when the dedup step has
+its own cadence marker, so a backed-off pass can record "attempted" without
+being read as "compacted".
+
+**Gap 2 — classification is assumed deterministic for a given file.** The
+byte-identity shortcut compares the memory file plus `routing.mode` /
+`routing.enabled`; it does not notice a changed marker vocabulary or changed
+domain rules. Such a change can therefore take until the next memory-file edit
+to show up in the blocked set. Done when the fingerprint also covers the
+classifier inputs (a hash of the routing vocabulary would do), or when the
+state is dropped on any config change.

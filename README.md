@@ -634,6 +634,26 @@ Each candidate carries the entry preview, the routed surface and ownership, the 
 
 The legacy fields (`migrated_count`, `migrated`, `errors`, `cleaned_memory`, `stats`) keep their meaning in both modes, so existing callers do not need to change.
 
+#### Backing Off a Blocked Set
+
+A blocked entry stays in agent memory, which means the *lazy* maintenance trigger stays satisfied. `auto_maintain_after_write` fires on a usage ratio, so a memory file full of entries `enforce` will not move used to re-run a full pass — backup, classification, rewrite — on **every** write, migrating nothing each time.
+
+The pass now fingerprints what it blocked (`blocked_set: {count, fingerprint, by_surface}` — per-entry content hashes plus the routed surface, sorted, no timestamps) and remembers it in `data/auto_compaction_state.json`. The next lazy trigger compares before it works:
+
+| Situation | What the lazy pass does |
+|-----------|-------------------------|
+| First enforced pass that blocks entries | runs, records the fingerprint, reports `compact.status: "blocked_only"` |
+| Same blocked set, nothing migratable | **skipped** — `compact.status: "backed_off"` plus `auto_compaction_backoff: {status: "blocked_set_unchanged", probe, blocked_set, skipped_passes, first_seen_at, hint}` |
+| A new blocked entry (fingerprint changed) | runs on the very next write; `backoff_decision: "blocked_set_changed"` |
+| A new L1-migratable entry | runs and migrates it, whether or not the blocked set changed; `backoff_decision: "l1_work_pending"` |
+| The blocked entries get placed elsewhere | runs; the record is cleared, so the next bloat entry triggers immediately |
+| `advisory` mode | unchanged — nothing is ever blocked, so there is nothing to back off, and no state file is written |
+| Explicit `compact_memory(...)` | always runs. The backoff is for the lazy ride-along only; an explicit call is you stating intent |
+
+`compact.status` separates the three outcomes that used to look alike: `migrated` (entries reached L1), `blocked_only` (the pass ran and could only block non-L1 entries), `backed_off` (it did not run, and says why) — plus `no_changes`, `not_triggered` and `error`.
+
+The state file is derived operational state: versioned (`schema_version`), keyed by a hash of the memory file path, and carrying hashes and counts rather than memory text or absolute paths. It is neither knowledge nor `MEMORY_CHANGELOG` provenance, and deleting it costs exactly one extra no-op pass. Two details worth knowing: the decision first checks whether the memory file is byte-identical to the one the recorded pass left behind and only otherwise re-classifies with a dry run (so backing off is cheap, never a full pass), and an entry refused for want of a heading (`refused_needs_title`) counts as pending work — a refusal keeps being reported instead of being backed off into silence.
+
 ### Derived Data: L0 Index and Vectors
 
 The L1 markdown files are the source of truth. The L0 index and the vector store (`data/vectors.db`) are **derived** from them and can be rebuilt at any time (`sync_l0_index`, `reindex_vector_store_tool`). The text that gets embedded uses a noise-stripped heading: `## Release process 2026-10-01 (v3.2)` is embedded as `Release process`, so periodic entries cluster by topic rather than by date. Displayed headings and stored metadata keep the original text. After upgrading, you can reindex so that existing vectors pick up the cleaner headings.

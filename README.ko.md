@@ -616,6 +616,26 @@ enforce 모드는 L1 밖으로는 아무것도 쓰지 않습니다. 막힌 항�
 
 기존 필드(`migrated_count`, `migrated`, `errors`, `cleaned_memory`, `stats`)의 의미는 두 모드 모두에서 동일하므로 기존 호출자는 바꿀 것이 없습니다.
 
+#### 막힌 항목 집합에 대한 백오프
+
+막힌 항목은 에이전트 메모리에 남으므로 **지연** 유지보수의 발동 조건도 계속 충족된 상태로 남습니다. `auto_maintain_after_write`가 보는 것은 사용률이라서, `enforce`가 옮기지 않는 항목으로 가득 찬 메모리 파일은 예전에는 **쓰기마다** 전체 압축(백업, 분류, 되쓰기)을 다시 돌리면서도 한 건도 옮기지 못했습니다.
+
+이제 압축은 막은 집합의 지문을 계산하고(`blocked_set: {count, fingerprint, by_surface}` — 항목별 콘텐츠 해시와 라우팅된 면을 정렬해 계산하며 타임스탬프는 들어가지 않습니다) `data/auto_compaction_state.json`에 기억합니다. 다음 지연 발동은 일하기 전에 먼저 비교합니다:
+
+| 상황 | 지연 패스의 동작 |
+|------|------|
+| 항목을 막은 첫 enforce 압축 | 실행하고, 지문을 기록하고, `compact.status: "blocked_only"`로 보고 |
+| 같은 집합이고 옮길 항목도 없음 | **건너뜀** — `compact.status: "backed_off"`와 함께 `auto_compaction_backoff: {status: "blocked_set_unchanged", probe, blocked_set, skipped_passes, first_seen_at, hint}` |
+| 막히는 항목이 새로 생김(지문이 바뀜) | 바로 다음 쓰기에서 실행; `backoff_decision: "blocked_set_changed"` |
+| L1로 옮길 수 있는 항목이 새로 생김 | 막힌 집합이 바뀌었는지와 무관하게 실행하고 옮김; `backoff_decision: "l1_work_pending"` |
+| 막힌 항목들이 다른 곳에 놓임 | 실행하고, 기록이 지워지므로 다음 비대 항목이 즉시 발동시킴 |
+| `advisory` 모드 | 그대로 — 이 모드에서는 아무것도 막히지 않으므로 백오프할 대상이 없고, 상태 파일도 쓰이지 않습니다 |
+| 명시적 `compact_memory(...)` | 항상 실행됩니다. 백오프는 곁따라 도는 지연 패스만의 것이고, 명시적 호출은 당신이 의도를 밝히는 일입니다 |
+
+`compact.status`는 예전에는 구분되지 않던 세 결과를 갈라 줍니다: `migrated`(항목이 L1에 들어감), `blocked_only`(돌았지만 비L1 항목을 막는 것밖에 못 함), `backed_off`(돌지 않았고, 그 이유를 말함) — 그리고 `no_changes`, `not_triggered`, `error`가 있습니다.
+
+상태 파일은 파생된 운영 상태입니다: 버전이 있고(`schema_version`), 메모리 파일 경로의 해시를 키로 쓰며, 메모리 본문이나 절대 경로가 아니라 해시와 개수만 담습니다. 지식도 아니고 `MEMORY_CHANGELOG` 내력도 아니어서, 지워도 비용은 빈 압축 한 번이 늘어나는 것뿐입니다. 알아 둘 만한 두 가지: 판단은 먼저 메모리 파일이 기록된 그때와 바이트 단위로 같은지 보고, 다를 때만 dry run으로 다시 분류합니다(그래서 백오프 자체가 싸고, 전체 압축이 되는 일은 결코 없습니다). 그리고 제목을 정할 수 없어 거부된 항목(`refused_needs_title`)은 남은 작업으로 셉니다 — 거부는 백오프에 묻혀 조용해지지 않고 계속 보고됩니다.
+
 ### 파생 데이터: L0 색인과 벡터
 
 L1 마크다운 파일이 유일한 진실의 원천입니다. L0 색인과 벡터 스토어(`data/vectors.db`)는 거기서 **파생**되며 언제든 재구축할 수 있습니다(`sync_l0_index`, `reindex_vector_store_tool`). 임베딩되는 텍스트는 노이즈를 제거한 제목을 사용합니다: `## Release process 2026-10-01 (v3.2)`는 `Release process`로 임베딩되므로 주기적인 항목이 날짜가 아니라 주제로 묶입니다. 표시용 제목과 저장된 메타데이터는 원문 그대로 유지됩니다. 업그레이드 후 재색인하면 기존 벡터도 더 깔끔한 제목을 쓰게 됩니다.
