@@ -329,6 +329,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `cognitive_decision_prompt`, and `init_framework`'s welcome text no longer
   present skills as an "L2" tier beneath L1. They describe the common core, the
   agent-owned extension surfaces, source-owned raw sessions and derived stores.
+- **`README.ja.md` / `README.ko.md` carry the full surface-and-routing model.**
+  Both were a release behind the en/zh-CN pair: they stated the surface table
+  but not the behaviour around it. They now document the same public model —
+  the complete environment-variable table (routing, `agent_extensions`,
+  `agent_memory`, `memory_changelog`), the `config.yaml` section with the
+  advisory-vs-`enforce` split and "detection is not permission", the
+  agent-neutral common core and its `agent_memory.adapter` table, the opt-in
+  `agent_extensions` layer with the `apply_agent_action` status table and the
+  `generic_file` path rules, the governance/cleanup tool tables, and the
+  architecture sections for the memory changelog, durable knowledge vs. process
+  state, advisory routing on the write path, `routing.enforce_direct_writes`,
+  routing on the compaction path, derived data, the safe-cleanup boundary and
+  namespace isolation. Their stale inline v0.4.0/v0.5.0 changelogs now point at
+  `CHANGELOG.md` like the en/zh-CN pair. Docs only; no behaviour change.
 - **`KnowledgeType.PROCEDURE` is documented as legacy.** The value is kept and
   still parses from existing frontmatter — removing it would make older
   markdown unreadable — but procedural content belongs on the SKILL surface.

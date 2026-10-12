@@ -160,13 +160,35 @@ design, but "strict common-core purity" is not strict while that door is open.
 Done when they classify too, or when the flag's documentation says explicitly
 that it governs `inject_knowledge` only.
 
-## 5. ja/ko README routing-section translation pass
+## 5. ja/ko README routing-section translation pass — done, with one gap
 
-`README.md` and `README.zh-CN.md` describe the common core, the agent-owned
-extension surfaces and the routing config. `README.ja.md` and `README.ko.md`
-had their "L2 skills" claim corrected but not the full section.
+**Done.** `README.ja.md` and `README.ko.md` now carry the same public model as
+the en/zh-CN pair: the full environment-variable table (routing,
+`agent_extensions`, `agent_memory`, changelog), the `config.yaml` section with
+the advisory-vs-`enforce` and `enforce_direct_writes` explanation and the
+"detection is not permission" paragraph, "the common core is agent-neutral"
+(the `agent_memory.adapter` table plus the registration example), the opt-in
+`agent_extensions` layer with the `apply_agent_action` status table, the
+`generic_file` handler and its path rules, the governance/cleanup tool tables,
+and the architecture sections for the memory changelog, durable knowledge vs.
+process state, advisory routing on the write path, strict direct writes,
+routing on the compaction path, derived data, the safe-cleanup boundary and
+namespace isolation. Raw sessions are stated as source-owned evidence rather
+than a writable surface in all four READMEs.
 
-Done when: both carry the same routing/surface section as the en/zh-CN pair.
+**Gap — two en-only sections are still en-only.** The Hermes write-guard
+quick-start (`init_framework` → `integrate_agent(action="install_guard")` →
+restart, plus `write_guard: auto`) and the Semble attribution design note exist
+in `README.md` only; `README.zh-CN.md` does not carry them either, so ja/ko
+match the zh-CN baseline rather than the en superset. Done when all three
+translations gain them, or when the en README's extra sections are explicitly
+declared en-only.
+
+Also worth knowing, not a gap: the `governance:` / `routing:` examples in the
+ja/ko files use Japanese and Korean marker strings (`保持理由`, `手順書`,
+`보존 이유`, `운영 절차서`, …). Those are *user-added* values — each list is
+annotated in-line as extending the built-in vocabulary, which remains English +
+Chinese only.
 
 ## 6. Lazy auto-compaction re-trigger under `enforce`
 
