@@ -119,7 +119,7 @@ class TestInjectAutoMaintain:
             config=config,
             domain="infra",
             section="Proxy Setup",
-            content="Use HTTP proxy at 127.0.0.1:7890 for all outbound traffic.",
+            content="Use HTTP proxy at 127.0.0.1:8080 for all outbound traffic.",
         )
 
         assert result["success"]

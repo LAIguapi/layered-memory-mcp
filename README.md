@@ -516,7 +516,7 @@ python -m layered_memory_mcp.server
 
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md) for the full release history. Recent highlights (currently in `Unreleased`):
+See [CHANGELOG.md](CHANGELOG.md) for the full release history. Recent highlights in `3.4.7`:
 
 - Lifecycle governance with structured actions (`move_to_todo` / `rewrite_as_current_rule` / `keep_with_reason`) and configurable marker lists
 - `plan_knowledge_cleanup_tool` and `apply_safe_knowledge_cleanup_tool` (read-only planning, plus dry-run-first application of safe actions)

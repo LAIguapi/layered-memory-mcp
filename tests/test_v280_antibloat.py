@@ -28,7 +28,7 @@ def _mk_config(tmp_path):
 def test_append_skips_exact_intra_section_duplicate(tmp_path):
     """Writing the same content twice in append mode must not duplicate it."""
     cfg = _mk_config(tmp_path)
-    line = "WSL 代理走 127.0.0.1:7890，cron 任务需显式 export。"
+    line = "WSL 代理走 127.0.0.1:8080，cron 任务需显式 export。"
 
     r1 = injector.inject_knowledge(cfg, "infra", "网络", line, mode="append")
     assert r1["success"]
@@ -45,7 +45,7 @@ def test_append_skips_exact_intra_section_duplicate(tmp_path):
 def test_append_many_times_stays_single(tmp_path):
     """The exact bloat scenario: append the same line 50x → still 1 copy."""
     cfg = _mk_config(tmp_path)
-    line = "海外机集群共5台，巡检前先读 paste 取凭证。"
+    line = "Example cluster has five nodes; run the documented health check before maintenance."
     for _ in range(50):
         injector.inject_knowledge(cfg, "infra", "机群", line, mode="append")
     fp = Path(cfg.knowledge_dir) / "infra.md"

@@ -42,7 +42,7 @@ class TestL0Pointer:
             config=config,
             domain="infra",
             section="Proxy",
-            content="HTTP proxy at 127.0.0.1:7890",
+            content="HTTP proxy at 127.0.0.1:8080",
             mode="upsert",
         )
 

@@ -499,7 +499,7 @@ python -m layered_memory_mcp.server
 
 ## 更新日志
 
-完整版本历史见 [CHANGELOG.md](CHANGELOG.md)。近期要点（目前位于 `Unreleased`）：
+完整版本历史见 [CHANGELOG.md](CHANGELOG.md)。`3.4.7` 近期要点：
 
 - 生命周期治理：结构化建议动作（`move_to_todo` / `rewrite_as_current_rule` / `keep_with_reason`），标记词表可配置
 - `plan_knowledge_cleanup_tool` 与 `apply_safe_knowledge_cleanup_tool`：只读规划，安全动作先 dry-run 再执行

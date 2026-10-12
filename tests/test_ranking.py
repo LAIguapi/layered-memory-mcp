@@ -89,7 +89,7 @@ class TestQueryAnalysis:
     def test_resolve_alpha_auto_exact_term(self):
         # Exact terms → low alpha (BM25 heavy)
         assert resolve_alpha("127.0.0.1:8080") < 0.5
-        assert resolve_alpha("/home/user/config") < 0.5
+        assert resolve_alpha("/tmp/example/config") < 0.5
 
     def test_resolve_alpha_auto_identifier(self):
         # Identifiers → moderate BM25 bias
