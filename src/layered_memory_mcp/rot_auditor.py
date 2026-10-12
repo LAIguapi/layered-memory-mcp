@@ -308,19 +308,21 @@ def _detect_promotion_candidates(config: "MemoryConfig", files: dict[str, str]) 
     if not getattr(config, "promotion_enabled", True):
         return []
 
-    watch = getattr(config, "promotion_watch_domains", ["misc"]) or []
     candidates: list[dict] = []
     try:
-        from .promotion import detect_promotion_candidate
+        from .promotion import detect_promotion_candidate, is_watched_domain
     except Exception:
         return []
 
     for name, path in sorted(files.items()):
         domain = name.removesuffix(".md")
-        if domain not in watch:
+        # Maintenance-time scan: exact watch names plus the catch-all patterns.
+        if not is_watched_domain(config, domain, include_patterns=True):
             continue
         try:
-            hit = detect_promotion_candidate(config, domain, Path(path))
+            hit = detect_promotion_candidate(
+                config, domain, Path(path), include_patterns=True
+            )
         except Exception:
             continue
         if hit is not None:

@@ -42,8 +42,12 @@ AI agents have **limited memory** — typically 2-4KB of persistent context inje
 - **Agent-Agnostic L0 Access** — `get_l0_index` tool lets any MCP agent retrieve the memory index
 - **Multi-Agent Namespace** — Isolate knowledge per agent via `LAYERED_MEMORY_NAMESPACE` while sharing common knowledge
 - **Session Scanning** — Extract knowledge candidates from recent agent sessions
-- **Health Validation** — Check L0-L1 consistency, file structure, and knowledge quality
-- **Write Safety** — Automatic `.bak` backup before every file modification
+- **Health Validation** — Check L0-L1 consistency, file structure, and knowledge quality, plus a rot and governance summary
+- **Lifecycle Governance** — Flags process state left in durable knowledge (TODO / FIXME / next step / pending / 待办 / 待拍板 …) and suggests a structured action: `move_to_todo`, `rewrite_as_current_rule`, or `keep_with_reason`. Marker lists are configurable
+- **Cleanup Planning** — A read-only planner sorts findings into safe mechanical fixes, items that need a decision, and items that must not be auto-fixed; a separate tool applies only the safe ones, dry-run by default
+- **Write Safety** — Whole-file rewrites keep a backup out of tree under `<LAYERED_MEMORY_HOME>/data/backups/knowledge/`, so the live knowledge directory holds only live files
+- **Cleaner Vector Recall** — Embeddings use a noise-stripped heading (dates, versions, and issue numbers removed); displayed headings and metadata stay unchanged
+- **Configurable Catch-all Scans** — Maintenance and audit scans find "misc"-style files by glob pattern (`misc`, `notes`, `inbox`, `scratch`, `杂项`, …), so you don't need a file named `misc.md`
 - **Space Analysis** — Monitor memory usage and get optimization suggestions
 - **Agent-Neutral** — Works with any MCP-compatible agent (Hermes, Claude, Cursor, etc.)
 - **Zero Dependencies** — Core engine uses Python stdlib only; only `fastmcp` for MCP transport
@@ -138,6 +142,26 @@ layered-memory-mcp --verbose
 | `LAYERED_MEMORY_DEDUP_THRESHOLD` | Similarity threshold for dedup (0.0-1.0) | `0.7` |
 | `LAYERED_MEMORY_L0_FORMAT` | L0 index format: `hermes` or `generic` | `hermes` |
 | `LAYERED_MEMORY_NAMESPACE` | Agent namespace for multi-agent isolation | `shared` |
+| `LAYERED_MEMORY_PROMOTION_WATCH_PATTERNS` | Comma-separated catch-all glob patterns for maintenance scans | built-in English + Chinese list |
+
+### config.yaml
+
+You can also set most behavior in `<LAYERED_MEMORY_HOME>/config.yaml`. The precedence is: constructor argument, then environment variable, then config.yaml, then the built-in default. Two of the sections that are relevant to knowledge governance:
+
+```yaml
+governance:
+  # Each list EXTENDS the built-in Chinese + English defaults.
+  open_markers: ["WIP", "follow-up"]          # open process state → move_to_todo
+  resolved_markers: ["shipped"]                # resolved history → rewrite_as_current_rule
+  keep_reason_labels: ["Retention note"]       # "<label>: <reason>" keeps a section's markers
+  disabled_markers: ["TBD"]                    # turn off defaults that are noise for you
+
+promotion:
+  watch_domains: ["misc"]                      # exact catch-all file names (also checked on writes)
+  watch_patterns: ["misc", "misc-*", "notes", "inbox", "scratch", "杂项"]  # case-insensitive globs, maintenance/audit scans only
+```
+
+Omit a key to keep the defaults. If you set `watch_patterns`, your list replaces the built-in pattern list. Set it to `[]` to turn pattern matching off.
 
 ## Usage
 
@@ -175,10 +199,34 @@ Agent: "What's the database connection string?"
 
 ```
 → validate_knowledge()
-← Checks L0↔L1 consistency, orphaned files, stale entries, file health
+← Checks L0↔L1 consistency, orphaned files, stale entries, file health,
+  and adds rot_summary / rot_health_score and governance_summary
+  (state markers found in L1, grouped by lifecycle action)
 ```
 
-### 4. Session Compression (Cron Job)
+### 4. Plan and Apply Cleanup
+
+The cleanup workflow keeps mechanical fixes separate from semantic ones:
+
+```
+1. plan_knowledge_cleanup_tool(max_items=50)
+   ← read-only JSON with three buckets:
+     safe_auto_fixes      move legacy *.md.bak out of knowledge/, re-sync L0,
+                          reindex the vector store, copy open markers into TODOs
+     needs_user_decision  rewrite resolved history, merge heading families,
+                          shrink oversized files, …
+     must_not_auto_fix    markers kept on purpose with a keep-reason line
+
+2. apply_safe_knowledge_cleanup_tool(actions=<items from safe_auto_fixes>)
+   ← dry run (default): reports what would change, writes nothing
+
+3. apply_safe_knowledge_cleanup_tool(actions=..., dry_run=False)
+   ← applies only the four safe action types, and rejects anything else
+```
+
+The apply tool never deletes or rewrites L1 text. When it turns a marker into a TODO, the source line stays in place. Merges, rewrites, deletions, and cross-domain moves are left to the user or agent, and are made through the normal write tools. For embedding-based checks (cross-file duplicates, split candidates), use `reconcile_knowledge_tool`.
+
+### 5. Session Compression (Cron Job)
 
 Set up a daily cron to extract new knowledge from conversations:
 
@@ -189,7 +237,7 @@ Set up a daily cron to extract new knowledge from conversations:
 4. L0 index → always up to date
 ```
 
-### 5. Legacy CRUD (Also Available)
+### 6. Legacy CRUD (Also Available)
 
 For direct file manipulation:
 
@@ -212,7 +260,7 @@ For direct file manipulation:
 | `search_sessions_by_keyword` | Search session content by keyword |
 | `get_l0_index` | Retrieve the full L0 index (agent-agnostic) |
 
-### Write Tools (5)
+### Write Tools
 
 | Tool | Description |
 |------|-------------|
@@ -226,8 +274,19 @@ For direct file manipulation:
 | Tool | Description |
 |------|-------------|
 | `sync_l0_index` | Manually rebuild L0 index from L1 files (supports `dry_run`) |
-| `validate_knowledge` | Health check: L0↔L1 consistency, file quality, duplicates |
+| `validate_knowledge` | Health check: L0↔L1 consistency, file quality, duplicates, plus rot score and governance (state-marker) summary |
 | `manage_l0_entry` | Add / remove / replace individual L0 entries |
+
+### Governance & Cleanup Tools
+
+| Tool | Description |
+|------|-------------|
+| `audit_rot_tool` | Read-only rot audit: health score (0-100), oversized files, garbled headings, stale sections, cross-file duplicates, catch-all promotion candidates |
+| `reconcile_knowledge_tool` | Embedding-based cross-file duplicate and split-candidate scan |
+| `plan_knowledge_cleanup_tool` | Read-only cleanup plan: `safe_auto_fixes` / `needs_user_decision` / `must_not_auto_fix` |
+| `apply_safe_knowledge_cleanup_tool` | Applies only safe mechanical actions from the plan (`migrate_legacy_backups`, `sync_l0_index`, `reindex_vector_store`, `create_todo_from_marker`); `dry_run=True` by default |
+
+These tools are additive. Existing tools keep their parameters and response fields. `validate_knowledge` and the post-write governance report only gain extra keys, for example a per-finding `action`.
 
 ## MCP Resources
 
@@ -272,6 +331,26 @@ Agent calls inject_knowledge(domain="infra", section="Proxy", content="...")
 ```
 
 This eliminates the "write-but-invisible" problem where agents write L1 files but the L0 index (injected into every turn) doesn't update, causing future sessions to ignore the new knowledge.
+
+### Durable Knowledge vs. Process State
+
+L1 is for **durable knowledge**, meaning the rules and facts that hold now. Unfinished work ("TODO: wire up X", "待拍板") and narratives of how something got fixed are **process state**, and they go stale fast. After a write, and in `validate_knowledge`, governance scans L1 for state markers and classifies each marker line:
+
+| Action | Meaning |
+|--------|---------|
+| `move_to_todo` | Open work. It belongs in the TODO store (`add_todo` / `list_todos`), not in L1 |
+| `rewrite_as_current_rule` | Resolved history ("has been fixed", "已修复"). Rewrite it as the rule that now holds |
+| `keep_with_reason` | The section has an explicit `<keep-reason label>: <reason>` line, so its markers are intentional |
+
+Detection is deterministic (regex and string matching, with no model calls) and advisory. The marker vocabulary is data and is configured through `governance:` in config.yaml, so other languages and house styles can be added without code changes.
+
+### Derived Data: L0 Index and Vectors
+
+The L1 markdown files are the source of truth. The L0 index and the vector store (`data/vectors.db`) are **derived** from them and can be rebuilt at any time (`sync_l0_index`, `reindex_vector_store_tool`). The text that gets embedded uses a noise-stripped heading: `## Release process 2026-10-01 (v3.2)` is embedded as `Release process`, so periodic entries cluster by topic rather than by date. Displayed headings and stored metadata keep the original text. After upgrading, you can reindex so that existing vectors pick up the cleaner headings.
+
+### Safe Cleanup Boundary
+
+Automatic cleanup is limited to mechanical, reversible, or idempotent actions: moving legacy `*.md.bak` files out of `knowledge/` into `data/backups/knowledge/`, rebuilding derived L0 and vector data, and *copying* an open marker into the TODO store (with a deterministic id, so re-applying does nothing). Anything semantic is outside the safe boundary and is always left to the user or agent: deleting facts, merging conflicting sections, moving content across domains, rewriting history as a rule, or removing the source line after a TODO is created. `apply_safe_knowledge_cleanup_tool` rejects these actions by name.
 
 ### Relevance Scoring
 
@@ -437,34 +516,13 @@ python -m layered_memory_mcp.server
 
 ## Changelog
 
-### v0.6.0 — Agent-Agnostic L0, BM25, Namespaces
+See [CHANGELOG.md](CHANGELOG.md) for the full release history. Recent highlights (currently in `Unreleased`):
 
-- **`get_l0_index` tool** — Any MCP agent can now retrieve the L0 index, not just Hermes
-- **BM25/TF-IDF search mode** — Better relevance scoring for long-form knowledge files (use `search_mode: "bm25"`)
-- **Multi-agent namespace isolation** — Set `LAYERED_MEMORY_NAMESPACE` to isolate per-agent knowledge with shared fallback
-- **`.bak` backup** — Automatic backup before every file modification via `inject_knowledge` or `update_knowledge_file`
-- **L0 staleness check** — `recall_knowledge` detects stale L0 index and warns with `l0_staleness_warning`
-- **Multi-language docs** — Japanese and Korean READMEs synced to v0.6.0
-
-### v0.5.0 — Smart Injection & Auto-Sync
-
-- **`inject_knowledge` tool** — Primary write path with dedup, section targeting, auto L0 sync
-- **`sync_l0_index` tool** — Manual L0 index rebuild with dry_run preview
-- **`validate_knowledge` tool** — L0↔L1 consistency check, health diagnostics
-- **`manage_l0_entry` tool** — Fine-grained L0 entry add/remove/replace
-- **Auto L0 sync** — All write tools (create/update/delete/inject) automatically sync L0 index
-- **Dedup engine** — SequenceMatcher-based similarity detection with configurable threshold
-- **File locking** — fcntl.flock for concurrent write safety
-- **Knowledge watcher** — File changes trigger debounced L0 sync (HTTP mode)
-- **`cognitive_decision_prompt`** — Built-in decision framework prompt
-
-### v0.4.0 — Initial Release
-
-- 4-tier knowledge architecture (L0/L1/L2/L3)
-- Keyword search with relevance scoring
-- Session scanning and compression
-- MCP protocol support (stdio + HTTP)
-- Zero external dependencies (core engine)
+- Lifecycle governance with structured actions (`move_to_todo` / `rewrite_as_current_rule` / `keep_with_reason`) and configurable marker lists
+- `plan_knowledge_cleanup_tool` and `apply_safe_knowledge_cleanup_tool` (read-only planning, plus dry-run-first application of safe actions)
+- Knowledge backups moved out of the live knowledge directory into `data/backups/knowledge/`
+- Noise-stripped headings in embedded vector text
+- Glob-based catch-all scans (`promotion.watch_patterns`) with English and Chinese defaults
 
 ## License
 

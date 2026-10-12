@@ -42,6 +42,7 @@ from .injector import inject_knowledge, sync_to_vector_store, remove_from_vector
 from .promotion import scan_split_candidates, scan_cross_domain_duplicates
 from .backups import backup_knowledge_file
 from .governance import post_write_governance, build_validation_extras
+from .cleanup import plan_knowledge_cleanup, apply_safe_knowledge_cleanup
 from .agent_integrator import (
     detect_agent_type,
     is_soul_injected,
@@ -1100,6 +1101,77 @@ async def reconcile_knowledge_tool(
         return out
 
     result = await asyncio.to_thread(_run)
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def plan_knowledge_cleanup_tool(max_items: int = 50) -> str:
+    """Plan knowledge-base cleanup — read-only, never mutates.
+
+    Sorts every lifecycle problem it can detect deterministically into three
+    buckets:
+      - safe_auto_fixes: mechanical actions you can hand straight to
+        apply_safe_knowledge_cleanup_tool — move legacy knowledge/*.md.bak
+        out of tree, re-sync a drifted L0 index, reindex an under-populated
+        vector store, copy open state markers (TODO / 待拍板 / next step…)
+        into the TODO store. None of them deletes or rewrites L1 text.
+      - needs_user_decision: resolved history to rewrite as the current rule,
+        same-skeleton heading families to merge, oversized files, marker lines
+        that cannot become a TODO as-is.
+      - must_not_auto_fix: markers kept on purpose (the section has a
+        "状态保留原因：…" / "State retention reason: …" line).
+
+    No embeddings, no LLM calls. For embedding-based checks (cross-file
+    duplicates, split candidates) use reconcile_knowledge_tool.
+
+    Args:
+        max_items: cap per bucket (totals are always reported in summary).
+
+    Returns:
+        JSON: {read_only, summary, safe_auto_fixes, needs_user_decision,
+        must_not_auto_fix, policy, see_also, how_to_apply}.
+    """
+    config = _get_config()
+    result = await asyncio.to_thread(plan_knowledge_cleanup, config, max(1, int(max_items)))
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def apply_safe_knowledge_cleanup_tool(actions: list, dry_run: bool = True) -> str:
+    """Apply safe, mechanical cleanup actions from plan_knowledge_cleanup_tool.
+
+    DEFAULTS TO A DRY RUN. Only these actions are accepted; anything else is
+    rejected, never guessed:
+      - migrate_legacy_backups: move knowledge/**/*.md.bak under
+        <home>/data/backups/knowledge (verified copy, then remove the sibling).
+      - sync_l0_index: regenerate the L0 index from the L1 files.
+      - reindex_vector_store: rebuild vectors.db from the files (skipped when
+        coverage is already complete unless {"force": true}).
+      - create_todo_from_marker: copy one open state-marker line into the TODO
+        store. Needs file + line + line_hash from the plan; a stale line is
+        skipped. The TODO id is derived from the line, so re-applying is a
+        no-op. The source L1 line is ALWAYS left in place (remove_source is
+        rejected).
+
+    Args:
+        actions: list of action objects, e.g. items copied from the plan's
+            safe_auto_fixes.
+        dry_run: True (default) reports what would happen and writes nothing.
+
+    Returns:
+        JSON: {dry_run, applied, would_apply, skipped, rejected, errors, summary}.
+    """
+    config = _get_config()
+    result = await asyncio.to_thread(
+        apply_safe_knowledge_cleanup, config, actions, dry_run, _get_todo_store
+    )
+    if not dry_run and any(a.get("action") == "reindex_vector_store" for a in result["applied"]):
+        # Refresh the live singleton store's cache (if one was ever opened).
+        try:
+            if _v2_stores:
+                _v2_stores["vector"]._invalidate_cache()
+        except Exception:
+            pass
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 

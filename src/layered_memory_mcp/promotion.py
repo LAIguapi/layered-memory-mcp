@@ -27,6 +27,7 @@ write.
 
 from __future__ import annotations
 
+import fnmatch
 import logging
 import re
 from pathlib import Path
@@ -61,10 +62,36 @@ def _is_noise_token(token: str) -> bool:
     return bool(_NOISE_TOKEN_RE.match(token))
 
 
+def is_watched_domain(
+    config: "MemoryConfig", domain: str, include_patterns: bool = True
+) -> bool:
+    """Is ``domain`` a catch-all the promotion detector should look at?
+
+    ``promotion_watch_domains`` are exact names. With ``include_patterns``,
+    ``promotion_watch_patterns`` (case-insensitive globs such as ``notes`` or
+    ``misc-*``) count too. The patterns are meant for pull/maintenance scans;
+    the write-path ride-along passes ``include_patterns=False`` so a broad
+    default never adds embedding work to ordinary writes.
+    """
+    dom = (domain or "").removesuffix(".md")
+    if not dom:
+        return False
+    if dom in (getattr(config, "promotion_watch_domains", ["misc"]) or []):
+        return True
+    if not include_patterns:
+        return False
+    low = dom.lower()
+    return any(
+        fnmatch.fnmatchcase(low, str(pat).lower())
+        for pat in (getattr(config, "promotion_watch_patterns", None) or [])
+    )
+
+
 def detect_promotion_candidate(
     config: "MemoryConfig",
     domain: str,
     filepath: Path,
+    include_patterns: bool = False,
 ) -> dict | None:
     """Detect whether a watched file has a same-topic cluster worth promoting.
 
@@ -94,9 +121,8 @@ def detect_promotion_candidate(
             return None
 
         # --- Gate 1: only scan watched catch-all domains (zero-cost skip) ---
-        watch = getattr(config, "promotion_watch_domains", ["misc"]) or []
         domain_clean = domain.removesuffix(".md") if domain else domain
-        if domain_clean not in watch:
+        if not is_watched_domain(config, domain_clean, include_patterns):
             return None
 
         path = Path(filepath)
@@ -305,10 +331,10 @@ def scan_split_candidates(
         config: MemoryConfig.
         domains: optional explicit list of domains to scan (filenames without
             .md). None → scan every .md across all knowledge dirs.
-        ignore_watch_gate: when True (default) do NOT restrict to
-            ``promotion_watch_domains`` — the whole point of the active tool is
-            to look everywhere. When False, honor the watch list (parity with
-            the passive detector).
+        ignore_watch_gate: when True (default) do NOT restrict to the watch
+            list — the whole point of the active tool is to look everywhere.
+            When False, honor ``promotion_watch_domains`` plus
+            ``promotion_watch_patterns``.
         min_sections: override ``promotion_min_sections`` for this scan.
         min_cluster_size: override ``promotion_min_cluster_size`` for this scan.
 
@@ -320,7 +346,6 @@ def scan_split_candidates(
     """
     result: dict = {"success": True, "candidates": [], "scanned": 0}
     try:
-        watch = getattr(config, "promotion_watch_domains", ["misc"]) or []
         want_min_sections = (
             min_sections if min_sections is not None
             else getattr(config, "promotion_min_sections", 4)
@@ -342,7 +367,7 @@ def scan_split_candidates(
                 dom = fp.name.removesuffix(".md")
                 if domains is not None and dom not in domains:
                     continue
-                if not ignore_watch_gate and dom not in watch:
+                if not ignore_watch_gate and not is_watched_domain(config, dom):
                     continue
                 if dom in seen:
                     continue

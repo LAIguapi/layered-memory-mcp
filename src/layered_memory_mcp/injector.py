@@ -1149,8 +1149,9 @@ def _check_dedup(
 def _section_body_from_hit(text: str) -> str:
     """Extract the section body from a vector-store 'text' field.
 
-    Vectors are stored as "section\\nbody" (see sync_to_vector_store._make_entry
-    which builds f"{section}\\n{body}"). Recall returns that text (possibly
+    Vectors are stored as "heading\\nbody", where heading is the
+    noise-stripped ``embedding_heading`` (see sync_to_vector_store). Before
+    that, rebuilds stored the heading twice. Recall returns that text (possibly
     truncated to 200 chars). We split off the first line (the section heading
     echo) and return the rest. For the authoritative full body the caller should
     re-read the file; this is the best-effort inline copy.
@@ -1828,13 +1829,16 @@ def sync_to_vector_store(
         db_path = Path(data_dir) / "vectors.db"
         vector_store = VectorStore(db_path)
 
-        def _make_entry(section: str, body: str) -> "KnowledgeEntry":
+        def _make_entry(section: str, body: str, embed_heading: str) -> "KnowledgeEntry":
+            # VectorStore.add embeds f"{summary}\n{content}", so the heading
+            # goes in exactly once, via summary. metadata["section"] keeps the
+            # original heading for display and lookups.
             return KnowledgeEntry(
                 id=str(uuid.uuid4()),
                 domain=domain,
                 section=section,
                 content=body,
-                summary=section,
+                summary=embed_heading,
                 type=KnowledgeType.FACT,
                 confidence=0.9,
                 review_status=ReviewStatus.APPROVED,
@@ -1852,7 +1856,13 @@ def sync_to_vector_store(
 
             # Parse "## section\n body" blocks; skip the file-level "# title"
             # header and blockquote intro (they carry no recall value).
+            # The embedded heading is noise-stripped (embedding_heading): dates
+            # and versions in "## Release 2026-10-01" otherwise pull vectors
+            # toward each other by date rather than topic.
+            from .heading import embedding_heading
+
             added = 0
+            used_texts: set[str] = set()
             parts = re.split(r"\n(?=## )", content)
             for part in parts:
                 m = re.match(r"^##\s+(.+?)\n(.*)", part.strip(), re.DOTALL)
@@ -1862,7 +1872,16 @@ def sync_to_vector_store(
                 body = m.group(2).strip()
                 if not body:
                     continue
-                vector_store.add(_make_entry(section, f"{section}\n{body}"))
+                # KnowledgeEntry.summary is capped at 200 chars.
+                embed_heading = embedding_heading(section)[:200]
+                # VectorStore.add skips an exact (domain, text) duplicate. Two
+                # same-skeleton sections with identical bodies would collapse
+                # into one vector and look like a permanent section gap to
+                # vector_store_needs_reindex, so fall back to the original.
+                if f"{embed_heading}\n{body}" in used_texts:
+                    embed_heading = section[:200]
+                used_texts.add(f"{embed_heading}\n{body}")
+                vector_store.add(_make_entry(section, body, embed_heading))
                 added += 1
 
             logger.debug("Rebuilt vector store domain=%s sections=%d", domain, added)

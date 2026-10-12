@@ -49,3 +49,23 @@ def heading_skeleton(heading: str) -> str:
 
 # Backwards-compatible alias for the previous private name.
 _heading_skeleton = heading_skeleton
+
+
+def embedding_heading(heading: str) -> str:
+    """The heading as it should be *embedded*: same topic, minus temporal noise.
+
+    Strips exactly what ``heading_skeleton`` strips (dates, versions, issue
+    numbers, parenthesised notes) but keeps word boundaries and case, because
+    the embedder tokenises "Release process" far better than the skeleton's
+    "releaseprocess". When the skeleton is empty — the heading was nothing but
+    a date — the original is returned unchanged, so no section ever embeds an
+    empty heading. Display text and metadata keep the original heading; this
+    is only for the derived vector text.
+    """
+    if not heading or not heading_skeleton(heading):
+        return heading or ""
+    text = HEADING_NOISE_RE.sub(" ", heading)
+    # Separators left dangling by a removed qualifier ("Deploy — 2026-10-01").
+    text = re.sub(r"\s*[-–—:：|/·,，、]+\s*$", "", text.strip())
+    text = re.sub(r"^\s*[-–—:：|/·,，、]+\s*", "", text)
+    return re.sub(r"\s+", " ", text).strip() or heading

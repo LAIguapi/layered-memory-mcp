@@ -302,6 +302,35 @@ def _load_consolidate_from_yaml(home: Path) -> dict:
     return section if isinstance(section, dict) else {}
 
 
+def _load_yaml_section(home: Path, key: str) -> dict:
+    """Read one top-level mapping from ``<home>/config.yaml`` ({} if absent).
+
+    Never raises: a broken config.yaml must not crash server start-up.
+    """
+    path = home / "config.yaml"
+    if not path.exists():
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = yaml.safe_load(fh)
+    except (OSError, yaml.YAMLError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    section = data.get(key)
+    return section if isinstance(section, dict) else {}
+
+
+# Catch-all file names a new user is likely to pile unsorted notes into. Glob
+# patterns, matched case-insensitively against the domain (filename minus .md).
+# Used by the maintenance-time split scans; see ``promotion.is_watched_domain``.
+DEFAULT_PROMOTION_WATCH_PATTERNS = [
+    "misc", "misc-*", "misc_*", "general", "other", "others", "tmp", "temp",
+    "notes", "inbox", "scratch", "unsorted", "uncategorized",
+    "杂项", "杂记", "其他", "其它", "临时", "笔记", "收件箱", "未分类",
+]
+
+
 def _coerce_str_list(value: object) -> list[str]:
     """Coerce a YAML scalar or list into a clean list of strings."""
     if value is None:
@@ -368,6 +397,12 @@ class MemoryConfig:
         hermes_db_path: str | None = None,
         session_exclude_markers: list[str] | None = None,
         session_exclude_sources: list[str] | None = None,
+        # Unreleased — maintenance-time split-scan patterns + governance rules
+        promotion_watch_patterns: list[str] | None = None,
+        governance_open_markers: list[str] | None = None,
+        governance_resolved_markers: list[str] | None = None,
+        governance_keep_reason_labels: list[str] | None = None,
+        governance_disabled_markers: list[str] | None = None,
     ):
         self.home = Path(home) if home else default_home()
         self.knowledge_dir = Path(knowledge_dir) if knowledge_dir else default_knowledge_dir(self.home)
@@ -513,11 +548,32 @@ class MemoryConfig:
             else _env_bool("LAYERED_MEMORY_PROMOTION_ENABLED", True)
         )
         # Only these catch-all domains are scanned (avoids false positives on
-        # legitimately-dense specialised files). Default: only "misc".
+        # legitimately-dense specialised files). Exact names; these are also
+        # the only domains the write-path ride-along embeds. Default: "misc".
+        # Precedence: constructor → env → config.yaml `promotion:` → default.
+        _promo_yaml = _load_yaml_section(self.home, "promotion")
         self.promotion_watch_domains: list[str] = (
             promotion_watch_domains if promotion_watch_domains is not None
-            else _env_list("LAYERED_MEMORY_PROMOTION_WATCH_DOMAINS", ["misc"])
+            else _env_list(
+                "LAYERED_MEMORY_PROMOTION_WATCH_DOMAINS",
+                _coerce_str_list(_promo_yaml.get("watch_domains")) or ["misc"],
+            )
         )
+        # Glob patterns for the maintenance-time scans (audit_rot, cleanup
+        # planning). A new user rarely has a file literally named misc.md, so
+        # an exact-name-only default left split detection dead; the default
+        # covers common catch-all names in English and Chinese. Set to [] to
+        # restrict the scans to promotion_watch_domains.
+        if promotion_watch_patterns is not None:
+            self.promotion_watch_patterns: list[str] = _coerce_str_list(promotion_watch_patterns)
+        elif os.environ.get("LAYERED_MEMORY_PROMOTION_WATCH_PATTERNS") is not None:
+            self.promotion_watch_patterns = _coerce_str_list(
+                os.environ["LAYERED_MEMORY_PROMOTION_WATCH_PATTERNS"]
+            )
+        elif "watch_patterns" in _promo_yaml:
+            self.promotion_watch_patterns = _coerce_str_list(_promo_yaml.get("watch_patterns"))
+        else:
+            self.promotion_watch_patterns = list(DEFAULT_PROMOTION_WATCH_PATTERNS)
         # Files with fewer sections than this are never scanned.
         self.promotion_min_sections: int = (
             promotion_min_sections if promotion_min_sections is not None
@@ -670,6 +726,26 @@ class MemoryConfig:
             )
         except (TypeError, ValueError):
             self.maintenance_initial_delay = 60.0
+
+        # Lifecycle governance marker rules (governance.py). Each list EXTENDS
+        # the shipped defaults (Chinese + English); `disabled_markers` removes
+        # defaults that are noise for this knowledge base. Precedence:
+        # constructor → `governance:` section of config.yaml → none.
+        _gov_yaml = _load_yaml_section(self.home, "governance")
+
+        def _gov(arg: list[str] | None, key: str) -> list[str]:
+            return _coerce_str_list(arg if arg is not None else _gov_yaml.get(key))
+
+        self.governance_open_markers: list[str] = _gov(governance_open_markers, "open_markers")
+        self.governance_resolved_markers: list[str] = _gov(
+            governance_resolved_markers, "resolved_markers"
+        )
+        self.governance_keep_reason_labels: list[str] = _gov(
+            governance_keep_reason_labels, "keep_reason_labels"
+        )
+        self.governance_disabled_markers: list[str] = _gov(
+            governance_disabled_markers, "disabled_markers"
+        )
 
         # v2.10.1: Domain classification table for the auto-extractor. The
         # framework ships **no** business presets — domain inference is opt-in.

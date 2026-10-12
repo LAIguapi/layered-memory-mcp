@@ -5,6 +5,73 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Lifecycle governance for L1 knowledge.** Durable knowledge and process
+  state are now told apart. After a write and in `validate_knowledge`, state
+  markers (TODO / FIXME / next step / pending / 待办 / 下一步 / 待拍板 / 待验证 /
+  尚未接入 / 未落地 …) are detected and each marker line gets one structured
+  suggested action: `move_to_todo` (open work belongs in the TODO store),
+  `rewrite_as_current_rule` (resolved history such as "has been fixed" /
+  "已修复"), or `keep_with_reason` (the section has an explicit
+  `State retention reason:` / `状态保留原因：` line). Detection is
+  deterministic, advisory, and makes no model calls. The post-write report
+  also flags same-topic heading families and oversized files.
+- **Configurable marker vocabulary.** A new `governance:` section in
+  `<LAYERED_MEMORY_HOME>/config.yaml` accepts `open_markers`,
+  `resolved_markers`, `keep_reason_labels`, and `disabled_markers`. The shipped
+  Chinese and English defaults are extended by user lists, and individual
+  defaults can be turned off. No code changes are needed to support another
+  language or house style.
+- **`plan_knowledge_cleanup_tool(max_items=50)`.** A read-only planner that
+  sorts every deterministic finding into `safe_auto_fixes`,
+  `needs_user_decision`, and `must_not_auto_fix`, with a policy block that
+  states which actions are never automatic.
+- **`apply_safe_knowledge_cleanup_tool(actions, dry_run=True)`.** Applies only
+  mechanical actions from the plan: `migrate_legacy_backups`, `sync_l0_index`,
+  `reindex_vector_store`, and `create_todo_from_marker`. It defaults to a dry
+  run. Semantic changes (deleting facts, merging sections, cross-domain moves,
+  rewriting history as a rule, removing the source line of a migrated TODO)
+  are rejected by name and left to the user or agent. TODO ids are derived from
+  the source line, so applying the same plan twice is a no-op.
+- **`promotion.watch_patterns` / `LAYERED_MEMORY_PROMOTION_WATCH_PATTERNS`.**
+  Case-insensitive glob patterns for catch-all files, used by the
+  maintenance, audit, and cleanup scans. The shipped defaults cover common
+  English and Chinese names (`misc`, `misc-*`, `general`, `other`, `notes`,
+  `inbox`, `scratch`, `unsorted`, `杂项`, `其它`, `未分类`, …), so a new
+  knowledge base no longer needs a file literally named `misc.md` to get
+  split/promotion suggestions. Set it to `[]` to turn pattern matching off.
+- `validate_knowledge` now includes `rot_summary`, `rot_health_score`, and
+  `governance_summary`. Each degrades to an `*_error` key instead of failing
+  validation.
+
+### Changed
+
+- **Backups moved out of the live knowledge directory.** Whole-file rewrites
+  no longer drop `<file>.md.bak` next to the live file. A single rolling
+  backup per file is kept under `<LAYERED_MEMORY_HOME>/data/backups/knowledge/`
+  (relative paths preserved). Existing in-tree `*.md.bak` files are reported
+  by the cleanup planner and can be moved with the `migrate_legacy_backups`
+  safe action.
+- **Vector text uses a noise-stripped heading.** The embedded text now uses
+  `embedding_heading()`, which removes dates, versions, issue numbers, and
+  parenthesised qualifiers, so periodic entries cluster by topic instead of by
+  date. The heading also appears once in the embedded text instead of twice.
+  Displayed headings and `metadata["section"]` keep the original text.
+  Vectors are derived data: run `reindex_vector_store_tool` to rebuild
+  existing vectors with the new heading text.
+- Exact `promotion_watch_domains` matching is unchanged and is still the only
+  gate on the write path. The broader patterns apply only to pull-style
+  maintenance and audit scans, so ordinary writes do no extra embedding work.
+
+### Compatibility
+
+- All new tools, config keys, and response fields are additive. Existing tool
+  signatures are unchanged, and the legacy `suggested_action` field is still
+  emitted on open-marker findings alongside the new `action`.
+
 ## [3.4.6] - 2026-10-07
 
 ### Fixed

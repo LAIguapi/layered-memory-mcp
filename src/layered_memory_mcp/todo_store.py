@@ -68,6 +68,11 @@ class TodoStore:
                  entry.cancelled_at.isoformat() if entry.cancelled_at else None))
         return {"success": True, "id": entry.id}
 
+    def exists(self, todo_id: str) -> bool:
+        with sqlite3.connect(str(self.db_path)) as conn:
+            row = conn.execute("SELECT 1 FROM todos WHERE id=? LIMIT 1", (todo_id,)).fetchone()
+        return row is not None
+
     def list(self, status=None, domain=None, priority=None, limit=50) -> list:
         where = ["1=1"]
         params = []

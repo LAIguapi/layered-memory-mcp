@@ -42,8 +42,12 @@ AI Agent 具有**有限的记忆**——通常每轮对话只有 2-4KB 的持久
 - **Agent 无关 L0 访问** — `get_l0_index` 工具让任何 MCP agent 都能获取记忆索引
 - **多 Agent 命名空间** — 通过 `LAYERED_MEMORY_NAMESPACE` 隔离不同 agent 的知识，同时共享公共知识
 - **会话扫描** — 从最近的 agent 会话中提取知识候选项
-- **健康验证** — 检查 L0↔L1 一致性、文件结构、知识质量
-- **写入安全** — 每次修改文件前自动创建 `.bak` 备份
+- **健康验证** — 检查 L0↔L1 一致性、文件结构、知识质量，并附带腐化（rot）与治理摘要
+- **生命周期治理** — 识别混在长期知识里的过程状态（TODO / FIXME / next step / pending / 待办 / 下一步 / 待拍板 / 待验证 / 尚未接入 / 未落地 …），给出结构化建议动作：`move_to_todo`、`rewrite_as_current_rule`、`keep_with_reason`；标记词表可配置
+- **清理规划** — 只读规划器把问题分为"可安全自动修复"、"需要用户决定"、"禁止自动修复"三类；另一个工具只执行安全动作，且默认 dry-run
+- **写入安全** — 整文件改写时的备份存放在知识目录之外（`<LAYERED_MEMORY_HOME>/data/backups/knowledge/`），活动知识目录里只有活动文件
+- **更干净的向量召回** — 写入向量的标题会去掉日期、版本号、期号等噪声；展示用标题和元数据保持原样
+- **可配置的杂项文件扫描** — 维护/审计扫描按 glob 模式识别"杂项"类文件（`misc`、`notes`、`inbox`、`scratch`、`杂项`、`其它` …），不再要求必须有 `misc.md`
 - **空间分析** — 监控内存使用情况，获取优化建议
 - **Agent 无关** — 适用于任何 MCP 兼容的 agent（Hermes、Claude、Cursor 等）
 - **零依赖** — 核心引擎仅使用 Python 标准库；仅需 `fastmcp` 用于 MCP 传输
@@ -121,6 +125,26 @@ layered-memory-mcp --verbose
 | `LAYERED_MEMORY_DEDUP_THRESHOLD` | 去重相似度阈值（0.0-1.0） | `0.7` |
 | `LAYERED_MEMORY_L0_FORMAT` | L0 索引格式：`hermes` 或 `generic` | `hermes` |
 | `LAYERED_MEMORY_NAMESPACE` | Agent 命名空间，用于多 Agent 隔离 | `shared` |
+| `LAYERED_MEMORY_PROMOTION_WATCH_PATTERNS` | 维护扫描使用的杂项文件 glob 模式（逗号分隔） | 内置中英文列表 |
+
+### config.yaml
+
+大部分行为也可以在 `<LAYERED_MEMORY_HOME>/config.yaml` 里配置。优先级为：构造参数 → 环境变量 → config.yaml → 内置默认值。与知识治理相关的两个段落：
+
+```yaml
+governance:
+  # 以下列表都是在内置中英文默认值基础上"追加"
+  open_markers: ["WIP", "follow-up"]          # 未完成的过程状态 → move_to_todo
+  resolved_markers: ["shipped"]                # 已解决的历史记录 → rewrite_as_current_rule
+  keep_reason_labels: ["Retention note"]       # 章节中有 "<标签>: <原因>" 行时保留其标记
+  disabled_markers: ["TBD"]                    # 关闭对你来说是噪声的默认标记
+
+promotion:
+  watch_domains: ["misc"]                      # 精确匹配的杂项文件名（写入时也会检查）
+  watch_patterns: ["misc", "misc-*", "notes", "inbox", "scratch", "杂项"]  # 不区分大小写的 glob，仅用于维护/审计扫描
+```
+
+不写某个键就保持默认。如果设置了 `watch_patterns`，你的列表会替换内置模式列表；设为 `[]` 可关闭模式匹配。
 
 ## 使用方法
 
@@ -159,10 +183,33 @@ Agent: "数据库连接字符串是什么？"
 
 ```
 → validate_knowledge()
-← 检查 L0↔L1 一致性、孤立文件、过期条目、文件健康度
+← 检查 L0↔L1 一致性、孤立文件、过期条目、文件健康度，
+  并附加 rot_summary / rot_health_score 与 governance_summary
+  （L1 中发现的状态标记，按生命周期动作分组）
 ```
 
-### 4. 会话压缩（定时任务）
+### 4. 规划并执行清理
+
+清理流程把机械修复和语义修改分开处理：
+
+```
+1. plan_knowledge_cleanup_tool(max_items=50)
+   ← 只读 JSON，分三类：
+     safe_auto_fixes      把遗留的 *.md.bak 移出 knowledge/、重新同步 L0、
+                          重建向量库、把未完成标记复制到 TODO
+     needs_user_decision  改写已解决的历史、合并同主题标题族、拆分过大文件……
+     must_not_auto_fix    带有保留原因行、有意保留的标记
+
+2. apply_safe_knowledge_cleanup_tool(actions=<safe_auto_fixes 中的条目>)
+   ← 默认 dry-run：只报告将会发生什么，不写入任何内容
+
+3. apply_safe_knowledge_cleanup_tool(actions=..., dry_run=False)
+   ← 只执行四种安全动作，其他动作一律拒绝
+```
+
+执行工具从不删除或改写 L1 文本。把标记转成 TODO 时，原始行保持不动。合并、改写、删除、跨领域移动交给用户或 agent，通过常规写入工具完成。基于向量的检查（跨文件重复、拆分候选）请使用 `reconcile_knowledge_tool`。
+
+### 5. 会话压缩（定时任务）
 
 设置每日定时任务，从对话中提取新知识：
 
@@ -173,7 +220,7 @@ Agent: "数据库连接字符串是什么？"
 4. L0 索引 → 始终保持最新
 ```
 
-### 5. 基础 CRUD（同样可用）
+### 6. 基础 CRUD（同样可用）
 
 直接文件操作：
 
@@ -210,8 +257,19 @@ Agent: "数据库连接字符串是什么？"
 | 工具 | 说明 |
 |------|------|
 | `sync_l0_index` | 手动从 L1 文件重建 L0 索引（支持 `dry_run` 预览） |
-| `validate_knowledge` | 健康检查：L0↔L1 一致性、文件质量、重复检测 |
+| `validate_knowledge` | 健康检查：L0↔L1 一致性、文件质量、重复检测，并附带 rot 评分与治理（状态标记）摘要 |
 | `manage_l0_entry` | 单条 L0 条目的增删改 |
+
+### 治理与清理工具
+
+| 工具 | 说明 |
+|------|------|
+| `audit_rot_tool` | 只读腐化审计：健康分（0-100）、过大文件、损坏标题、过期章节、跨文件重复、杂项文件拆分候选 |
+| `reconcile_knowledge_tool` | 基于向量的跨文件重复与拆分候选扫描 |
+| `plan_knowledge_cleanup_tool` | 只读清理计划：`safe_auto_fixes` / `needs_user_decision` / `must_not_auto_fix` |
+| `apply_safe_knowledge_cleanup_tool` | 只执行计划中的安全机械动作（`migrate_legacy_backups`、`sync_l0_index`、`reindex_vector_store`、`create_todo_from_marker`），默认 `dry_run=True` |
+
+这些工具都是新增的。已有工具的参数和返回字段保持不变；`validate_knowledge` 和写入后的治理报告只是多了字段（例如每条发现的 `action`）。
 
 ## MCP 资源
 
@@ -256,6 +314,26 @@ Agent 调用 inject_knowledge(domain="infra", section="Proxy", content="...")
 ```
 
 这彻底消除了"写但不可见"的问题——Agent 写入 L1 文件后 L0 索引不更新，导致未来会话忽略新知识。
+
+### 长期知识 vs. 过程状态
+
+L1 用来存放**长期知识**，也就是当前成立的规则和事实。未完成的工作（"TODO: 接入 X"、"待拍板"）和"某问题是怎么修好的"这类叙述属于**过程状态**，很快就会过时。写入后以及 `validate_knowledge` 时，治理模块会扫描 L1 中的状态标记，并对每个标记行做分类：
+
+| 动作 | 含义 |
+|------|------|
+| `move_to_todo` | 未完成的工作，应放进 TODO 存储（`add_todo` / `list_todos`），而不是 L1 |
+| `rewrite_as_current_rule` | 已解决的历史（"已修复"、"has been fixed"），应改写为当前成立的规则 |
+| `keep_with_reason` | 章节里有明确的 `<保留原因标签>：<原因>` 行，说明这些标记是有意保留的 |
+
+检测是确定性的（正则和字符串匹配，不调用模型），结果只作为建议。标记词表是数据，通过 config.yaml 的 `governance:` 段配置，扩展其他语言或团队风格不需要改代码。
+
+### 派生数据：L0 索引与向量
+
+L1 markdown 文件是唯一的事实来源。L0 索引和向量库（`data/vectors.db`）都是从这些文件**派生**出来的，随时可以重建（`sync_l0_index`、`reindex_vector_store_tool`）。写入向量的文本使用去噪后的标题：`## Release process 2026-10-01 (v3.2)` 会以 `Release process` 嵌入，这样周期性条目按主题而不是日期聚类。展示用标题和存储的元数据仍保留原文。升级后可以重建索引，让已有向量也用上更干净的标题。
+
+### 安全清理边界
+
+自动清理只做机械的、可逆或幂等的动作：把遗留的 `*.md.bak` 从 `knowledge/` 移到 `data/backups/knowledge/`，重建派生的 L0 和向量数据，以及把未完成标记*复制*到 TODO 存储（使用确定性 id，重复执行不会产生新条目）。任何语义层面的修改都在安全边界之外，始终交给用户或 agent 决定：删除事实、合并冲突章节、跨领域移动内容、把历史改写成规则、创建 TODO 后删除原始行。`apply_safe_knowledge_cleanup_tool` 会按名称拒绝这些动作。
 
 ### 相关性评分
 
@@ -421,34 +499,13 @@ python -m layered_memory_mcp.server
 
 ## 更新日志
 
-### v0.6.0 — Agent 无关 L0、BM25 搜索、命名空间
+完整版本历史见 [CHANGELOG.md](CHANGELOG.md)。近期要点（目前位于 `Unreleased`）：
 
-- **`get_l0_index` 工具** — 任何 MCP agent 均可获取 L0 索引，不再限于 Hermes
-- **BM25/TF-IDF 搜索模式** — 长文档相关性评分更准确（使用 `search_mode: "bm25"`）
-- **多 Agent 命名空间隔离** — 设置 `LAYERED_MEMORY_NAMESPACE` 隔离知识，支持共享区回退
-- **`.bak` 备份** — `inject_knowledge` 或 `update_knowledge_file` 修改前自动备份
-- **L0 过期检测** — `recall_knowledge` 检测 L0 是否过期并返回 `l0_staleness_warning`
-- **多语言文档** — 日文、韩文 README 同步至 v0.6.0
-
-### v0.5.0 — 智能注入与自动同步
-
-- **`inject_knowledge` 工具** — 首选写入路径：去重、分段定位、L0 自动同步
-- **`sync_l0_index` 工具** — 手动 L0 索引重建，支持 dry_run 预览
-- **`validate_knowledge` 工具** — L0↔L1 一致性检查、健康诊断
-- **`manage_l0_entry` 工具** — L0 条目精细化管理（增删改）
-- **L0 自动同步** — 所有写入工具（create/update/delete/inject）自动同步 L0 索引
-- **去重引擎** — 基于 SequenceMatcher 的相似度检测，阈值可配置
-- **文件锁** — fcntl.flock 并发写入安全
-- **知识监控器** — 文件变化触发 L0 同步（HTTP 模式）
-- **`cognitive_decision_prompt`** — 内置决策框架提示
-
-### v0.4.0 — 初始版本
-
-- 四层知识架构（L0/L1/L2/L3）
-- 关键词搜索与相关性评分
-- 会话扫描与压缩
-- MCP 协议支持（stdio + HTTP）
-- 核心引擎零外部依赖
+- 生命周期治理：结构化建议动作（`move_to_todo` / `rewrite_as_current_rule` / `keep_with_reason`），标记词表可配置
+- `plan_knowledge_cleanup_tool` 与 `apply_safe_knowledge_cleanup_tool`：只读规划，安全动作先 dry-run 再执行
+- 知识备份移出活动知识目录，统一放在 `data/backups/knowledge/`
+- 向量文本中的标题去除日期/版本等噪声
+- 基于 glob 的杂项文件扫描（`promotion.watch_patterns`），内置中英文默认值
 
 ## 许可证
 
