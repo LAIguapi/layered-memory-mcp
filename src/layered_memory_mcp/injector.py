@@ -1215,7 +1215,7 @@ def _inject_knowledge_core(
     Args:
         config: MemoryConfig instance.
         domain: Target L1 file (with or without .md), e.g. "infra" or "infra.md".
-        section: Target ## heading in the file, e.g. "WSL 代理".
+        section: Target ## heading in the file, e.g. "HTTP proxy".
                  If the section doesn't exist, it will be created.
         content: Knowledge content to inject (markdown text).
         mode: "upsert" (replace if similar exists), "append" (always add),
@@ -1509,25 +1509,16 @@ def _inject_knowledge_core(
     # faithful section-level mirror of the file — which is exactly what the new
     # semantic dedup recall reads back. The old default-mode add() left a growing
     # pile of coarse per-write vectors that diluted section-level recall.
-    try:
-        current_text = filepath.read_text(encoding="utf-8")
-    except OSError:
-        current_text = None
-    if current_text is not None:
-        vector_result = sync_to_vector_store(
-            data_dir=data_dir,
-            domain=domain_clean,
-            content=current_text,
-            summary=_summarize_for_l0(content),
-            replace_domain=True,
-        )
-    else:
-        vector_result = sync_to_vector_store(
-            data_dir=data_dir,
-            domain=domain_clean,
-            content=content.strip(),
-            summary=_summarize_for_l0(content),
-        )
+    # The sync reads the current file after its database snapshot. A failed
+    # read must preserve old vectors and report failure, never append a coarse
+    # vector built from the possibly stale original request.
+    vector_result = sync_to_vector_store(
+        data_dir=data_dir,
+        domain=domain_clean,
+        content=content,
+        replace_domain=True,
+        source_path=filepath,
+    )
 
     is_new_file = write_action == "created"
 
@@ -2107,12 +2098,8 @@ def _execute_write(
     except Exception as e:
         logger.error("File lock/write error for %s: %s", filename, e)
         result = {"success": False, "error": str(e)}
-    finally:
-        # Clean up lock file
-        try:
-            lock_path.unlink(missing_ok=True)
-        except Exception:
-            pass
+    # Keep the lock inode: a waiting process may already hold it after release.
+    # Unlinking would let the next writer create a different, unlocked inode.
 
     return result
 
@@ -2439,12 +2426,63 @@ def _summarize_for_l0(content: str, max_chars: int = 80) -> str:
     return ""
 
 
+def _bodyful_sections(raw: str) -> list[tuple[str, str]]:
+    """Canonical H2 body projection shared by sync and consistency checks."""
+    norm = raw.replace("\r\n", "\n").replace("\r", "\n")
+    sections = []
+    for part in re.split(r"\n(?=## )", norm):
+        match = re.match(r"^##\s+(.+?)\n(.*)", part.strip(), re.DOTALL)
+        if match and match.group(2).strip():
+            sections.append((match.group(1).strip(), match.group(2).strip()))
+    return sections
+
+
+def _vector_entries(domain: str, raw: str) -> list:
+    """Project Markdown without changing source headings or authored summaries.
+
+    REST's single-entry frontmatter files have their own model contract: their
+    body need not contain an H2. Do not silently discard them during maintenance.
+    Legacy Markdown is projected as one entry per bodyful H2, including repeats.
+    """
+    from .heading import embedding_heading
+    from .models import KnowledgeEntry, SourceInfo, SourceType, ReviewStatus, KnowledgeType
+    from .storage.frontmatter import parse_frontmatter
+
+    meta, _body = parse_frontmatter(raw)
+    if meta and meta.get("id") and meta.get("section"):
+        entry = KnowledgeEntry.from_markdown(raw, domain=domain)
+        entry.domain = domain
+        return [entry] if entry.content.strip() else []
+    return [
+        KnowledgeEntry(
+            domain=domain, section=section, content=body,
+            summary=embedding_heading(section)[:200], type=KnowledgeType.FACT,
+            confidence=0.9, review_status=ReviewStatus.APPROVED,
+            source=SourceInfo(type=SourceType.MANUAL, extracted_by="auto_sync"),
+        )
+        for section, body in _bodyful_sections(raw)
+    ]
+
+
+def _vector_sources(config: "MemoryConfig") -> dict[str, tuple[Path, str]]:
+    """Read authoritative files, first namespace wins; propagate read errors."""
+    sources: dict[str, tuple[Path, str]] = {}
+    for kdir in config.knowledge_dirs:
+        if not kdir.exists():
+            continue
+        for path in sorted(kdir.glob("*.md")):
+            if path.stem not in sources:
+                sources[path.stem] = (path, path.read_text(encoding="utf-8"))
+    return sources
+
+
 def sync_to_vector_store(
     data_dir: str | Path,
     domain: str,
     content: str,
     summary: str = "",
     replace_domain: bool = False,
+    source_path: Path | None = None,
 ) -> dict:
     """Sync a knowledge entry to the vector store for semantic search.
 
@@ -2452,12 +2490,12 @@ def sync_to_vector_store(
     Idempotent — existing entries are updated, new ones are added.
 
     Two modes:
-      - Default (replace_domain=False): add a single entry for ``content``.
-        Used by section-level writes (inject_knowledge), where ``content`` is
-        one section's body.
+      - Default (replace_domain=False): add a standalone entry for ``content``.
+        Retained for callers without a source file. File-backed writers use
+        full-domain replacement and pass ``source_path``.
       - Full rebuild (replace_domain=True): ``content`` is the WHOLE L1 file.
-        Delete every existing vector for ``domain`` then re-add one vector per
-        ``## section``. This keeps vectors.db strictly in sync with the file
+        Atomically replace vectors for ``domain`` with one vector per
+        bodyful ``## section``. This keeps vectors.db in sync with the file
         for whole-file writes (update/create_knowledge_file), instead of
         leaving the previous section vectors behind as orphans.
 
@@ -2467,79 +2505,39 @@ def sync_to_vector_store(
         content: Section body (default mode) or full file text (rebuild mode)
         summary: One-line summary for indexing
         replace_domain: When True, rebuild the whole domain from ``content``.
+        source_path: Read the current file after taking the database snapshot,
+            and validate it before publication. File-backed callers must pass
+            this so a delayed sync cannot publish an older caller snapshot.
 
     Returns:
         dict with success status
     """
+    vector_store = None
     try:
         from .storage.vector_store import VectorStore
         from .models import KnowledgeEntry, SourceInfo, SourceType, ReviewStatus, KnowledgeType
-        import re
-        import sqlite3
         import uuid
 
         db_path = Path(data_dir) / "vectors.db"
         vector_store = VectorStore(db_path)
 
-        def _make_entry(section: str, body: str, embed_heading: str) -> "KnowledgeEntry":
-            # VectorStore.add embeds f"{summary}\n{content}", so the heading
-            # goes in exactly once, via summary. metadata["section"] keeps the
-            # original heading for display and lookups.
-            return KnowledgeEntry(
-                id=str(uuid.uuid4()),
-                domain=domain,
-                section=section,
-                content=body,
-                summary=embed_heading,
-                type=KnowledgeType.FACT,
-                confidence=0.9,
-                review_status=ReviewStatus.APPROVED,
-                source=SourceInfo(type=SourceType.MANUAL, extracted_by="auto_sync"),
-            )
-
         if replace_domain:
-            # Whole-file write: rebuild the domain section-by-section so the
-            # vector store mirrors the file exactly (no leftover orphans).
-            if db_path.exists():
-                with sqlite3.connect(db_path) as conn:
-                    conn.execute("DELETE FROM vectors WHERE domain = ?", (domain,))
-                    conn.commit()
-                vector_store._invalidate_cache()
+            expected = vector_store.snapshot()
+            if source_path is not None:
+                content = Path(source_path).read_text(encoding="utf-8")
+            entries = _vector_entries(domain, content)
 
-            # Parse "## section\n body" blocks; skip the file-level "# title"
-            # header and blockquote intro (they carry no recall value).
-            # The embedded heading is noise-stripped (embedding_heading): dates
-            # and versions in "## Release 2026-10-01" otherwise pull vectors
-            # toward each other by date rather than topic.
-            from .heading import embedding_heading
+            def validate_source():
+                if source_path is not None and Path(source_path).read_text(encoding="utf-8") != content:
+                    raise RuntimeError("source changed during vector preparation; retry required")
 
-            added = 0
-            used_texts: set[str] = set()
-            parts = re.split(r"\n(?=## )", content)
-            for part in parts:
-                m = re.match(r"^##\s+(.+?)\n(.*)", part.strip(), re.DOTALL)
-                if not m:
-                    continue
-                section = m.group(1).strip()
-                body = m.group(2).strip()
-                if not body:
-                    continue
-                # KnowledgeEntry.summary is capped at 200 chars.
-                embed_heading = embedding_heading(section)[:200]
-                # VectorStore.add skips an exact (domain, text) duplicate. Two
-                # same-skeleton sections with identical bodies would collapse
-                # into one vector and look like a permanent section gap to
-                # vector_store_needs_reindex, so fall back to the original.
-                if f"{embed_heading}\n{body}" in used_texts:
-                    embed_heading = section[:200]
-                used_texts.add(f"{embed_heading}\n{body}")
-                vector_store.add(_make_entry(section, body, embed_heading))
-                added += 1
-
+            vector_store.replace_entries(
+                entries, domains=[domain], expected=expected, validate_source=validate_source,
+            )
+            added = len(entries)
             logger.debug("Rebuilt vector store domain=%s sections=%d", domain, added)
             return {"success": True, "action": "vector_rebuilt", "domain": domain, "sections": added}
 
-        text = (summary + "\n" + content).strip() if summary else content.strip()
         entry = KnowledgeEntry(
             id=str(uuid.uuid4()),
             domain=domain,
@@ -2557,6 +2555,9 @@ def sync_to_vector_store(
     except Exception as e:
         logger.warning("Vector store sync failed (non-critical): %s", e)
         return {"success": False, "error": str(e)}
+    finally:
+        if vector_store is not None:
+            vector_store.close()
 
 
 def remove_from_vector_store(
@@ -2607,11 +2608,8 @@ def reindex_vector_store(
 
     Args:
         config: MemoryConfig (knowledge dirs + data dir).
-        drop_existing: when True (default) wipe vectors.db first so the rebuild
-            is authoritative (no orphaned vectors from deleted sections/files).
-            The per-domain replace_domain rebuild already clears each domain it
-            touches; the global wipe additionally reaps whole domains whose file
-            no longer exists.
+        drop_existing: when True (default) atomically replace the whole corpus,
+            including orphaned domains. When False, replace only source domains.
         calibrate: when True (default) also self-calibrate the semantic
             thresholds from the freshly-rebuilt corpus (Task 4). The result is
             attached under ``calibration`` and cached for the write path.
@@ -2630,48 +2628,26 @@ def reindex_vector_store(
         "errors": [],
     }
 
+    store = None
     try:
         data_dir.mkdir(parents=True, exist_ok=True)
-        if drop_existing and db_path.exists():
-            import sqlite3
-            with sqlite3.connect(db_path) as conn:
-                conn.execute("DELETE FROM vectors")
-                conn.commit()
-            # Reset the singleton store's cache if one is already live.
-            try:
-                from .storage.vector_store import VectorStore
-                VectorStore(db_path)._invalidate_cache()
-            except Exception:
-                pass
+        from .storage.vector_store import VectorStore
 
-        seen_domains: set[str] = set()
-        for kdir in config.knowledge_dirs:
-            if not kdir.exists():
-                continue
-            for fp in sorted(kdir.glob("*.md")):
-                domain = fp.name.removesuffix(".md")
-                # A domain can exist in namespace + shared; only rebuild once.
-                # First file wins (namespace dir is listed first).
-                if domain in seen_domains:
-                    continue
-                seen_domains.add(domain)
-                try:
-                    text = fp.read_text(encoding="utf-8")
-                except OSError as e:
-                    result["errors"].append(f"{fp.name}: {e}")
-                    continue
-                sync = sync_to_vector_store(
-                    data_dir=data_dir,
-                    domain=domain,
-                    content=text,
-                    replace_domain=True,
-                )
-                result["files"] += 1
-                if sync.get("success"):
-                    result["domains"] += 1
-                    result["sections"] += int(sync.get("sections", 0) or 0)
-                else:
-                    result["errors"].append(f"{fp.name}: {sync.get('error')}")
+        store = VectorStore(db_path)
+        expected = store.snapshot()
+        sources = _vector_sources(config)
+        entries = [entry for domain, (_path, text) in sources.items()
+                   for entry in _vector_entries(domain, text)]
+
+        def validate_source():
+            if _vector_sources(config) != sources:
+                raise RuntimeError("knowledge changed during reindex; retry required")
+
+        store.replace_entries(
+            entries, domains=None if drop_existing else list(sources),
+            expected=expected, validate_source=validate_source,
+        )
+        result.update(domains=len(sources), files=len(sources), sections=len(entries))
 
         # v3.1.1: self-calibrate thresholds from the freshly-rebuilt corpus.
         if calibrate:
@@ -2685,77 +2661,51 @@ def reindex_vector_store(
             "Reindexed vector store: %d domains, %d sections from %d files",
             result["domains"], result["sections"], result["files"],
         )
-        if result["errors"]:
-            result["success"] = len(result["errors"]) < result["files"]
         return result
     except Exception as e:
         logger.error("Vector reindex failed: %s", e)
-        return {"success": False, "error": str(e), **result}
+        return {**result, "success": False, "error": str(e), "errors": [str(e)]}
+    finally:
+        if store is not None:
+            store.close()
 
 
 def vector_store_needs_reindex(config: "MemoryConfig") -> bool:
-    """Heuristic: does vectors.db look under-populated vs the .md files?
+    """Compare the exact derived projection, without embedding or DB writes.
 
-    Used to decide whether to trigger a first-run/post-update rebuild. Returns
-    True when there are markdown files but the vector store is empty, covers
-    fewer DOMAINS than exist on disk, OR (v3.1.1) is missing SECTIONS within a
-    covered domain — the section-level gap that a silently-failed vector sync
-    leaves behind (file has the section, vectors.db doesn't → dedup can't recall
-    it → duplicate re-appends). Cheap: counts markdown ## headings and compares
-    to per-domain vector counts; no embedding.
+    Empty H2 domains require no rows. Compare section identity, text and
+    multiplicity so equal-sized stale sets and orphans cannot look healthy.
+    Inspection failures propagate: callers must report unknown/error, not
+    silently convert an unreadable store or source into a healthy result.
     """
-    try:
-        import sqlite3
-        from .storage.vector_store import VectorStore
-        data_dir = config.home / "data"
-        db_path = data_dir / "vectors.db"
+    import sqlite3
+    from collections import Counter
+    from contextlib import closing
+    from .storage.vector_store import entry_embedding_text
+    from .storage.frontmatter import parse_frontmatter
 
-        # Count markdown domains AND their section headings (bodyful sections
-        # only — the rebuild skips empty-body sections, so we must too or we'd
-        # report a false gap).
-        md_domains: set[str] = set()
-        md_section_counts: dict[str, int] = {}
-        seen: set[str] = set()
-        for kdir in config.knowledge_dirs:
-            if not kdir.exists():
-                continue
-            for fp in kdir.glob("*.md"):
-                dom = fp.name.removesuffix(".md")
-                md_domains.add(dom)
-                if dom in seen:
-                    continue  # first file (namespace) wins, mirrors rebuild
-                seen.add(dom)
-                try:
-                    raw = fp.read_text(encoding="utf-8")
-                except OSError:
-                    continue
-                md_section_counts[dom] = _count_bodyful_sections(raw)
-        if not md_domains:
-            return False
-        if not db_path.exists():
-            return True
-
-        stats = VectorStore(db_path).stats()
-        indexed_domains = set(stats.get("domains", {}).keys())
-        # Domain-level coverage gap.
-        if not md_domains.issubset(indexed_domains):
-            return True
-
-        # Section-level coverage gap: a domain has more bodyful sections on disk
-        # than vectors in the store → historical sync missed some sections.
-        per_domain_vectors = stats.get("domains", {})
-        for dom, want in md_section_counts.items():
-            have = int(per_domain_vectors.get(dom, 0) or 0)
-            if want > have:
-                logger.debug(
-                    "needs_reindex: domain %s has %d sections but %d vectors",
-                    dom, want, have,
-                )
-                return True
-        return False
-    except Exception as e:
-        logger.debug("needs_reindex check failed: %s", e)
-        return False
+    expected = Counter()
+    stable_id_domains = set()
+    for domain, (_path, raw) in _vector_sources(config).items():
+        meta, _body = parse_frontmatter(raw)
+        stable_id = bool(meta and meta.get("id") and meta.get("section"))
+        if stable_id:
+            stable_id_domains.add(domain)
+        expected.update(
+            (domain, entry.id if stable_id else None, entry.section, entry_embedding_text(entry))
+            for entry in _vector_entries(domain, raw)
+        )
+    db_path = config.home / "data" / "vectors.db"
+    if not db_path.exists():
+        return bool(expected)
+    with closing(sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)) as conn:
+        rows = conn.execute("SELECT id, domain, text, metadata FROM vectors").fetchall()
+    # Only frontmatter IDs are authoritative. Legacy H2 entries receive new
+    # derived IDs on each rebuild and must not create a permanent false alarm.
+    actual = Counter((domain, entry_id if domain in stable_id_domains else None,
+                      json.loads(metadata)["section"], text)
+                     for entry_id, domain, text, metadata in rows)
+    return actual != expected
 
 
 def _count_bodyful_sections(raw: str) -> int:
@@ -2765,14 +2715,4 @@ def _count_bodyful_sections(raw: str) -> int:
     empty, so the reindex-need check must count the same way to avoid a false
     "missing section" positive.
     """
-    import re as _re
-    norm = raw.replace("\r\n", "\n").replace("\r", "\n")
-    parts = _re.split(r"\n(?=## )", norm)
-    count = 0
-    for part in parts:
-        m = _re.match(r"^##\s+(.+?)\n(.*)", part.strip(), _re.DOTALL)
-        if not m:
-            continue
-        if m.group(2).strip():
-            count += 1
-    return count
+    return len(_bodyful_sections(raw))

@@ -28,7 +28,7 @@ def _mk_config(tmp_path):
 def test_append_skips_exact_intra_section_duplicate(tmp_path):
     """Writing the same content twice in append mode must not duplicate it."""
     cfg = _mk_config(tmp_path)
-    line = "WSL 代理走 127.0.0.1:8080，cron 任务需显式 export。"
+    line = "HTTP proxy uses 127.0.0.1:8080; scheduled tasks must set it explicitly."
 
     r1 = injector.inject_knowledge(cfg, "infra", "网络", line, mode="append")
     assert r1["success"]

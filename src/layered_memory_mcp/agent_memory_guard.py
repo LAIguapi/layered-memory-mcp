@@ -4,16 +4,12 @@ WHY THIS MODULE EXISTS
 ----------------------
 ``MemoryConfig.detect_agent_memory_path()`` probes absolute, user-level
 locations (``~/.hermes/memories/MEMORY.md``, ``~/.claude/CLAUDE.md``, ...) and
-deliberately ignores ``LAYERED_MEMORY_HOME`` — in production the L1 store and
-the agent's native memory file genuinely are separate things.
+deliberately ignores ``LAYERED_MEMORY_HOME`` because the L1 store and the
+agent's native memory file are separate things.
 
-The side effect is that *any* ambiguous config picks up a real production
-memory file. A throwaway sanity script built on a bare ``MemoryConfig(home=
-tmpdir)`` called ``inject_knowledge(dry_run=False)``, the ride-along
-``auto_maintain_after_write`` auto-detected ``~/.hermes/memories/MEMORY.md``,
-and one ``[L0] misc: ...`` pointer landed in a live agent's memory. Nothing in
-that chain was a bug on its own; the hazard is the *silent* promotion of an
-auto-detected path to a write target.
+The safety risk is that an ambiguous config can silently promote an
+auto-detected path to a write target. This module makes that promotion
+explicit and reportable.
 
 THE RULE
 --------

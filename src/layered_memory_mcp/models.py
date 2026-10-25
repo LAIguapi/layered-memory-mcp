@@ -243,6 +243,10 @@ class KnowledgeEntry(BaseModel):
             "review_status": ReviewStatus(meta.get("review_status", "approved")),
             "reviewed_by": meta.get("reviewed_by"),
         }
+        # A frontmatter entry keeps its identity through update and reindex.
+        # Generating a new ID here leaves the previous vector behind on update.
+        if meta.get("id"):
+            kwargs["id"] = meta["id"]
 
         # Handle datetime fields
         for dt_field in ("created_at", "updated_at", "reviewed_at"):

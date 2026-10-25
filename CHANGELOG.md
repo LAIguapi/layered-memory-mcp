@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.5.1] - 2026-10-25
+
+- Require an explicit proxy configuration for embedding-model bootstrap. The
+  library no longer probes arbitrary local ports or infers the operator's
+  network topology.
+- Compare the exact Markdown-derived vector projection, including section text,
+  identity, duplicate multiplicity and orphans. Empty H2 domains no longer cause
+  perpetual reindex requests; inspection errors no longer look healthy.
+- Prepare domain/corpus replacements before atomic publication. Preserve old
+  vectors on failure, reject concurrent stale snapshots, reread file-backed sync
+  sources, and refresh long-lived reader caches after other connections commit.
+- Repair vector drift through the existing HTTP MCP maintenance loop, with
+  persistent rate limiting, failure backoff and overlap protection.
+- Normalize embedding headings on entry-based writes while preserving authored
+  summaries and original section metadata. Preserve frontmatter IDs on reload.
+- Reject stale standalone adds after concurrent reindex; include persistent
+  frontmatter IDs in consistency checks and replace old REST domain identities.
+- Report file-write/vector-sync partial failures, retain shared writer lock
+  inodes, and explicitly close vector cache observers and transient connections.
+- Return persistence-specific candidate groups from session extraction, retaining
+  the legacy entries list and keeping all classification suggestion-only.
+
 ## [3.5.0] - 2026-10-12
 
 ### Added
@@ -340,9 +362,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   changelog fills with its resolved JSONL path.
 - **Test isolation covers `Path.open`.** `pathlib.Path.open` calls `io.open`
   directly, so it never went through the `builtins.open` backstop in
-  `conftest.py` — every `path.write_text(...)` in the framework, which is how
-  all memory and L1 writes are actually performed, bypassed the production-path
-  guard. Both are patched now.
+  `conftest.py`. Both write paths are guarded now.
 - **`inject_knowledge` annotates, it does not redirect.** Every result now
   carries a `routing` block, and a write the router would have sent elsewhere
   also carries `routing_warning`. Existing fields, actions and handshakes are
@@ -789,7 +809,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   singleton that this suite has long assigned to directly and reset by hand; a
   test raising before its own cleanup left its tmp config behind for every later
   test. An autouse fixture now snapshots and restores it, the same way the
-  production-path guard already covers files.
+  host-path guard already covers files.
 
 ### Changed
 
@@ -831,7 +851,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Refreshing the files does not reload a running host: a *logic* change still
   needs the host to restart, while a version bump alone does not.
-- Test isolation hardened with this change: the production-path guard now also
+- Test isolation hardened with this change: the host-path guard now also
   blocks writes to ``~/.hermes/plugins`` and ``~/.hermes/config.yaml`` (the two
   places a guard deploy/enable can reach), and resolves the real home at import
   time so fixture ordering cannot defeat it.
@@ -951,12 +971,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Test suite no longer writes to production memory.** `detect_agent_memory_path()`
-  resolved `~/.hermes/memories/MEMORY.md` through `Path.home()`, ignoring
-  `LAYERED_MEMORY_HOME`, so tests exercising the dual-write path appended junk
-  `[L0]` pointers to a live MEMORY.md. `tests/conftest.py` now redirects every
-  resolution route (L1 home, agent memory path, HOME/USERPROFILE) and wraps
-  `open` to turn any write into the real memory dirs into a loud failure.
+- **Test isolation no longer permits writes outside the sandbox.**
+  `tests/conftest.py` redirects every resolution route (L1 home, agent memory
+  path, HOME/USERPROFILE) and wraps both standard write paths with a guard.
 
 ## [3.2.1] - 2026-09-30
 

@@ -73,7 +73,7 @@ class TestQueryAnalysis:
         assert _looks_like_identifier("kebab-case") is True
         assert _looks_like_identifier("dot.path.access") is True
         assert _looks_like_identifier("how to configure proxy") is False
-        assert _looks_like_identifier("WSL 代理") is False
+        assert _looks_like_identifier("HTTP proxy") is False
 
     def test_exact_terms(self):
         assert _looks_like_exact_term("/path/to/file") is True
@@ -98,7 +98,7 @@ class TestQueryAnalysis:
 
     def test_resolve_alpha_auto_natural_language(self):
         # Natural language → semantic heavy
-        assert resolve_alpha("how to configure WSL proxy") > 0.5
+        assert resolve_alpha("how to configure an HTTP proxy") > 0.5
         assert resolve_alpha("网络配置问题") > 0.5
 
 
@@ -136,7 +136,7 @@ class TestApplyQueryBoost:
         scores = {"a.md": 1.0, "b.md": 0.8}
         file_keywords = {"a.md": ["proxy", "wsl", "network"], "b.md": ["docker", "container"]}
 
-        boosted = apply_query_boost(scores, "WSL proxy config", file_keywords, boost=1.3)
+        boosted = apply_query_boost(scores, "HTTP proxy config", file_keywords, boost=1.3)
 
         # a.md has matching keywords → boosted
         assert boosted["a.md"] > 1.0
@@ -146,7 +146,7 @@ class TestApplyQueryBoost:
     def test_no_overlap(self):
         scores = {"a.md": 1.0}
         file_keywords = {"a.md": ["docker"]}
-        boosted = apply_query_boost(scores, "WSL proxy", file_keywords)
+        boosted = apply_query_boost(scores, "HTTP proxy", file_keywords)
         assert boosted["a.md"] == pytest.approx(1.0)
 
 

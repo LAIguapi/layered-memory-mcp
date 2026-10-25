@@ -1,17 +1,15 @@
-"""Global test isolation — keeps the suite from ever touching production data.
+"""Global test isolation — keeps the suite from ever touching host data.
 
 WHY THIS FILE EXISTS
 --------------------
 `MemoryConfig.detect_agent_memory_path()` resolves the agent memory file by
 probing absolute, user-level locations (``Path.home()/".hermes"/...``). Those
-probes deliberately ignore ``LAYERED_MEMORY_HOME``, because in production the
-L1 store and the agent's own memory file are genuinely separate things.
+probes deliberately ignore ``LAYERED_MEMORY_HOME``, because the L1 store and
+the agent's own memory file are separate things.
 
-The side effect: a test that set only ``LAYERED_MEMORY_HOME`` still resolved
-the *real* ``~/.hermes/memories/MEMORY.md``, so any test exercising the
-dual-write path wrote test fixtures straight into production memory. That is
-exactly how 20 junk ``[L0]`` pointers (``svc_a``, ``new-file``, ``test``,
-eight duplicate ``misc`` entries, ...) ended up in a live MEMORY.md.
+The side effect: a test that set only ``LAYERED_MEMORY_HOME`` could still
+resolve a host-managed memory path, so a test exercising the dual-write path
+could escape the sandbox. The fixtures below close that escape hatch.
 
 The autouse fixture below closes every escape hatch at once, so isolation is
 the default and no future test has to remember to opt in.
@@ -23,11 +21,11 @@ import os
 
 import pytest
 
-# The developer's real home, captured at import time — before any fixture
-# redirects HOME — so the production-path guard cannot be fooled by ordering.
+# The host home, captured at import time — before any fixture redirects HOME —
+# so the host-path guard cannot be fooled by ordering.
 _REAL_HOME = os.path.expanduser("~")
 
-# Every env var that can steer a write at production data.
+# Every env var that can steer a write at host-managed data.
 _REDIRECTED_ENV_VARS = (
     "LAYERED_MEMORY_HOME",
     "LAYERED_MEMORY_AGENT_MEMORY_PATH",
@@ -57,7 +55,7 @@ def _isolate_memory_home(tmp_path, monkeypatch):
     # 1. L1 store
     monkeypatch.setenv("LAYERED_MEMORY_HOME", str(sandbox / "layered-memory"))
 
-    # 2. Agent memory file — the route that caused the production leak.
+    # 2. Agent memory file — a route that must remain inside the sandbox.
     fake_home = sandbox / "home"
     (fake_home / ".hermes" / "memories").mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv(
@@ -70,13 +68,13 @@ def _isolate_memory_home(tmp_path, monkeypatch):
     monkeypatch.setenv("USERPROFILE", str(fake_home))  # Windows equivalent
 
     # Vector models are read-only large artifacts, not writable test data.
-    # Keep the production cache visible after HOME is redirected so vector tests
+    # Keep an existing model cache visible after HOME is redirected so vector tests
     # do not try to bootstrap-download the embedding model in offline CI/dev.
     real_model_dir = os.path.join(_REAL_HOME, ".layered-memory", "models")
     if os.path.exists(real_model_dir):
         monkeypatch.setenv("LAYERED_MEMORY_MODEL_DIR", real_model_dir)
 
-    # Drop inherited overrides so a developer's shell env can't leak in and
+    # Drop inherited overrides so the caller's shell env can't leak in and
     # re-point a write at real data.
     for var in _REDIRECTED_ENV_VARS:
         if var in ("LAYERED_MEMORY_HOME", "LAYERED_MEMORY_AGENT_MEMORY_PATH"):
@@ -87,17 +85,17 @@ def _isolate_memory_home(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _guard_production_paths(monkeypatch):
-    """Hard stop: make writes to the real memory dirs raise instead of land.
+def _guard_host_paths(monkeypatch):
+    """Hard stop: make writes to host-managed memory dirs raise instead of land.
 
-    Defence in depth. If a code path ever hardcodes an absolute production
-    path (bypassing both config and env), this converts a silent production
+    Defence in depth. If a code path ever hardcodes an absolute host-managed
+    path (bypassing both config and env), this converts a silent host-data
     write into a loud test failure.
 
     The plugin directory and the host config are on the list too: the write
     guard can deploy into ``~/.hermes/plugins`` and ``hermes plugins enable``
     rewrites ``config.yaml``, so a test that forgot to redirect ``HOME`` would
-    otherwise be able to reconfigure the developer's own host.
+    otherwise be able to reconfigure the caller's own host.
 
     ``pathlib.Path.open`` is patched alongside ``builtins.open`` because it does
     **not** go through it: ``Path.open`` calls ``io.open`` directly, so every
@@ -130,7 +128,7 @@ def _guard_production_paths(monkeypatch):
             if target.startswith(bad):
                 raise AssertionError(
                     "TEST ISOLATION VIOLATION: attempted write to "
-                    f"production path {target!r}. Use the sandbox from "
+                    f"host-managed path {target!r}. Use the sandbox from "
                     "the _isolate_memory_home fixture instead."
                 )
 
@@ -154,8 +152,8 @@ def _isolate_server_config():
     ``layered_memory_mcp.server._config`` is a lazily-built singleton, and this
     suite has a long-standing habit of assigning to it directly and setting it
     back to ``None`` by hand. A test that raises before its own cleanup then
-    leaks its tmp config into every later test — the same class of leak that
-    once wrote test fixtures into production memory. Restoring it centrally
+    leaks its tmp config into every later test — the same class of cross-test
+    leak that can write fixtures outside the sandbox. Restoring it centrally
     makes isolation the default instead of something every test must remember.
     """
     from layered_memory_mcp import server

@@ -20,7 +20,7 @@
 # Example (customize for your own use case):
 
 # infra:
-#   - "WSL"
+#   - "network"
 #   - "proxy"
 #   - "server"
 #   - "docker"

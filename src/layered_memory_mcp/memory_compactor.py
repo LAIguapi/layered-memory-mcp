@@ -2127,7 +2127,7 @@ def _suggest_migration(entry: str, domain_rules: list[tuple[str, list[str]]] | N
     tag_inner = tag.strip("[]")
 
     # Special case: L0 tag entries already have a domain tag — use it directly
-    # e.g. "[L0] infra: WSL代理…" → domain=infra
+    # e.g. "[L0] infra: network…" → domain=infra
     l0_match = _get_l0_pattern(config).match(entry)
     if l0_match:
         rest = entry[l0_match.end():]

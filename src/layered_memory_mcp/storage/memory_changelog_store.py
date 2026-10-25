@@ -79,7 +79,7 @@ class MemoryChangelogStore:
         far below the stream buffer, so it reaches the file as a single
         ``O_APPEND`` write and concurrent appenders cannot interleave. Going
         through ``builtins.open`` (rather than ``os.write``) also keeps this
-        path inside the test-suite's production-path guard.
+        path inside the test-suite's host-path guard.
         """
         try:
             # json.dumps escapes embedded newlines, so one event is always

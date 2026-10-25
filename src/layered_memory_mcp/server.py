@@ -782,12 +782,13 @@ async def create_knowledge_file(filename: str, content: str) -> str:
         # v2.2.0 + v2.9.3: rebuild the domain's vectors from the whole file so
         # vectors.db mirrors the file (one vector per ## section).
         domain = filename.removesuffix(".md")
-        await asyncio.to_thread(
+        vector_result = await asyncio.to_thread(
             sync_to_vector_store,
             data_dir=config.home / "data",
             domain=domain,
             content=content,
             replace_domain=True,
+            source_path=filepath,
         )
 
         # v2.9.3: dual-write completion — write the new domain's L0 pointer into
@@ -816,7 +817,10 @@ async def create_knowledge_file(filename: str, content: str) -> str:
             "file": filename,
             "size_bytes": len(content.encode("utf-8")),
             "l0_synced": sync_report is not None,
+            "vector_sync_ok": bool(vector_result.get("success")),
         }
+        if not result["vector_sync_ok"]:
+            result["vector_sync_error"] = vector_result.get("error")
         if sync_report:
             result["l0_sync"] = sync_report
         if dual_write:
@@ -888,12 +892,13 @@ async def update_knowledge_file(filename: str, content: str) -> str:
         # v2.2.0 + v2.9.3: rebuild the domain's vectors from the whole file so
         # vectors.db mirrors the file (no leftover section orphans).
         domain = filename.removesuffix(".md")
-        await asyncio.to_thread(
+        vector_result = await asyncio.to_thread(
             sync_to_vector_store,
             data_dir=config.home / "data",
             domain=domain,
             content=content,
             replace_domain=True,
+            source_path=filepath,
         )
 
         # v2.9.3: dual-write completion. Whole-file writes previously bypassed
@@ -927,7 +932,10 @@ async def update_knowledge_file(filename: str, content: str) -> str:
             "old_size": old_size,
             "new_size": new_size,
             "l0_synced": sync_report is not None,
+            "vector_sync_ok": bool(vector_result.get("success")),
         }
+        if not result["vector_sync_ok"]:
+            result["vector_sync_error"] = vector_result.get("error")
         if sync_report:
             result["l0_sync"] = sync_report
         if dual_write:
@@ -1079,7 +1087,7 @@ async def inject_knowledge_tool(
 
     Args:
         domain: Target L1 file (with or without .md), e.g. "infra" or "infra.md".
-        section: Target ## heading in the file, e.g. "WSL 代理".
+        section: Target ## heading in the file, e.g. "HTTP proxy".
                  Created automatically if it doesn't exist.
         content: Knowledge content to inject (markdown text).
         mode: Write mode — "upsert" (default, replace similar), "append" (always add),
@@ -1333,7 +1341,7 @@ async def batch_inject_knowledge_tool(
     Args:
         items: List of knowledge entries, each with keys:
                - domain: Target L1 file (e.g. "infra")
-               - section: Target ## heading (e.g. "WSL 代理")
+               - section: Target ## heading (e.g. "HTTP proxy")
                - content: Knowledge content (markdown text)
         mode: Write mode for ALL items — "upsert" (default), "append", or "merge".
         agent_id: Optional agent identifier for provenance tracking.
@@ -1953,8 +1961,9 @@ async def extract_session_knowledge(
 
     Replaces scan_recent_sessions + manual analysis with automated,
     structured extraction. Reads FULL sessions (no truncation),
-    detects knowledge types, scores confidence, and returns
-    ready-to-inject knowledge entries.
+    detects knowledge types, scores confidence, and returns candidates grouped
+    by persistence surface. Classification never applies a write: agent-owned
+    actions are suggestions, and raw-session candidates remain source evidence.
 
     Args:
         days: Look back N days (default 3).
@@ -1983,8 +1992,14 @@ async def extract_session_knowledge(
         )
         items = extractor.extract_from_sessions(sessions, max_items_per_session=max_items_per_session)
 
-        # Convert to serializable format
+        # Keep the legacy entries list, but make persistence routing explicit.
         entries = []
+        candidates = {key: [] for key in (
+            "l1_candidates", "todo_candidates", "agent_owned_candidates",
+            "raw_session_candidates", "rejected",
+        )}
+        by_surface: dict[str, int] = {}
+        by_ownership: dict[str, int] = {}
         for item in items:
             e = item.entry
             entries.append({
@@ -2003,6 +2018,19 @@ async def extract_session_knowledge(
                 },
                 "tags": e.tags,
             })
+            decision = _classify_memory_item(
+                e.content, config=config, domain=e.domain, section=e.section,
+            )
+            surface = decision.surface.value
+            ownership = decision.ownership.value
+            by_surface[surface] = by_surface.get(surface, 0) + 1
+            by_ownership[ownership] = by_ownership.get(ownership, 0) + 1
+            bucket = {
+                "l1_knowledge": "l1_candidates", "todo": "todo_candidates",
+                "skill": "agent_owned_candidates", "user_profile": "agent_owned_candidates",
+                "agent_other": "agent_owned_candidates", "ephemeral": "raw_session_candidates",
+            }.get(surface, "rejected")
+            candidates[bucket].append({**entries[-1], "routing": decision.to_dict()})
 
         stats = extractor.get_extraction_stats(items)
         return {
@@ -2010,6 +2038,9 @@ async def extract_session_knowledge(
             "sessions_scanned": len(sessions),
             "entries": entries,
             "stats": stats,
+            **candidates,
+            "routing_summary": {"total": len(entries), "by_surface": by_surface,
+                                "by_ownership": by_ownership},
         }
 
     result = await asyncio.to_thread(_extract)

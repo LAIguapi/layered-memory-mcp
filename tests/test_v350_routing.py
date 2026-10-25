@@ -564,14 +564,14 @@ class TestAdvisoryInject:
             "action": "deferred_fusion",
             "needs_fusion": True,
             "expected_hash": "abc123",
-            "fusion": {"hit_section": "WSL 代理", "old_body": "old", "cosine": 0.81},
+            "fusion": {"hit_section": "HTTP proxy", "old_body": "old", "cosine": 0.81},
             "l0_synced": False,
         }
         monkeypatch.setattr(
             injector, "_inject_knowledge_core", lambda **kwargs: dict(canned)
         )
         out = inject_knowledge(
-            config=_cfg(tmp_path), domain="infra", section="WSL 代理", content=SKILL_TEXT
+            config=_cfg(tmp_path), domain="infra", section="HTTP proxy", content=SKILL_TEXT
         )
         for key, value in canned.items():
             assert out[key] == value
@@ -704,7 +704,7 @@ class TestMemoryChangelogSchema:
 
     def test_entry_shape(self):
         entry = build_entry(
-            "l1_section_merged", "infra", section="WSL 代理", reason="fusion write-back"
+            "l1_section_merged", "infra", section="HTTP proxy", reason="fusion write-back"
         )
         assert entry is not None
         payload = entry.to_dict()

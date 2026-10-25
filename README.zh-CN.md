@@ -338,11 +338,11 @@ agent_extensions:
 `inject_knowledge` 是**所有 Agent 的首选写入路径**。一次调用完成去重、分段定位和 L0 索引自动同步。
 
 ```
-Agent 学到: "生产数据库是 prod-db:5432 上的 PostgreSQL 15"
+Agent 学到: "服务数据库位于 database.example.invalid:5432，使用 PostgreSQL 15"
 → inject_knowledge(
     domain="infrastructure",
     section="Database",
-    content="PostgreSQL 15 on prod-db:5432, connection pool: 20 max",
+    content="PostgreSQL 15 on database.example.invalid:5432, connection pool: 20 max",
     mode="upsert"
   )
 ← 创建/更新 infrastructure.md，自动同步 L0 索引
@@ -654,6 +654,34 @@ enforce 模式不会往 L1 之外写任何东西，被拦下的条目只被报�
 
 L1 markdown 文件是唯一的事实来源。L0 索引和向量库（`data/vectors.db`）都是从这些文件**派生**出来的，随时可以重建（`sync_l0_index`、`reindex_vector_store_tool`）。写入向量的文本使用去噪后的标题：`## Release process 2026-10-01 (v3.2)` 会以 `Release process` 嵌入，这样周期性条目按主题而不是日期聚类。展示用标题和存储的元数据仍保留原文。升级后可以重建索引，让已有向量也用上更干净的标题。
 
+长驻 HTTP MCP 服务复用现有周期维护线程，自动检查并修复向量不一致。
+配置沿用 `LAYERED_MEMORY_MAINTENANCE_ENABLED`（默认开启）、
+`LAYERED_MEMORY_MAINTENANCE_TICK`（默认 1800 秒，最低 30 秒）及
+`LAYERED_MEMORY_MAINTENANCE_DELAY`（默认 60 秒）。健康检查不生成嵌入。
+空文件、仅标题文件和空 H2 节不需要向量；检查对比章节身份、文本和重复次数，
+同时发现孤儿向量。文件读取或数据库异常明确报错，不视为健康。
+
+替换向量先全部生成，再用单个 SQLite 事务发布。准备失败或检测到源文件、
+向量表并发变化时，保留原有已提交向量并要求重试。文件写入后的 sync 会重新
+读取当前文件，防止延迟到达的旧快照覆盖新内容。维护状态持久化于
+`data/vector_maintenance.json`，禁止重叠维护，失败按配置周期退避，最长六小时
+（若配置周期更长则沿用该周期）。短驻 stdio 客户端可显式调用
+`reindex_vector_store_tool`；每次普通写入不会附带全库重建。
+REST 的 frontmatter 条目保留 ID、标题元数据和独立摘要的原意；标题去噪只影响嵌入文本。
+一致性检查包含 frontmatter 的持久 ID，不比较 legacy H2 随重建生成的 ID。
+REST create/update 同步当前源文件；同域换成新 ID 时，即使文本相同也会移除旧 ID 向量。
+文件已写入但向量发布失败时，MCP 返回 `vector_sync_ok: false`；REST 返回 HTTP 503，
+明确说明文件已保存并附条目 ID。重新发起 create 前应先回读、修复已保存条目，旧提交向量仍可用。
+
+底层 `VectorStore.add` 也会拒绝 embedding 期间数据库快照已变化的发布；有外部来源的
+调用方可提供 `validate_source`。使用 context manager 或调用 `close()` 回收 cache observer。
+知识写入保留 `.lock` 文件，让等待者与新进程使用同一锁 inode；锁文件不作为知识条目。
+
+`extract_session_knowledge` 保留原有 `entries` 返回值，并新增
+`l1_candidates`、`todo_candidates`、`agent_owned_candidates`、
+`raw_session_candidates`、`rejected` 和 `routing_summary`。各候选附带路由决策，
+仅供审查；即使配置了扩展处理器，提取也不会写入 TODO、skill、profile 或原始会话。
+
 ### 安全清理边界
 
 自动清理只做机械的、可逆或幂等的动作：把遗留的 `*.md.bak` 从 `knowledge/` 移到 `data/backups/knowledge/`，重建派生的 L0 和向量数据，以及把未完成标记*复制*到 TODO 存储（使用确定性 id，重复执行不会产生新条目）。任何语义层面的修改都在安全边界之外，始终交给用户或 agent 决定：删除事实、合并冲突章节、跨领域移动内容、把历史改写成规则、创建 TODO 后删除原始行。`apply_safe_knowledge_cleanup_tool` 会按名称拒绝这些动作。
@@ -827,7 +855,7 @@ python -m layered_memory_mcp.server
 
 ## 更新日志
 
-完整版本历史见 [CHANGELOG.md](CHANGELOG.md)。`3.5.0` 近期要点：
+完整版本历史见 [CHANGELOG.md](CHANGELOG.md)。`3.5.0` 和 `3.5.1` 近期要点：
 
 - 记忆面模型与确定性持久化路由（`classify_memory_item`），默认只给建议
 - `get_memory_surface_capabilities`：当前配置下框架能写哪些面、哪些只能给建议

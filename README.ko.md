@@ -338,11 +338,11 @@ agent_extensions:
 `inject_knowledge` 도구는 모든 에이전트의 **기본 쓰기 경로(primary write path)**입니다. 단일 호출로 중복 제거, 섹션 타겟팅, 자동 L0 색인 동기화를 처리합니다.
 
 ```
-Agent 학습: "프로덕션 DB는 prod-db:5432의 PostgreSQL 15"
+Agent 학습: "서비스 데이터베이스는 database.example.invalid:5432의 PostgreSQL 15"
 → inject_knowledge(
     domain="infrastructure",
     section="Database",
-    content="PostgreSQL 15 on prod-db:5432, connection pool: 20 max",
+    content="PostgreSQL 15 on database.example.invalid:5432, connection pool: 20 max",
     mode="upsert"
   )
 ← infrastructure.md 생성/업데이트, L0 색인 자동 동기화
@@ -826,7 +826,7 @@ python -m layered_memory_mcp.server
 
 ## Changelog
 
-전체 릴리스 이력은 [CHANGELOG.md](CHANGELOG.md)를 참조하세요. `3.5.0`의 주요 내용:
+전체 릴리스 이력은 [CHANGELOG.md](CHANGELOG.md)를 참조하세요. `3.5.0`과 `3.5.1`의 주요 내용:
 
 - 면 모델과 결정론적 지속성 라우터(`classify_memory_item`), 기본값은 조언만
 - `get_memory_surface_capabilities`: 현재 설정에서 프레임워크가 쓸 수 있는 면과 제안만 가능한 면

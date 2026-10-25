@@ -1111,11 +1111,11 @@ class MemoryConfig:
               separator: null                 # override the adapter's separator
 
         With neither ``path`` nor ``allow_auto_detect_write`` set, an
-        auto-detected production memory file is refused as a *write* target
+        auto-detected host-managed memory file is refused as a *write* target
         unless the home is clearly this install's own — see
         ``agent_memory_guard.resolve_write_target`` for the exact rule. That is
         what stops a bare temp config (a test, a sanity script) from silently
-        appending a pointer to a live agent's memory.
+        appending a pointer to an agent's memory.
 
         Precedence throughout: constructor → env → config.yaml → default.
         """

@@ -207,7 +207,7 @@ def test_reindex_rebuilds_from_markdown(tmp_path):
     # Write a multi-section file directly (simulate external/legacy files whose
     # vectors were never synced).
     (kdir / "infra.md").write_text(
-        "# infra\n\n## 代理\n用 clash 分流。\n\n## 网络\nWSL2 端口转发。\n",
+        "# infra\n\n## 代理\nUse an HTTP proxy.\n\n## 网络\nNetwork port forwarding.\n",
         encoding="utf-8",
     )
     (kdir / "misc.md").write_text(
@@ -230,7 +230,7 @@ def test_reindex_rebuilds_from_markdown(tmp_path):
     # And a subsequent semantic search finds the reindexed section.
     from layered_memory_mcp.storage.vector_store import VectorStore
     store = VectorStore(Path(cfg.home) / "data" / "vectors.db")
-    hits = store.search("clash 代理分流", top_n=3, domain="infra")
+    hits = store.search("HTTP proxy routing", top_n=3, domain="infra")
     assert hits and hits[0]["score"] > 0.5
 
 

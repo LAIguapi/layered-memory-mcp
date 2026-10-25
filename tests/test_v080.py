@@ -283,7 +283,7 @@ class TestMemoryCompaction:
         memory_file.write_text(
             "[L0索引] infra: proxy → knowledge/infra.md\n"
             "§\n"
-            "[proxy] 代理配置：走 /etc/proxy.conf，端口 7890，注意 no_proxy 白名单\n",
+            "[proxy] Proxy configuration: use /etc/proxy.conf, port 8080, with a no_proxy allowlist\n",
             encoding="utf-8",
         )
 

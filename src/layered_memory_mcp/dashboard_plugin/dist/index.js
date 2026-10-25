@@ -697,7 +697,7 @@
             h(Input, {
               value: injectSection,
               onChange: e => setInjectSection(e.target.value),
-              placeholder: "e.g., WSL Proxy, API Design",
+              placeholder: "e.g., HTTP Proxy, API Design",
               className: "bg-background border-border text-text-primary mt-1"
             })
           ),

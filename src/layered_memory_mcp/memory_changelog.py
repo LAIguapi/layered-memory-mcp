@@ -177,7 +177,7 @@ class MemoryChangelogEntry(BaseModel):
     #: The entry point that caused the mutation (``inject_knowledge``,
     #: ``sync_l0_index``, …), so an event can be traced back to a call.
     tool: str | None = None
-    #: Structural one-liner ("replaced '## WSL 代理' in infra, 412 bytes").
+    #: Structural one-liner ("replaced '## HTTP proxy' in infra, 412 bytes").
     summary: str = ""
     reason: str = ""
     #: An identifier of the evidence behind the write (e.g. a session id) —

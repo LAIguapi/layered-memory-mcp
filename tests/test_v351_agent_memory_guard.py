@@ -1,11 +1,8 @@
-"""Agent-memory write guard — the incident this file exists to prevent.
+"""Agent-memory write guard — regression coverage for unsafe auto-detection.
 
-An ad-hoc sanity script built a bare ``MemoryConfig(home=<tmpdir>)``, called
-``inject_knowledge`` with ``dry_run=False``, and the ride-along
-``auto_maintain_after_write`` auto-detected the *real* ``~/.hermes/memories/
-MEMORY.md`` and appended an ``[L0] misc: ...`` pointer to a live agent's memory.
-Every individual step behaved as designed; the hazard was that an ambiguous
-config silently promoted an auto-detected path to a write target.
+An ambiguous temporary configuration can cause the ride-along
+``auto_maintain_after_write`` path to promote an auto-detected agent-memory
+file to a write target. The guard keeps that promotion explicit.
 
 These tests pin both halves of the fix (see
 :mod:`layered_memory_mcp.agent_memory_guard`):
@@ -15,9 +12,9 @@ These tests pin both halves of the fix (see
     still succeeds;
   * an explicit target — or an explicit opt-in — still works.
 
-Every path below uses a *fake* production file inside ``tmp_path``. Nothing
-here, in any branch, is allowed to resolve the real ``~/.hermes`` or
-``~/.layered-memory`` (conftest's sandbox fixtures are the backstop).
+Every path below uses a fake external memory file inside ``tmp_path``. Nothing
+here, in any branch, is allowed to resolve host-managed data (conftest's
+sandbox fixtures are the backstop).
 """
 
 from __future__ import annotations
@@ -40,7 +37,7 @@ from layered_memory_mcp.memory_compactor import (
     compact_memory,
 )
 
-#: Content of the fake "production" memory file. Long enough to read as bloat,
+#: Content of the fake external memory file. Long enough to read as bloat,
 #: and carrying a pointer so the reap path has something to match.
 PROD_CONTENT = (
     "[L0] infra: proxy notes → knowledge/infra.md\n"
@@ -59,8 +56,8 @@ def _digest(path: Path) -> str:
 
 @pytest.fixture
 def prod(tmp_path: Path) -> Path:
-    """A fake production memory file, *outside* any config home we build."""
-    target = tmp_path / "fake-prod-home" / ".hermes" / "memories" / "MEMORY.md"
+    """A fake external memory file, outside any config home we build."""
+    target = tmp_path / "external-home" / ".hermes" / "memories" / "MEMORY.md"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(PROD_CONTENT, encoding="utf-8")
     return target
@@ -68,11 +65,10 @@ def prod(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def detect_prod(monkeypatch, prod: Path):
-    """Make auto-detection resolve the fake production file.
+    """Make auto-detection resolve the fake external memory file.
 
     Mirrors the real method's contract: an explicitly configured path still
-    wins, so the opt-in tests below exercise the same precedence production
-    would.
+    wins, so the opt-in tests below exercise the same precedence.
     """
 
     def _detect(self):
@@ -93,7 +89,7 @@ def _bare_config(tmp_path: Path, monkeypatch, **kwargs) -> MemoryConfig:
 
 
 class TestUnsafeAutoDetectIsRefused:
-    """A bare/temp config must never write an auto-detected production file."""
+    """A bare/temp config must never write an auto-detected external file."""
 
     def test_pointer_dual_write_is_refused_and_reported(
         self, tmp_path, monkeypatch, detect_prod
@@ -147,7 +143,7 @@ class TestUnsafeAutoDetectIsRefused:
         assert "[L0] infra:" in detect_prod.read_text(encoding="utf-8")
 
     def test_auto_maintain_skips_and_reports(self, tmp_path, monkeypatch, detect_prod):
-        """The exact chain from the incident, at the maintenance entry point."""
+        """The same unsafe path is reported at the maintenance entry point."""
         cfg = _bare_config(tmp_path, monkeypatch, auto_maintain_interval_days=0.0)
         before = _digest(detect_prod)
 
@@ -194,7 +190,7 @@ class TestUnsafeAutoDetectIsRefused:
     def test_inject_knowledge_writes_l1_and_surfaces_the_refusal(
         self, tmp_path, monkeypatch, detect_prod
     ):
-        """Replay of the incident: the L1 write succeeds, the projection does not."""
+        """The L1 write succeeds while the unsafe projection is refused."""
         cfg = _bare_config(tmp_path, monkeypatch)
         before = _digest(detect_prod)
 
@@ -358,7 +354,7 @@ class TestGuardRules:
         Even when the sandbox home *is* ``default_home()`` (conftest sets
         ``LAYERED_MEMORY_HOME`` for every test), a test run is not an install.
         """
-        home = tmp_path / "pretend-prod"
+        home = tmp_path / "pretend-install"
         home.mkdir(parents=True, exist_ok=True)
         monkeypatch.setattr(config_mod, "default_home", lambda: home)
         cfg = MemoryConfig(home=str(home))
@@ -370,7 +366,7 @@ class TestGuardRules:
 
         By design this cannot be satisfied for real from the test suite — the
         two sentinels patched here are exactly what keeps tests out of
-        production memory — so the branch is pinned with them stubbed.
+        host-managed memory — so the branch is pinned with them stubbed.
         """
         home = tmp_path / "install-home"
         home.mkdir(parents=True, exist_ok=True)

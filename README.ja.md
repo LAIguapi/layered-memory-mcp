@@ -338,11 +338,11 @@ agent_extensions:
 `inject_knowledge`ツールは、すべてのエージェント向けの**プライマリ書き込みパス**です。1回の呼び出しで重複排除、セクションターゲティング、L0インデックスの自動同期を処理します。
 
 ```
-エージェントが学習：「本番DBはPostgreSQL 15 on prod-db:5432」
+エージェントが学習：「サービス用データベースはPostgreSQL 15 on database.example.invalid:5432」
 → inject_knowledge(
     domain="infrastructure",
     section="Database",
-    content="PostgreSQL 15 on prod-db:5432, connection pool: 20 max",
+    content="PostgreSQL 15 on database.example.invalid:5432, connection pool: 20 max",
     mode="upsert"
   )
 ← infrastructure.mdを作成/更新し、L0インデックスを自動同期
@@ -826,7 +826,7 @@ python -m layered_memory_mcp.server
 
 ## 変更履歴
 
-完全なリリース履歴は [CHANGELOG.md](CHANGELOG.md) を参照してください。`3.5.0` の主な内容：
+完全なリリース履歴は [CHANGELOG.md](CHANGELOG.md) を参照してください。`3.5.0` と `3.5.1` の主な内容：
 
 - 記憶面モデルと決定論的な永続化ルーター（`classify_memory_item`）。既定では助言のみ
 - `get_memory_surface_capabilities`：現在の設定でフレームワークが書ける面と、提案しかできない面

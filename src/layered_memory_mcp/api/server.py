@@ -106,6 +106,21 @@ class ReviewQueueItem(BaseModel):
 stores: dict[str, Any] = {}
 
 
+def _sync_knowledge_vectors(entry: KnowledgeEntry) -> None:
+    """Publish the current frontmatter file, never a delayed request snapshot."""
+    from ..injector import sync_to_vector_store
+
+    result = sync_to_vector_store(
+        stores["vector"].db_path.parent, entry.domain, entry.content,
+        replace_domain=True, source_path=stores["l1"]._resolve_path(entry.domain),
+    )
+    if not result.get("success"):
+        raise HTTPException(status_code=503, detail={
+            "message": "L1 write succeeded; vector sync failed. Reconciliation is required.",
+            "id": entry.id, "vector_sync_error": result.get("error"),
+        })
+
+
 def store_dirs(config: "MemoryConfig | None" = None) -> tuple[Path, Path]:
     """``(knowledge_dir, data_dir)`` for this HTTP server's stores.
 
@@ -136,10 +151,12 @@ async def lifespan(app: FastAPI):
     stores["vector"] = VectorStore(data_dir / "vectors.db")
     stores["review"] = ReviewQueue(data_dir / "review_queue.db")
 
-    logger.info("API initialized: knowledge_dir=%s", knowledge_dir)
-    yield
-    # Cleanup
-    stores.clear()
+    try:
+        logger.info("API initialized: knowledge_dir=%s", knowledge_dir)
+        yield
+    finally:
+        stores["vector"].close()
+        stores.clear()
 
 
 def create_app() -> FastAPI:
@@ -194,7 +211,7 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=500, detail=result.get("error", "Write failed"))
 
         # Index in vector store
-        stores["vector"].add(entry)
+        _sync_knowledge_vectors(entry)
 
         # If pending, add to review queue
         if entry.review_status == ReviewStatus.PENDING:
@@ -256,7 +273,7 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=500, detail=result.get("error"))
 
         # Update vector store
-        stores["vector"].add(entry)
+        _sync_knowledge_vectors(entry)
 
         return _entry_to_response(entry)
 

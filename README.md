@@ -355,11 +355,11 @@ A custom handler is a class with `name`, `supports(surface)`, an optional `readi
 The `inject_knowledge` tool is the **primary write path** for all agents. It handles deduplication, section targeting, and automatic L0 index sync in a single call.
 
 ```
-Agent learns: "Production DB is PostgreSQL 15 on prod-db:5432"
+Agent learns: "The service database is PostgreSQL 15 on database.example.invalid:5432"
 → inject_knowledge(
     domain="infrastructure",
     section="Database",
-    content="PostgreSQL 15 on prod-db:5432, connection pool: 20 max",
+    content="PostgreSQL 15 on database.example.invalid:5432, connection pool: 20 max",
     mode="upsert"
   )
 ← Creates/updates infrastructure.md, auto-syncs L0 index
@@ -671,6 +671,44 @@ The state file is derived operational state: versioned (`schema_version`), keyed
 
 The L1 markdown files are the source of truth. The L0 index and the vector store (`data/vectors.db`) are **derived** from them and can be rebuilt at any time (`sync_l0_index`, `reindex_vector_store_tool`). The text that gets embedded uses a noise-stripped heading: `## Release process 2026-10-01 (v3.2)` is embedded as `Release process`, so periodic entries cluster by topic rather than by date. Displayed headings and stored metadata keep the original text. After upgrading, you can reindex so that existing vectors pick up the cleaner headings.
 
+On a long-lived HTTP MCP server, the existing maintenance loop checks vector
+consistency and repairs drift automatically. It uses `LAYERED_MEMORY_MAINTENANCE_ENABLED`
+(default on), `LAYERED_MEMORY_MAINTENANCE_TICK` (default 1800 seconds, minimum 30)
+and `LAYERED_MEMORY_MAINTENANCE_DELAY` (default 60 seconds). Healthy checks do no
+embedding. Empty files, title-only files and empty H2 sections need no vectors;
+the check compares section identities, text and multiplicity, including orphaned
+rows. Read or database errors are reported as errors, never as healthy.
+
+Replacement embeddings are prepared before a single SQLite transaction publishes
+them. Failed preparation or a concurrent source/vector change preserves the
+previous committed rows and requests a retry. File-backed sync rereads the current
+file so a delayed writer cannot publish its older caller snapshot. Maintenance
+persists its retry state in `data/vector_maintenance.json`, prevents overlapping
+jobs, and backs failures off from the configured interval up to six hours (or
+the configured interval when longer). Short-lived stdio clients can use
+`reindex_vector_store_tool` explicitly; corpus repair is not added to each write.
+REST frontmatter entries keep their IDs, section metadata and authored summaries;
+heading normalization applies to embedding text only. Consistency checks include
+the persistent frontmatter ID; generated legacy H2 IDs are not compared. REST
+create/update sync the current source file, so replacing a domain with a new
+entry ID removes vectors for the previous ID even when the text is identical.
+If the file write succeeds but vector publication fails, MCP reports
+`vector_sync_ok: false`; REST returns HTTP 503 with the saved entry ID and an
+explicit partial-success message. Reconcile the saved file before retrying a
+create request. Existing committed vectors remain available.
+
+Standalone `VectorStore.add` also rejects a database snapshot changed during
+embedding; callers with external sources can supply `validate_source`.
+Use `VectorStore` as a context manager or call `close()` to release its cache
+observer. Knowledge writers retain their `.lock` files to keep waiting and new
+processes on the same lock inode; these files are not knowledge entries.
+
+`extract_session_knowledge` retains its `entries` response and also returns
+`l1_candidates`, `todo_candidates`, `agent_owned_candidates`,
+`raw_session_candidates`, `rejected` and `routing_summary`. Each candidate carries
+the router decision. These are review suggestions: extraction never writes a
+TODO, skill, profile or raw session, even with extension handlers configured.
+
 ### Safe Cleanup Boundary
 
 Automatic cleanup is limited to mechanical, reversible, or idempotent actions: moving legacy `*.md.bak` files out of `knowledge/` into `data/backups/knowledge/`, rebuilding derived L0 and vector data, and *copying* an open marker into the TODO store (with a deterministic id, so re-applying does nothing). Anything semantic is outside the safe boundary and is always left to the user or agent: deleting facts, merging conflicting sections, moving content across domains, rewriting history as a rule, or removing the source line after a TODO is created. `apply_safe_knowledge_cleanup_tool` rejects these actions by name.
@@ -845,7 +883,7 @@ python -m layered_memory_mcp.server
 
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md) for the full release history. Recent highlights in `3.5.0`:
+See [CHANGELOG.md](CHANGELOG.md) for the full release history. Recent highlights from `3.5.0` and `3.5.1`:
 
 - A surface model and a deterministic persistence router (`classify_memory_item`), advisory by default
 - `get_memory_surface_capabilities`: what the framework may write under your config, and what it can only suggest

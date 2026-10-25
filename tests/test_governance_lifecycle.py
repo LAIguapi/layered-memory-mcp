@@ -342,7 +342,7 @@ class TestEmbeddingHeading:
     def test_strips_noise_keeps_words(self):
         assert embedding_heading("Release process — 2026-10-01") == "Release process"
         assert embedding_heading("发布流程 v3.4.7") == "发布流程"
-        assert embedding_heading("WSL 代理") == "WSL 代理"
+        assert embedding_heading("HTTP proxy") == "HTTP proxy"
         # Pure-date heading has an empty skeleton: keep the original.
         assert heading_skeleton("2026-10-01") == ""
         assert embedding_heading("2026-10-01") == "2026-10-01"
@@ -400,9 +400,9 @@ class TestEmbeddingHeading:
         from layered_memory_mcp.injector import _section_body_from_hit, sync_to_vector_store
 
         sync_to_vector_store(data_dir=tmp_path / "data", domain="d",
-                             content="## WSL 代理\n走 7890\n", replace_domain=True)
+                             content="## HTTP proxy\nUse 8080\n", replace_domain=True)
         (text, _meta), = self._rows(tmp_path / "data")
-        assert _section_body_from_hit(text) == "走 7890"
+        assert _section_body_from_hit(text) == "Use 8080"
 
 
 # --- P4. watch patterns ----------------------------------------------------------

@@ -297,8 +297,8 @@ class TestInjectKnowledgeRecording:
         result = inject_knowledge(
             cfg,
             "infra",
-            "WSL proxy",
-            "The outbound proxy listens on 127.0.0.1:8080 and the WSL bridge "
+            "HTTP proxy",
+            "The outbound proxy listens on 127.0.0.1:8080 and the network bridge "
             "routes through it.",
         )
         assert result["success"] is True
@@ -309,7 +309,7 @@ class TestInjectKnowledgeRecording:
         assert event["operation"] == "l1_domain_created"
         assert event["surface"] == "l1_knowledge"
         assert event["domain"] == "infra"
-        assert event["section"] == "WSL proxy"
+        assert event["section"] == "HTTP proxy"
         assert event["tool"] == "inject_knowledge"
         assert event["actor"] == "framework"
         assert event["schema_version"] == SCHEMA_VERSION
@@ -323,7 +323,7 @@ class TestInjectKnowledgeRecording:
 
     def test_event_ids_and_order(self, tmp_path):
         cfg = _cfg(tmp_path)
-        inject_knowledge(cfg, "infra", "WSL proxy", "Proxy on 127.0.0.1:8080.")
+        inject_knowledge(cfg, "infra", "HTTP proxy", "Proxy on 127.0.0.1:8080.")
         inject_knowledge(
             cfg, "infra", "Disk layout", "Data volumes mount under /mnt/data as xfs."
         )
@@ -337,7 +337,7 @@ class TestInjectKnowledgeRecording:
     def test_agent_id_is_carried_as_provenance(self, tmp_path):
         cfg = _cfg(tmp_path)
         inject_knowledge(
-            cfg, "infra", "WSL proxy", "Proxy on 127.0.0.1:8080.", agent_id="hermes"
+            cfg, "infra", "HTTP proxy", "Proxy on 127.0.0.1:8080.", agent_id="hermes"
         )
         assert _events(cfg)[0]["agent_id"] == "hermes"
 
@@ -346,17 +346,17 @@ class TestInjectKnowledgeRecording:
     ):
         cfg = _cfg(tmp_path)
         inject_knowledge(
-            cfg, "infra", "WSL proxy", "The proxy listens on 127.0.0.1:8080."
+            cfg, "infra", "HTTP proxy", "The proxy listens on 127.0.0.1:8080."
         )
         old_body = (
             Path(cfg.knowledge_dir) / "infra.md"
-        ).read_text(encoding="utf-8").split("## WSL proxy\n\n", 1)[1].strip()
+        ).read_text(encoding="utf-8").split("## HTTP proxy\n\n", 1)[1].strip()
 
         result = inject_knowledge(
             cfg,
             "infra",
-            "WSL proxy",
-            "The proxy listens on 127.0.0.1:8080; the WSL bridge routes through it.",
+            "HTTP proxy",
+            "The proxy listens on 127.0.0.1:8080; the network bridge routes through it.",
             fuse=True,
             expected_hash=_hash_body(old_body),
         )
@@ -374,13 +374,13 @@ class TestInjectKnowledgeRecording:
 
     def test_fuse_conflict_records_nothing(self, tmp_path):
         cfg = _cfg(tmp_path)
-        inject_knowledge(cfg, "infra", "WSL proxy", "Proxy on 127.0.0.1:8080.")
+        inject_knowledge(cfg, "infra", "HTTP proxy", "Proxy on 127.0.0.1:8080.")
         before = _events(cfg)
 
         result = inject_knowledge(
             cfg,
             "infra",
-            "WSL proxy",
+            "HTTP proxy",
             "A blind overwrite attempt.",
             fuse=True,
             expected_hash="0000000000000000",
@@ -453,17 +453,17 @@ class TestInjectKnowledgeRecording:
 
     def test_skipped_duplicate_records_nothing(self, tmp_path):
         cfg = _cfg(tmp_path)
-        content = "The outbound proxy listens on 127.0.0.1:8080 for the WSL bridge."
-        inject_knowledge(cfg, "infra", "WSL proxy", content)
+        content = "The outbound proxy listens on 127.0.0.1:8080 for the network bridge."
+        inject_knowledge(cfg, "infra", "HTTP proxy", content)
         before = _events(cfg)
 
-        result = inject_knowledge(cfg, "infra", "WSL proxy", content)
+        result = inject_knowledge(cfg, "infra", "HTTP proxy", content)
         assert result["action"] == "skipped"
         assert _events(cfg) == before
 
     def test_validation_failure_records_nothing(self, tmp_path):
         cfg = _cfg(tmp_path)
-        assert inject_knowledge(cfg, "infra", "WSL proxy", "   ")["success"] is False
+        assert inject_knowledge(cfg, "infra", "HTTP proxy", "   ")["success"] is False
         assert inject_knowledge(cfg, "infra", "", "something")["success"] is False
         assert _events(cfg) == []
 
@@ -476,7 +476,7 @@ class TestInjectKnowledgeRecording:
             "_execute_write",
             lambda **kwargs: {"success": False, "error": "disk on fire"},
         )
-        result = inject_knowledge(cfg, "infra", "WSL proxy", "Proxy on 7890.")
+        result = inject_knowledge(cfg, "infra", "HTTP proxy", "Proxy on port 8080.")
         assert result["success"] is False
         assert _events(cfg) == []
 
@@ -755,7 +755,7 @@ class TestReadTools:
 class TestDisabledBackend:
     def test_disabled_records_nothing(self, tmp_path):
         cfg = _cfg(tmp_path, memory_changelog={"enabled": False})
-        inject_knowledge(cfg, "infra", "WSL proxy", "Proxy on 127.0.0.1:8080.")
+        inject_knowledge(cfg, "infra", "HTTP proxy", "Proxy on 127.0.0.1:8080.")
         assert record(cfg, "l1_section_created", "infra") is None
         assert not _log_path(cfg).exists()
 

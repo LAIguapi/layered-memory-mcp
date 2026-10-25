@@ -24,6 +24,7 @@ import logging
 import os
 import sqlite3
 import threading
+from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -51,32 +52,6 @@ _embedder = None
 _embedder_lock = threading.Lock()
 
 
-# Common local HTTP proxy ports to probe as a last resort when a direct
-# HuggingFace download fails and no proxy was explicitly configured. Covers the
-# defaults of the most common desktop proxy tools.
-_COMMON_PROXY_PORTS = (7890, 7897, 8080, 1087, 8889)
-
-
-def _detect_local_proxy() -> str | None:
-    """Return a reachable local proxy URL, or None if none is listening.
-
-    Probes 127.0.0.1 on a few common proxy ports with a short TCP connect.
-    Used only as an opt-in fallback for bootstrapping the model download on
-    networks where HuggingFace isn't directly reachable.
-    """
-    import socket
-
-    for port in _COMMON_PROXY_PORTS:
-        try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.3):
-                url = f"http://127.0.0.1:{port}"
-                logger.info("Auto-detected local proxy at %s", url)
-                return url
-        except OSError:
-            continue
-    return None
-
-
 def _load_via_proxy(proxy_url: str):
     """Load TextEmbedding with proxy env temporarily exported, then restore."""
     from fastembed import TextEmbedding
@@ -102,8 +77,8 @@ def _get_embedder():
     Load order:
       1. Offline (model already cached) — the normal hot path.
       2. Direct download from HuggingFace.
-      3. Proxy download: an explicit LAYERED_MEMORY_HF_PROXY if set, otherwise
-         an auto-detected local proxy (common desktop proxy ports).
+      3. Proxy download through the explicitly configured
+         LAYERED_MEMORY_HF_PROXY, when set.
     """
     global _embedder
     if _embedder is not None:
@@ -133,12 +108,13 @@ def _get_embedder():
         except Exception as direct_err:
             logger.warning("Direct download failed (%s); trying proxy", direct_err)
 
-        # Attempt 3: proxy download. Explicit env wins; otherwise auto-detect.
-        proxy_url = PROXY_URL or _detect_local_proxy()
+        # Attempt 3: proxy download only when explicitly configured. Never probe
+        # local ports: a library must not guess the operator's network topology.
+        proxy_url = PROXY_URL
         if not proxy_url:
             raise RuntimeError(
                 "Could not load or download the embedding model. HuggingFace is "
-                "unreachable and no local proxy was found. Set "
+                "unreachable and no proxy was configured. Set "
                 "LAYERED_MEMORY_HF_PROXY to a working HTTP proxy and retry."
             )
         _embedder = _load_via_proxy(proxy_url)
@@ -154,6 +130,18 @@ def _embed_texts(texts: list[str]) -> np.ndarray:
     return np.array(vecs, dtype=np.float32)
 
 
+def entry_embedding_text(entry: "KnowledgeEntry") -> str:
+    """Normalize the heading only; keep a distinct authored summary intact."""
+    from ..heading import embedding_heading
+
+    heading = embedding_heading(entry.section)
+    parts = [heading]
+    if entry.summary.strip() not in ("", entry.section.strip(), heading):
+        parts.append(entry.summary.strip())
+    parts.append(entry.content.strip())
+    return "\n".join(parts).strip()
+
+
 class VectorStore:
     """SQLite-backed vector store for semantic search.
 
@@ -167,6 +155,7 @@ class VectorStore:
 
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
+        self._closed = False
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
         # In-memory vector cache. The whole table's vectors are parsed once and
@@ -180,6 +169,40 @@ class VectorStore:
         self._cache_texts: list[str] = []
         self._cache_metas: list[dict] = []
         self._cache_matrix: np.ndarray | None = None
+        # data_version is connection-relative. Keep a read-only observer so a
+        # long-lived reader sees commits from maintenance and other processes.
+        self._cache_observer = sqlite3.connect(
+            f"{self.db_path.resolve().as_uri()}?mode=ro", uri=True, check_same_thread=False,
+        )
+        self._cache_version: int | None = None
+
+    def _check_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("vector store is closed")
+
+    @contextmanager
+    def _connect(self):
+        """Close transient connections as well as committing/rolling back them."""
+        self._check_open()
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            with conn:
+                yield conn
+
+    def close(self) -> None:
+        """Release the persistent cache observer; safe to call repeatedly."""
+        with self._cache_lock:
+            if not self._closed:
+                self._cache_observer.close()
+                self._closed = True
+                self._cache_valid = False
+                self._cache_matrix = None
+
+    def __enter__(self) -> "VectorStore":
+        self._check_open()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.close()
 
     def _invalidate_cache(self) -> None:
         """Drop the in-memory vector cache; next search rebuilds it lazily."""
@@ -197,12 +220,12 @@ class VectorStore:
         Parses every row's JSON vector exactly once per invalidation, instead
         of on every search call. Legacy-dimension rows are skipped defensively.
         """
-        if self._cache_valid:
-            return
         with self._cache_lock:
-            if self._cache_valid:  # double-checked under lock
+            self._check_open()
+            version = self._cache_observer.execute("PRAGMA data_version").fetchone()[0]
+            if self._cache_valid and self._cache_version == version:
                 return
-            with sqlite3.connect(self.db_path) as conn:
+            with self._connect() as conn:
                 rows = conn.execute(
                     "SELECT id, domain, text, vector, metadata FROM vectors"
                 ).fetchall()
@@ -226,10 +249,11 @@ class VectorStore:
                 np.vstack(vectors) if vectors else np.zeros((0, EMBED_DIM), np.float32)
             )
             self._cache_valid = True
+            self._cache_version = version
 
     def _init_db(self) -> None:
         """Create tables if not exists."""
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS vectors (
                     id TEXT PRIMARY KEY,
@@ -245,26 +269,36 @@ class VectorStore:
             """)
             conn.commit()
 
-    def add(self, entry: "KnowledgeEntry") -> None:
-        """Add or update a knowledge entry in the vector store."""
-        text = f"{entry.summary}\n{entry.content}".strip()
+    def add(self, entry: "KnowledgeEntry", *, validate_source=None) -> None:
+        """Prepare and atomically publish an entry unless its snapshot is stale.
+
+        ``validate_source`` may reject publication if an external source changed
+        during preparation. File-backed domain writers should use injector sync,
+        which rereads and validates the authoritative file, including its ID.
+        """
+        expected = self.snapshot()
+        entry = entry.model_copy(deep=True)
+        text = entry_embedding_text(entry)
 
         # Exact (domain, text) dedup guard. A verbatim duplicate is a no-op.
         # (Historically a fresh random uuid per call defeated INSERT OR REPLACE
         # and let vectors.db balloon to 4449 rows from ~120 unique entries.)
-        with sqlite3.connect(self.db_path) as conn:
-            existing = conn.execute(
-                "SELECT 1 FROM vectors WHERE domain = ? AND text = ? LIMIT 1",
-                (entry.domain, text),
-            ).fetchone()
-        if existing:
-            return
+        matches = [row for row in expected if row[1] == entry.domain and row[2] == text]
+        existing = next((row for row in matches if row[0] == entry.id),
+                        matches[0] if matches else None)
 
         # bge embeds each text independently — no corpus refit needed. This is
         # a major simplification over the old TF-IDF path, which had to refit
         # the whole vocabulary on every single add.
-        vector = _embed_texts([text])[0]
-        vector_json = json.dumps(vector.tolist())
+        # A heading date/tag-only edit can leave embedding text unchanged.
+        # Reuse the vector while still refreshing this entry's metadata.
+        if existing:
+            vector_json = existing[3]
+        else:
+            vectors = _embed_texts([text])
+            if vectors.shape != (1, EMBED_DIM) or not np.isfinite(vectors).all():
+                raise ValueError("embedding returned invalid shape or non-finite values")
+            vector_json = json.dumps(vectors[0].tolist())
 
         metadata = {
             "type": entry.type.value,
@@ -273,7 +307,11 @@ class VectorStore:
             "section": entry.section,
         }
 
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._validate_publication(conn, expected, validate_source)
+            if existing and existing[0] != entry.id:
+                return
             conn.execute(
                 """
                 INSERT OR REPLACE INTO vectors (id, domain, text, vector, metadata)
@@ -284,9 +322,67 @@ class VectorStore:
             conn.commit()
         self._invalidate_cache()
 
+    def snapshot(self) -> list[tuple]:
+        """Committed rows for optimistic publication; no embedding or writes."""
+        with self._connect() as conn:
+            return conn.execute(
+                "SELECT id, domain, text, vector, metadata FROM vectors ORDER BY id"
+            ).fetchall()
+
+    @staticmethod
+    def _validate_publication(conn, expected: list[tuple], validate_source=None) -> None:
+        """Check both snapshots while the SQLite publication transaction is held."""
+        current = conn.execute(
+            "SELECT id, domain, text, vector, metadata FROM vectors ORDER BY id"
+        ).fetchall()
+        if current != expected:
+            raise RuntimeError("vector store changed during preparation; retry required")
+        if validate_source is not None:
+            validate_source()
+
+    def replace_entries(
+        self,
+        entries: list["KnowledgeEntry"],
+        *,
+        domains: list[str] | None = None,
+        expected: list[tuple],
+        validate_source=None,
+    ) -> None:
+        """Prepare first, then publish all replacements in one transaction.
+
+        Refuse publication if another writer changed the store or the caller's
+        source snapshot changed during embedding. Readers keep the previous
+        committed rows on any failure, including a failure halfway through SQL.
+        ``domains=None`` replaces the corpus; a list replaces just those domains.
+        """
+        self._check_open()
+        texts = [entry_embedding_text(entry) for entry in entries]
+        vectors = _embed_texts(texts)
+        if vectors.shape != (len(entries), EMBED_DIM) or not np.isfinite(vectors).all():
+            raise ValueError("embedding returned invalid shape or non-finite values")
+        replacement = [
+            (entry.id, entry.domain, text, json.dumps(vector.tolist()), json.dumps({
+                "type": entry.type.value, "confidence": entry.confidence,
+                "tags": entry.tags, "section": entry.section,
+            }))
+            for entry, text, vector in zip(entries, texts, vectors)
+        ]
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._validate_publication(conn, expected, validate_source)
+            if domains is None:
+                conn.execute("DELETE FROM vectors")
+            else:
+                conn.executemany("DELETE FROM vectors WHERE domain = ?", [(d,) for d in domains])
+            conn.executemany(
+                "INSERT INTO vectors (id, domain, text, vector, metadata) VALUES (?, ?, ?, ?, ?)",
+                replacement,
+            )
+        self._invalidate_cache()
+
     def delete(self, entry_id: str) -> None:
         """Remove an entry from the vector store."""
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             conn.execute("DELETE FROM vectors WHERE id = ?", (entry_id,))
             conn.commit()
         self._invalidate_cache()
@@ -361,7 +457,7 @@ class VectorStore:
         bge-small-zh-512), since old vectors live in an incompatible space.
         Reads each row's `text`, recomputes its vector in place. Idempotent.
         """
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             rows = conn.execute("SELECT id, text FROM vectors").fetchall()
 
         if not rows:
@@ -372,7 +468,7 @@ class VectorStore:
         # Batch-embed all texts in one model call.
         vectors = _embed_texts(texts)
 
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             for entry_id, vec in zip(ids, vectors):
                 conn.execute(
                     "UPDATE vectors SET vector = ? WHERE id = ?",
@@ -403,7 +499,7 @@ class VectorStore:
 
     def stats(self) -> dict:
         """Return store statistics."""
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             count = conn.execute("SELECT COUNT(*) FROM vectors").fetchone()[0]
             domains = conn.execute(
                 "SELECT domain, COUNT(*) FROM vectors GROUP BY domain"

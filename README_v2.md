@@ -61,7 +61,7 @@ extract_session_knowledge(
 
 # Semantic search
 search_semantic(
-    query="How to configure WSL proxy?",
+    query="How to configure an HTTP proxy?",
     top_n=5,
 )
 

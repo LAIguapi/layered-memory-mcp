@@ -1,9 +1,8 @@
 """Regression tests for test-suite isolation (conftest.py).
 
-Root cause being locked down: ``detect_agent_memory_path()`` probes
-``Path.home()/".hermes"/"memories"/"MEMORY.md"`` and ignores
-``LAYERED_MEMORY_HOME``, so tests used to resolve — and write to — the real
-production memory file.
+These tests ensure that agent-owned memory paths and framework-owned knowledge
+paths remain inside the per-test sandbox instead of reaching a host-managed
+path.
 """
 
 from __future__ import annotations
@@ -15,40 +14,36 @@ import pytest
 
 from layered_memory_mcp.config import MemoryConfig
 
-# The real production paths this suite must never touch. Derived from the real
-# home, captured at import time before any fixture redirects HOME (conftest.py
-# relies on the same ordering), so this file carries no machine-specific path.
+# Host-managed paths this suite must never touch. Derived from the host home,
+# captured before fixtures redirect HOME, so no concrete user path is embedded.
 _REAL_HOME = os.path.expanduser("~")
 _REAL_MEMORY = os.path.join(_REAL_HOME, ".hermes", "memories", "MEMORY.md")
 _REAL_L1 = os.path.join(_REAL_HOME, ".layered-memory")
 
 
 class TestPathIsolation:
-    def test_agent_memory_path_is_not_production(self):
-        """The exact leak that polluted MEMORY.md with 20 junk pointers."""
+    def test_agent_memory_path_is_not_host_managed(self):
+        """Agent-memory resolution must not escape the test sandbox."""
         resolved = MemoryConfig().detect_agent_memory_path()
         assert resolved is not None
         assert str(resolved) != _REAL_MEMORY, (
-            f"agent memory resolved to production file {resolved}"
+            f"agent memory resolved to a host-managed file {resolved}"
         )
 
-    def test_knowledge_dir_is_not_production(self):
+    def test_knowledge_dir_is_not_host_managed(self):
         kdir = str(MemoryConfig().knowledge_dir)
-        assert not kdir.startswith(_REAL_L1), f"L1 store resolved to production {kdir}"
+        assert not kdir.startswith(_REAL_L1), f"L1 store resolved to host-managed data {kdir}"
 
     def test_home_is_redirected(self):
         """Path.home() must be sandboxed for code that bypasses config."""
         sandbox_home = str(Path.home())
         assert sandbox_home == os.environ["HOME"]
-        # Not the real home — but it may legitimately sit *under* ~/.hermes when
-        # TMPDIR points there (Hermes sets TMPDIR=~/.hermes/cache/scratch, which
-        # is where pytest's tmp_path lands), so compare resolved paths rather
-        # than path prefixes. What must never happen is the sandbox resolving to
-        # the production memory file.
+        # Compare resolved paths rather than prefixes: the temporary directory
+        # may be nested below another tool's cache directory.
         assert sandbox_home != _REAL_HOME, f"home not redirected: {sandbox_home}"
         sandbox_memory = os.path.join(sandbox_home, ".hermes", "memories", "MEMORY.md")
         assert sandbox_memory != _REAL_MEMORY, (
-            f"sandbox home resolves to production memory {sandbox_memory}"
+            f"sandbox home resolves to a host-managed memory path {sandbox_memory}"
         )
 
     def test_sandbox_paths_are_writable(self):
@@ -68,27 +63,41 @@ class TestPathIsolation:
         leaked.write_text("x", encoding="utf-8")
 
 
-class TestProductionWriteGuard:
-    """The backstop fixture must convert a prod write into a loud failure."""
+class TestHostWriteGuard:
+    """The backstop fixture must convert a host write into a loud failure."""
 
-    def test_writing_to_production_memory_raises(self):
+    def test_writing_to_host_memory_raises(self):
         with pytest.raises(AssertionError, match="TEST ISOLATION VIOLATION"):
             with open(_REAL_MEMORY, "a", encoding="utf-8") as fh:
                 fh.write("this must never land\n")
 
-    def test_writing_to_production_l1_raises(self):
+    def test_writing_to_host_knowledge_raises(self):
         with pytest.raises(AssertionError, match="TEST ISOLATION VIOLATION"):
             with open(f"{_REAL_L1}/knowledge/pwned.md", "w", encoding="utf-8") as fh:
                 fh.write("nope")
 
-    def test_path_write_text_to_production_raises(self):
+    def test_path_write_text_to_host_path_raises(self):
         """``Path.write_text`` bypasses ``builtins.open`` — and is the idiom the
         framework actually uses for every memory/L1 write."""
         with pytest.raises(AssertionError, match="TEST ISOLATION VIOLATION"):
             Path(_REAL_MEMORY).write_text("this must never land\n", encoding="utf-8")
 
-    def test_reading_production_is_still_allowed(self):
-        """Read-only access stays legal — the guard targets writes only."""
-        if Path(_REAL_MEMORY).exists():
-            with open(_REAL_MEMORY, encoding="utf-8") as fh:
-                fh.read(16)
+    def test_reading_host_path_is_still_allowed(self, tmp_path, monkeypatch):
+        """Exercise the guard without depending on a readable real home.
+
+        Classify a sandbox file as protected for the guard only. Actual I/O
+        still uses the sandbox file; The host-managed path need not exist or be readable.
+        The write control proves this did not accidentally bypass the guard.
+        """
+        probe = tmp_path / "guard-read-probe.md"
+        probe.write_text("read-only evidence", encoding="utf-8")
+        real_abspath = os.path.abspath
+        monkeypatch.setattr(
+            os.path, "abspath",
+            lambda path: _REAL_MEMORY if str(path) == str(probe) else real_abspath(path),
+        )
+        with open(probe, encoding="utf-8") as fh:
+            assert fh.read() == "read-only evidence"
+        assert probe.read_text(encoding="utf-8") == "read-only evidence"
+        with pytest.raises(AssertionError, match="TEST ISOLATION VIOLATION"):
+            probe.write_text("forbidden", encoding="utf-8")

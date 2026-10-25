@@ -91,11 +91,8 @@ def write_knowledge_file(
     except Exception as e:
         logger.error("Write error for %s: %s", filepath, e)
         return {"success": False, "error": str(e)}
-    finally:
-        try:
-            lock_path.unlink(missing_ok=True)
-        except Exception:
-            pass
+    # Do not unlink the lock: another process may already have acquired the
+    # same inode. All writers must continue to lock that inode.
 
 
 class L1Store:

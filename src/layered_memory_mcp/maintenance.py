@@ -27,8 +27,15 @@ Deliberately out of scope:
 from __future__ import annotations
 
 import logging
+import json
+import math
+import os
+import tempfile
 import threading
+import time
 from typing import Any, Callable
+
+from filelock import FileLock, Timeout
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +46,83 @@ DEFAULT_INITIAL_DELAY = 60.0
 # intervals measured in days, so anything under half a minute is a
 # misconfiguration (usually a seconds/milliseconds mix-up), not a preference.
 MIN_TICK_SECONDS = 30.0
+
+
+def _maintenance_interval(config: Any) -> float:
+    """Resolve one policy for the periodic loop and persisted vector retries."""
+    try:
+        interval = float(getattr(config, "maintenance_tick_seconds", DEFAULT_TICK_SECONDS)
+                         or DEFAULT_TICK_SECONDS)
+        if not math.isfinite(interval):
+            raise ValueError("non-finite maintenance interval")
+        return max(MIN_TICK_SECONDS, interval)
+    except (ValueError, TypeError):
+        return DEFAULT_TICK_SECONDS
+
+
+def maintain_vectors(config: Any) -> dict:
+    """Inspect and repair derived vectors, with persistent bounded retries.
+
+    Uses the existing maintenance switch and interval. A separate file lock
+    prevents overlapping periodic jobs across processes; publication itself
+    validates source and database snapshots against concurrent normal writes.
+    """
+    if not getattr(config, "maintenance_enabled", True):
+        return {"status": "disabled"}
+    data = config.home / "data"
+    data.mkdir(parents=True, exist_ok=True)
+    interval = _maintenance_interval(config)
+    try:
+        with FileLock(str(data / "vector_maintenance.lock"), timeout=0):
+            state_path = data / "vector_maintenance.json"
+            state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {}
+            now = time.time()
+            if now < float(state.get("next_attempt", 0)):
+                return {"status": "rate_limited", "last_status": state.get("status"),
+                        "next_attempt": state["next_attempt"], "error": state.get("error")}
+            # Persist the attempt before expensive work, so a process crash
+            # cannot turn frequent pull/restart calls into a rebuild storm.
+            state.update(status="running", next_attempt=now + interval, last_attempt=now)
+            _save_vector_maintenance_state(state_path, state)
+            try:
+                from .injector import vector_store_needs_reindex, reindex_vector_store
+
+                if vector_store_needs_reindex(config):
+                    repair = reindex_vector_store(config, calibrate=False)
+                    if not repair.get("success"):
+                        raise RuntimeError(repair.get("error") or str(repair.get("errors")))
+                    if vector_store_needs_reindex(config):
+                        raise RuntimeError("source changed after repair; retry required")
+                    report = {"status": "repaired", "repair": repair}
+                else:
+                    report = {"status": "healthy"}
+                state.update(status=report["status"], failures=0, error=None,
+                             next_attempt=time.time() + interval)
+            except Exception as error:
+                failures = int(state.get("failures", 0)) + 1
+                delay = max(interval, min(interval * 2 ** min(failures - 1, 4), 21600.0))
+                state.update(status="error", failures=failures, error=str(error),
+                             next_attempt=time.time() + delay)
+                logger.warning("maintenance: vector repair failed: %s", error)
+                report = {"status": "error", "error": str(error)}
+            _save_vector_maintenance_state(state_path, state)
+            return {**report, "next_attempt": state["next_attempt"]}
+    except Timeout:
+        return {"status": "busy"}
+
+
+def _save_vector_maintenance_state(path, state: dict) -> None:
+    """Publish retry state atomically; never leave truncated JSON on a crash."""
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=".vector-maintenance-", delete=False) as stream:
+            temporary = stream.name
+            json.dump(state, stream)
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None and os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def maintenance_task(config: Any) -> dict:
@@ -58,6 +142,14 @@ def maintenance_task(config: Any) -> dict:
     except Exception as e:  # noqa: BLE001 — maintenance must never break the host
         logger.warning("maintenance: auto-maintain failed: %s", e)
         report["auto_maintain"] = {"error": str(e)}
+
+    # Inspect after compaction so this tick projects its final source files.
+    # Preserve old committed rows on embedding/publication failure.
+    try:
+        report["vector_maintenance"] = maintain_vectors(config)
+    except Exception as e:
+        logger.warning("maintenance: vector inspection/state failed: %s", e)
+        report["vector_maintenance"] = {"status": "error", "error": str(e)}
 
     # 2. Deployed guard refresh. The host's guard is a copy of the payload
     #    bundled in this package, so it is a version behind after every upgrade.
@@ -153,25 +245,14 @@ def start_maintenance(config: Any, task: Callable[[], Any] | None = None) -> Mai
         logger.info("maintenance loop disabled by config")
         return None
 
-    try:
-        interval = float(
-            getattr(config, "maintenance_tick_seconds", DEFAULT_TICK_SECONDS)
-            or DEFAULT_TICK_SECONDS
-        )
-    except (TypeError, ValueError):
-        interval = DEFAULT_TICK_SECONDS
-    if interval < MIN_TICK_SECONDS:
-        logger.warning(
-            "maintenance tick %ss is below the %ss floor; using the floor",
-            interval,
-            MIN_TICK_SECONDS,
-        )
-        interval = MIN_TICK_SECONDS
+    interval = _maintenance_interval(config)
 
     try:
         delay = max(
             0.0, float(getattr(config, "maintenance_initial_delay", DEFAULT_INITIAL_DELAY) or 0.0)
         )
+        if not math.isfinite(delay):
+            delay = DEFAULT_INITIAL_DELAY
     except (TypeError, ValueError):
         delay = DEFAULT_INITIAL_DELAY
 

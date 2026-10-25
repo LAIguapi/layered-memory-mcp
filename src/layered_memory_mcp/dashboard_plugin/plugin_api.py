@@ -523,42 +523,20 @@ async def rebuild_vectors_endpoint(req: RebuildVectorsRequest):
         }
 
     def _rebuild():
-        config = _get_config()
-        data_dir = config.home / "data"
-        knowledge_dir = config.knowledge_dir
+        from layered_memory_mcp.injector import reindex_vector_store
 
-        # Clear and re-index
-        stores = _get_v2_stores()
-        vector_store = stores["vector"]
-
-        # Re-index all L1 files
-        from layered_memory_mcp.models import KnowledgeEntry, KnowledgeType, SourceInfo, SourceType, ReviewStatus
-        import uuid
-
-        count = 0
-        for fpath in sorted(knowledge_dir.glob("*.md")):
-            content = fpath.read_text(encoding="utf-8")
-            entry = KnowledgeEntry(
-                id=str(uuid.uuid4()),
-                domain=fpath.stem,
-                section=fpath.stem,
-                content=content,
-                summary=f"L1: {fpath.stem}",
-                type=KnowledgeType.FACT,
-                confidence=0.9,
-                review_status=ReviewStatus.APPROVED,
-                source=SourceInfo(type=SourceType.MANUAL, extracted_by="dashboard_rebuild"),
-            )
-            vector_store.add(entry)
-            count += 1
-
-        return {"indexed": count}
+        return reindex_vector_store(_get_config(), calibrate=False)
 
     result = await asyncio.to_thread(_rebuild)
     return {
         "dry_run": False,
-        "indexed": result["indexed"],
-        "message": f"Vector store rebuilt with {result['indexed']} entries.",
+        "success": result["success"],
+        "indexed": result["sections"],
+        "error": result.get("error"),
+        "message": (
+            f"Vector store rebuilt with {result['sections']} entries."
+            if result["success"] else "Vector rebuild failed; previous vectors were preserved."
+        ),
     }
 
 
