@@ -15,8 +15,9 @@ a full rebuild, and a graph outage with fallback retrieval.
 
 WHAT IT IS NOT
 --------------
-- NOT an implementation. The deterministic fixture store and the embedded
-  backend are later batches (§12 Batch C / Batch E).
+- NOT an implementation. The deterministic in-memory implementation is
+  :class:`~layered_memory_mcp.graph_fixture_store.InMemoryGraphStore` (§12
+  Batch C); the embedded backend is a later batch (§12 Batch E).
 - NOT a transaction manager or a migration tool.
 - NOT a search engine. Fuzzy wording matching stays with the existing
   BM25/vector retrieval (§7.1), which feeds ``traverse`` its seed IDs.

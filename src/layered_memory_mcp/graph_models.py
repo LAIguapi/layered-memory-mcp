@@ -15,8 +15,8 @@ WHAT IT IS NOT
   remains the L1 document model and the MCP-facing shape; this module is the
   semantic layer those documents will eventually be *projected from*.
 - NOT a store. The store contract lives in
-  :mod:`~layered_memory_mcp.graph_store`; the deterministic fixture
-  implementation is a later batch.
+  :mod:`~layered_memory_mcp.graph_store` and the deterministic in-memory
+  implementation of it in :mod:`~layered_memory_mcp.graph_fixture_store`.
 - NOT a second editable ledger. A node is projected from append-only memory
   events over source evidence (§4); it is not an independent fact source.
 
