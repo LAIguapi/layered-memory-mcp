@@ -1444,3 +1444,283 @@ def test_the_graph_store_is_injected_explicitly_and_defaults_to_none():
     finally:
         server.set_graph_store(None)
     assert server._graph_store is None
+
+
+# ---------------------------------------------------------------------------
+# MCP wiring, Batch I-B: search_semantic — the first *real* seeded recall path
+# ---------------------------------------------------------------------------
+# Unlike the L1 scan behind ``recall_knowledge``, a vector row already carries
+# the explicit ``graph_node_id`` Batch I-A writes into its metadata, so this is
+# the entry point where a mapping actually exists today. The properties under
+# test are the same three: legacy is untouched, the block is additive, and every
+# degradation stays a visible status rather than a failed tool.
+
+SEMANTIC_ROW_ID = "retrieval::index_maintenance"
+SECOND_SEMANTIC_ROW_ID = "indexing::retrieval_index"
+
+
+def _semantic_row(**kwargs) -> dict:
+    """One row shaped exactly as ``VectorStore.search`` already returns it."""
+    data = {
+        "id": SEMANTIC_ROW_ID,
+        "domain": "retrieval",
+        "text": "The retrieval index rebuild runs nightly.",
+        "metadata": {
+            "type": "fact",
+            "confidence": 0.9,
+            "tags": [],
+            "section": "Index maintenance",
+            GRAPH_SEED_ID_KEY: ACTIVE_CLAIM_ID,
+        },
+        "score": 0.8123,
+    }
+    data.update(kwargs)
+    return data
+
+
+class _FakeVectorStore:
+    """The injected vector store — no embedding model, no database, no disk."""
+
+    def __init__(self, rows: list[dict]):
+        self.rows = rows
+        self.calls: list[tuple] = []
+
+    def search(self, query, top_n=5, domain=None):
+        self.calls.append((query, top_n, domain))
+        return deepcopy(self.rows)
+
+
+def _semantic_response(
+    monkeypatch, tmp_path, mode: str, store=None, rows=None, config=None
+):
+    import asyncio
+    import json
+
+    from layered_memory_mcp import server
+
+    monkeypatch.setattr(
+        server,
+        "_config",
+        config if config is not None else _server_config(tmp_path, mode),
+    )
+    monkeypatch.setattr(server, "_graph_store", store)
+    vector = _FakeVectorStore([_semantic_row()] if rows is None else rows)
+    monkeypatch.setattr(server, "_v2_stores", {"vector": vector})
+    monkeypatch.setattr(server, "_record_access", lambda events: None)
+
+    return json.loads(asyncio.run(server.search_semantic(query="index rebuild")))
+
+
+def test_legacy_semantic_search_is_byte_compatible_and_reaches_no_graph_op(
+    monkeypatch, tmp_path
+):
+    store = _RecordingStore()
+    response = _semantic_response(monkeypatch, tmp_path, "legacy", store=store)
+
+    assert response == {
+        "success": True,
+        "query": "index rebuild",
+        "results": [_semantic_row()],
+    }
+    assert "graph" not in response
+    assert store.calls == []
+
+
+def test_legacy_semantic_search_reaches_no_graph_seam_at_all(monkeypatch, tmp_path):
+    """Not even the pure helpers: legacy must be indistinguishable from pre-I-B."""
+    def _refuse(*args, **kwargs):
+        raise AssertionError("legacy mode must not reach the graph runtime")
+
+    monkeypatch.setattr(graph_runtime, "run_graph_assisted_recall", _refuse)
+    monkeypatch.setattr(graph_runtime, "build_seed_mapping", _refuse)
+    monkeypatch.setattr(graph_runtime, "compare_recall_results", _refuse)
+    monkeypatch.setattr(graph_runtime, "graph_recall_payload", _refuse)
+
+    response = _semantic_response(
+        monkeypatch, tmp_path, "legacy", store=_fixture_store()
+    )
+
+    assert "graph" not in response
+    assert response["results"] == [_semantic_row()]
+
+
+def test_the_default_mode_adds_no_graph_block_to_semantic_search(
+    monkeypatch, tmp_path
+):
+    """Not just the explicit string: the *unset* config must stay legacy too."""
+    from layered_memory_mcp.config import MemoryConfig
+
+    monkeypatch.delenv("LAYERED_MEMORY_GRAPH_MODE", raising=False)
+    home = tmp_path / "server-default"
+    knowledge = home / "knowledge"
+    knowledge.mkdir(parents=True, exist_ok=True)
+    config = MemoryConfig(home=str(home), knowledge_dir=str(knowledge))
+    assert config.graph_mode == "legacy"
+
+    store = _RecordingStore()
+    response = _semantic_response(
+        monkeypatch, tmp_path, "legacy", store=store, config=config
+    )
+
+    assert "graph" not in response
+    assert store.calls == []
+
+
+def test_a_graph_mode_adds_a_block_without_touching_the_semantic_results(
+    monkeypatch, tmp_path
+):
+    legacy = _semantic_response(monkeypatch, tmp_path, "legacy")
+    enabled = _semantic_response(
+        monkeypatch, tmp_path, "graph_recall", store=_fixture_store()
+    )
+
+    assert enabled["results"] == legacy["results"]
+    assert enabled["success"] == legacy["success"]
+    assert enabled["query"] == legacy["query"]
+    assert enabled["graph"]["mode"] == "graph_recall"
+
+
+def test_real_semantic_metadata_maps_the_row_identity_to_its_seed_nodes(
+    monkeypatch, tmp_path
+):
+    """The I-A metadata is what produces the mapping — nothing is inferred."""
+    response = _semantic_response(
+        monkeypatch, tmp_path, "graph_recall", store=_fixture_store()
+    )
+
+    block = response["graph"]
+    assert block["status"] in (GRAPH_STATUS_OK, GRAPH_STATUS_PARTIAL)
+    assert block["authoritative"] is True
+    assert block["mapped_results"] == 1
+    assert block["unmapped_results"] == 0
+    # The semantic identity is the vector row id, not a file name.
+    assert block["results"][0]["file"] == SEMANTIC_ROW_ID
+    assert ACTIVE_CLAIM_ID in block["results"][0]["graph_nodes"]
+    # ...and the legacy row is still the legacy row.
+    assert response["results"] == [_semantic_row()]
+
+
+def test_shadow_semantic_search_observes_and_claims_no_authority(
+    monkeypatch, tmp_path
+):
+    response = _semantic_response(
+        monkeypatch, tmp_path, "shadow", store=_fixture_store()
+    )
+
+    block = response["graph"]
+    assert block["authoritative"] is False
+    assert block["graph_assisted"] is True
+    assert block["comparison"]["identical"] is True
+    assert block["comparison"]["dropped_identities"] == []
+    assert block["comparison"]["added_identities"] == []
+    assert block["comparison"]["order_preserved"] is True
+    assert response["results"] == [_semantic_row()]
+
+
+def test_shadow_compares_the_semantic_rows_not_an_empty_legacy_answer(
+    monkeypatch, tmp_path
+):
+    """A comparison that saw no identities on the old side would be a lie."""
+    rows = [_semantic_row(), _semantic_row(id=SECOND_SEMANTIC_ROW_ID, score=0.4)]
+    response = _semantic_response(
+        monkeypatch, tmp_path, "shadow", store=_fixture_store(), rows=rows
+    )
+
+    comparison = response["graph"]["comparison"]
+    assert comparison["old_count"] == 2
+    assert comparison["new_count"] == 2
+    assert comparison["identical"] is True
+
+
+def test_semantic_search_without_a_store_degrades_visibly(monkeypatch, tmp_path):
+    response = _semantic_response(monkeypatch, tmp_path, "graph", store=None)
+
+    assert response["success"] is True
+    assert response["results"] == [_semantic_row()]
+    assert response["graph"]["status"] == GRAPH_STATUS_UNAVAILABLE
+    assert response["graph"]["authoritative"] is False
+
+
+def test_a_broken_injected_store_never_breaks_semantic_search(monkeypatch, tmp_path):
+    class _NotAStore:
+        pass
+
+    response = _semantic_response(
+        monkeypatch, tmp_path, "graph_recall", store=_NotAStore()
+    )
+
+    assert response["success"] is True
+    assert response["results"] == [_semantic_row()]
+    assert response["graph"]["status"] == GRAPH_STATUS_UNAVAILABLE
+    assert "graph_runtime_failed:ValueError" in response["graph"]["warnings"]
+
+
+def test_a_raising_store_leaks_only_the_exception_class_name(monkeypatch, tmp_path):
+    response = _semantic_response(
+        monkeypatch, tmp_path, "graph_recall", store=_RaisingTraversalStore()
+    )
+    import json as _json
+
+    block = _json.dumps(response["graph"], ensure_ascii=False)
+    assert response["success"] is True
+    assert "/tmp/not-a-real-path" not in block
+    assert "backend diagnostic" not in block
+
+
+def test_a_semantic_row_without_graph_metadata_is_an_unmapped_fallback(
+    monkeypatch, tmp_path
+):
+    row = _semantic_row(metadata={"type": "fact", "section": "Index maintenance"})
+    response = _semantic_response(
+        monkeypatch, tmp_path, "graph_recall", store=_fixture_store(), rows=[row]
+    )
+
+    assert response["success"] is True
+    assert response["results"] == [row]
+    assert response["graph"]["status"] == GRAPH_STATUS_UNUSED
+    assert response["graph"]["mapped_results"] == 0
+    assert response["graph"]["unmapped_results"] == 1
+    assert response["graph"]["authoritative"] is False
+
+
+def test_a_semantic_row_without_a_usable_identity_is_counted_not_guessed(
+    monkeypatch, tmp_path
+):
+    """A row with no id cannot be a seed — and must not sink the other rows."""
+    rows = [_semantic_row(id="  "), _semantic_row()]
+    response = _semantic_response(
+        monkeypatch, tmp_path, "graph_recall", store=_fixture_store(), rows=rows
+    )
+
+    assert response["success"] is True
+    assert response["results"] == rows
+    assert response["graph"]["mapped_results"] == 1
+    assert "results_without_identity:1" in response["graph"]["warnings"]
+
+
+def test_the_semantic_graph_block_carries_no_memory_body(monkeypatch, tmp_path):
+    import json as _json
+
+    response = _semantic_response(
+        monkeypatch, tmp_path, "graph", store=_fixture_store()
+    )
+    block = _json.dumps(response["graph"], ensure_ascii=False)
+
+    assert "The retrieval index rebuild runs nightly." not in block
+    assert "The index rebuild job is scheduled nightly." not in block
+    assert "Index maintenance" not in block
+
+
+def test_the_semantic_graph_block_is_additive_only(monkeypatch, tmp_path):
+    """Every pre-I-B response key keeps its pre-I-B value in every mode."""
+    legacy = _semantic_response(monkeypatch, tmp_path, "legacy")
+    for mode in ("shadow", "graph_recall", "graph_write", "graph"):
+        enabled = _semantic_response(
+            monkeypatch, tmp_path, mode, store=_fixture_store()
+        )
+        assert {k: v for k, v in enabled.items() if k != "graph"} == legacy
+    # graph_write neither observes recall nor adds a block to a read path.
+    write_only = _semantic_response(
+        monkeypatch, tmp_path, "graph_write", store=_RecordingStore()
+    )
+    assert "graph" not in write_only

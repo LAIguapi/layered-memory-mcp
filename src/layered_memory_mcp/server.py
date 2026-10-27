@@ -329,6 +329,108 @@ def _graph_recall_block(config: MemoryConfig, result: dict) -> dict | None:
     return block
 
 
+# v3.6.0 Batch I-B: the semantic-search result key that already *is* a stable
+# row identity — the vector row's ``id``, which is the L1 entry id Batch I-A
+# derives the ``graph_node_id`` metadata from. A ``text`` snippet, a ``domain``
+# or a ``section`` is deliberately not usable here: none of them is unique, and
+# a non-unique key would silently merge two rows into one graph seed.
+SEMANTIC_RESULT_IDENTITY_KEY = "id"
+
+
+def _semantic_graph_seeds(results) -> tuple[list[dict], int]:
+    """Project vector rows onto the identity shape the graph seam requires.
+
+    ``VectorStore.search`` emits ``{id, domain, text, metadata, score}``, while
+    the recall seam keys its mapping by ``file`` (the identity the L1 recall
+    path emits). This is the whole translation: ``id`` → the seam's identity
+    key, the numeric ``score``, and the row's ``metadata`` *verbatim* — the
+    graph IDs are read from it by ``build_seed_mapping``, never from the text,
+    the domain or the id itself.
+
+    The rows are a separate, minimal projection rather than the payloads
+    themselves: nothing the graph seam returns can then reach the semantic
+    results, and a row's body never travels into a report that may be logged.
+
+    A row with no usable identity is *dropped from the seeds and counted*,
+    rather than raising: one unusable row must not cost the other rows their
+    graph material, and a fabricated identity would attach a row to a node it
+    never named. The identity rule is ``clean_identifier`` itself — the same
+    one :class:`~layered_memory_mcp.graph_recall.RecallSeed` applies — so the
+    two cannot drift apart.
+
+    Returns:
+        ``(seed_rows, rows_without_identity)``.
+    """
+    from .graph_models import clean_identifier
+    from .graph_runtime import GRAPH_METADATA_KEY, GRAPH_RESULT_IDENTITY_KEY
+
+    seeds: list[dict] = []
+    without_identity = 0
+    for row in results or []:
+        raw_identity = (
+            row.get(SEMANTIC_RESULT_IDENTITY_KEY) if isinstance(row, dict) else None
+        )
+        if not isinstance(raw_identity, str):
+            without_identity += 1
+            continue
+        try:
+            identity = clean_identifier(raw_identity, GRAPH_RESULT_IDENTITY_KEY)
+        except ValueError:
+            without_identity += 1
+            continue
+
+        score = row.get("score", 0.0)
+        seed = {
+            GRAPH_RESULT_IDENTITY_KEY: identity,
+            "score": (
+                float(score)
+                if isinstance(score, (int, float)) and not isinstance(score, bool)
+                else 0.0
+            ),
+        }
+        if GRAPH_METADATA_KEY in row:
+            # Verbatim, including a malformed value: ``build_seed_mapping``
+            # already counts "not a mapping" / "no graph key" as named
+            # fallbacks, and that report is more honest than a silent drop.
+            seed[GRAPH_METADATA_KEY] = row[GRAPH_METADATA_KEY]
+        seeds.append(seed)
+
+    return seeds, without_identity
+
+
+def _semantic_graph_block(config: MemoryConfig, results) -> dict | None:
+    """The additive graph block for a semantic-search response, or None.
+
+    ``search_semantic`` is the first entry point where a graph mapping actually
+    exists: unlike the L1 file scan behind ``recall_knowledge``, a vector row
+    carries the explicit ``graph_node_id`` metadata Batch I-A writes.
+
+    The mode is checked here first so ``legacy`` does no work at all — not the
+    projection below, and (through ``_graph_recall_block``) not one graph
+    operation — leaving the response exactly what it was. In a graph-enabled
+    mode the block is purely additive: ``success`` / ``query`` / ``results``
+    are never rewritten, reordered or re-scored, and the orchestration is the
+    existing ``_graph_recall_block`` rather than a second runtime.
+    """
+    from .graph_runtime import GraphModeDecision
+
+    mode = GraphModeDecision.from_config(config)
+    if not mode.observes_recall:
+        return None
+
+    seeds, without_identity = _semantic_graph_seeds(results)
+    block = _graph_recall_block(config, {"results": seeds})
+    if block is None:  # pragma: no cover - the mode above already said yes
+        return None
+    if without_identity:
+        # Counted, not hidden: these rows are in the answer but have no graph
+        # identity to expand from.
+        block["warnings"] = sorted(
+            {*block.get("warnings", ()), f"results_without_identity:{without_identity}"}
+        )
+    return block
+
+
 # ---------------------------------------------------------------------------
 # Helper: wrap blocking I/O for async contexts
 # ---------------------------------------------------------------------------
@@ -2165,11 +2267,23 @@ async def search_semantic(
     except Exception as exc:
         logger.debug("semantic telemetry skipped: %s", exc)
 
-    return json.dumps({
+    payload = {
         "success": True,
         "query": query,
         "results": results,
-    }, ensure_ascii=False, indent=2)
+    }
+
+    # v3.6.0 Batch I-B: graph-assisted semantic recall, additive and mode-gated.
+    # In the default `legacy` mode this adds no key and reaches no graph
+    # operation, so the response is exactly what it always was. The graph work
+    # is blocking, so it goes to a thread like every other blocking call here.
+    graph_block = await asyncio.to_thread(
+        _semantic_graph_block, _get_config(), results
+    )
+    if graph_block is not None:
+        payload["graph"] = graph_block
+
+    return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
