@@ -359,6 +359,33 @@ AGENT_EXTENSION_MODES = ("suggest", "apply_with_confirmation", "apply")
 
 ROUTING_MODES = ("advisory", "enforce")
 
+#: The memory-graph integration modes (ARCHITECTURE_v2.md §12 Batch H). ONE
+#: validated decision rather than several booleans that can drift into a
+#: half-enabled state nobody declared:
+#:
+#:   "legacy"       -- old recall, old write. The default, and the way back.
+#:   "shadow"       -- old behaviour stays authoritative; graph recall/write
+#:                     preparation may be *observed*, changes no answer and
+#:                     commits no graph state.
+#:   "graph_recall" -- graph-assisted recall is authoritative when healthy
+#:                     (with graph_recall.py's own fallback); writes stay legacy.
+#:   "graph_write"  -- semantic graph writes are enabled where an explicit
+#:                     decision is supplied; recall stays legacy.
+#:   "graph"        -- both.
+#:
+#: Order is the enabling order, so the tuple reads as the rollout ladder.
+GRAPH_MODES = ("legacy", "shadow", "graph_recall", "graph_write", "graph")
+
+#: The default. A graph that turns itself on would make the integration
+#: irreversible in exactly the batch that exists to keep it reversible.
+DEFAULT_GRAPH_MODE = "legacy"
+
+#: Modes in which graph-assisted recall may decide the answer.
+_GRAPH_RECALL_MODES = ("graph_recall", "graph")
+
+#: Modes in which an explicit semantic write decision may reach a store.
+_GRAPH_WRITE_MODES = ("graph_write", "graph")
+
 
 def _normalize_agent_extensions(raw: object) -> dict:
     """Normalise the ``agent_extensions`` section to a complete, safe shape.
@@ -509,6 +536,9 @@ class MemoryConfig:
         # Unreleased — MEMORY_CHANGELOG backend (see memory_changelog.py).
         # Raw YAML section shape: {enabled, path, retention_days}.
         memory_changelog: dict | None = None,
+        # v3.6.0 — memory-graph integration mode (see GRAPH_MODES). One
+        # validated switch for graph-assisted recall and semantic graph writes.
+        graph_mode: str | None = None,
     ):
         self.home = Path(home) if home else default_home()
 
@@ -1077,6 +1107,40 @@ class MemoryConfig:
         except (TypeError, ValueError):
             self.memory_changelog_retention_days = None
 
+        # v3.6.0: memory-graph integration mode (see GRAPH_MODES). The whole
+        # control plane of Batch H is this one string:
+        #
+        #   graph:
+        #     mode: legacy   # legacy | shadow | graph_recall | graph_write | graph
+        #
+        # Precedence: constructor → LAYERED_MEMORY_GRAPH_MODE → `graph:` in
+        # <home>/config.yaml → "legacy". Unlike `routing:` an unknown value
+        # RAISES rather than falling back per key: the whole point of a single
+        # mode is that "which path is authoritative?" has one answer, and a
+        # typo that silently resolved to legacy would make a graph rollout
+        # look enabled while nothing was. A malformed *section* (not a mapping)
+        # still degrades to the default, matching the rest of this file —
+        # nothing was declared, so nothing is overridden.
+        #
+        # Deliberately NOT here: a backend, a path, a connection. The store is
+        # injected by the runtime assembly (graph_runtime.py); a config that
+        # could build one would make the graph a second truth source by
+        # default, which §5 forbids in this batch.
+        _graph_yaml = _load_yaml_section(self.home, "graph")
+        _graph_mode = (
+            graph_mode
+            if graph_mode is not None
+            else os.environ.get("LAYERED_MEMORY_GRAPH_MODE")
+            or _graph_yaml.get("mode")
+            or DEFAULT_GRAPH_MODE
+        )
+        self.graph_mode: str = str(_graph_mode).strip().lower()
+        if self.graph_mode not in GRAPH_MODES:
+            raise ValueError(
+                f"Invalid graph_mode: {self.graph_mode!r}. Must be one of "
+                f"{', '.join(repr(m) for m in GRAPH_MODES)}."
+            )
+
         # Resolve namespace-aware knowledge directories
         if self.namespace != "shared":
             self._knowledge_root = self.knowledge_dir  # base knowledge/
@@ -1199,6 +1263,39 @@ class MemoryConfig:
             from .adapters.environment import DEFAULT_SEPARATOR
 
             return DEFAULT_SEPARATOR
+
+    # ------------------------------------------------------------------
+    # Memory-graph integration predicates (v3.6.0)
+    # ------------------------------------------------------------------
+    #
+    # Every caller branches on these, never on ``graph_mode == "..."``: one
+    # place to read means adding a mode cannot leave a stale string comparison
+    # behind in recall, in the write path and in the MCP wiring.
+
+    @property
+    def graph_enabled(self) -> bool:
+        """Whether anything graph-shaped is switched on at all."""
+        return self.graph_mode != DEFAULT_GRAPH_MODE
+
+    @property
+    def graph_recall_enabled(self) -> bool:
+        """Whether graph-assisted recall may decide the answer."""
+        return self.graph_mode in _GRAPH_RECALL_MODES
+
+    @property
+    def graph_write_enabled(self) -> bool:
+        """Whether an explicit semantic write decision may reach a store."""
+        return self.graph_mode in _GRAPH_WRITE_MODES
+
+    @property
+    def graph_shadow_enabled(self) -> bool:
+        """Whether the graph is observed without being allowed to decide.
+
+        Deliberately *not* "any non-legacy mode": shadow is the one mode whose
+        output must be comparison material only, so it has to be
+        distinguishable from a mode where the graph is authoritative.
+        """
+        return self.graph_mode == "shadow"
 
     @property
     def knowledge_dirs(self) -> list[Path]:

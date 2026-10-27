@@ -258,6 +258,78 @@ def _get_config() -> MemoryConfig:
 
 
 # ---------------------------------------------------------------------------
+# v3.6.0: the memory-graph store is INJECTED, never constructed here
+# ---------------------------------------------------------------------------
+# None means "no graph", which every graph-enabled mode handles as a reported
+# outage rather than an error. Nothing in this module builds a backend: a server
+# that opened a graph database on start-up would make the graph a second truth
+# source by default, which is exactly what the Batch H mode exists to prevent
+# (see ARCHITECTURE_v2.md §12; backend assembly is a later batch).
+_graph_store = None
+
+
+def set_graph_store(store) -> None:
+    """Inject (or clear with ``None``) the memory-graph backend.
+
+    The explicit seam for a runtime assembly — a deployment script, an embedding
+    host, a test. Clearing it is always safe: a graph-enabled mode then reports
+    ``graph_unavailable:no_store`` and answers from the legacy path.
+    """
+    global _graph_store
+    _graph_store = store
+
+
+def _graph_recall_block(config: MemoryConfig, result: dict) -> dict | None:
+    """The additive graph block for a recall response, or None in legacy mode.
+
+    Returning ``None`` is what keeps the legacy response byte-identical: in
+    ``legacy`` mode this function touches nothing and adds no key.
+
+    In a graph-enabled mode the block is purely additive — the existing
+    ``results`` / ``matched_files`` / ``search_mode`` fields are never rewritten,
+    reordered or re-scored. Shadow mode additionally carries the deterministic
+    comparison record, which is the whole point of shadowing.
+
+    Never raises: recall is the hot read path, so a caller-contract error in the
+    graph seam (a malformed injected store, a duplicated result identity) is
+    reported as an outage in the block instead of failing the tool.
+    """
+    from .graph_recall import GRAPH_STATUS_UNAVAILABLE
+    from .graph_runtime import (
+        GraphModeDecision,
+        GraphRecallRuntimeReport,
+        compare_recall_results,
+        graph_recall_payload,
+        run_graph_assisted_recall,
+    )
+
+    mode = GraphModeDecision.from_config(config)
+    if not mode.observes_recall:
+        return None
+
+    legacy_results = result.get("results") or []
+    try:
+        report = run_graph_assisted_recall(
+            legacy_results, _graph_store, mode=mode
+        )
+    except Exception as exc:
+        # The class name only: a store diagnostic may name a database file.
+        logger.debug("graph-assisted recall unavailable: %s", type(exc).__name__)
+        report = GraphRecallRuntimeReport(
+            mode=mode.mode,
+            status=GRAPH_STATUS_UNAVAILABLE,
+            warnings=[f"graph_runtime_failed:{type(exc).__name__}"],
+        )
+
+    block = graph_recall_payload(report)
+    if mode.shadow_enabled:
+        # The shadow evidence itself: identities, order, counts and status —
+        # never a memory body, so the block stays safe to log and sample.
+        block["comparison"] = compare_recall_results(legacy_results, report).to_dict()
+    return block
+
+
+# ---------------------------------------------------------------------------
 # Helper: wrap blocking I/O for async contexts
 # ---------------------------------------------------------------------------
 
@@ -482,6 +554,13 @@ async def recall_knowledge(
     staleness = await asyncio.to_thread(quick_l0_consistency_check, config)
     if staleness:
         result["l0_staleness_warning"] = staleness
+
+    # v3.6.0: graph-assisted recall, additive and mode-gated. In the default
+    # `legacy` mode this adds no key and reaches no graph operation, so the
+    # response is exactly what it always was.
+    graph_block = await asyncio.to_thread(_graph_recall_block, config, result)
+    if graph_block is not None:
+        result["graph"] = graph_block
 
     return json.dumps(result, ensure_ascii=False, indent=2)
 
