@@ -26,7 +26,7 @@ import sqlite3
 import threading
 from contextlib import closing, contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Mapping
 
 import numpy as np
 
@@ -169,6 +169,68 @@ def entry_metadata(entry: "KnowledgeEntry") -> dict:
         },
         entry,
     )
+
+
+def _metadata_payload_text(row_id: str, metadata) -> str | None:
+    """One ``patch_metadata`` value as the text that will be stored.
+
+    Three accepted shapes, each for a reason:
+
+    * a mapping — the normal forward direction, written as canonical key-sorted
+      JSON so two callers planning the same metadata write the same bytes;
+    * a ``str`` holding a JSON object — written verbatim, which is what lets a
+      rollback restore a row's previous bytes exactly rather than a re-encoded
+      equivalent;
+    * ``None`` — SQL NULL, so "this row had no metadata" is a state a
+      reversible publication can return to.
+
+    Anything else is refused rather than coerced; the error names the row and
+    the shape, never the value (§15).
+    """
+    if metadata is None:
+        return None
+    if isinstance(metadata, str):
+        try:
+            decoded = json.loads(metadata)
+        except ValueError:
+            raise ValueError(
+                f"metadata text for row {row_id!r} is not valid JSON"
+            ) from None
+        if not isinstance(decoded, dict):
+            raise ValueError(
+                f"metadata text for row {row_id!r} is not a JSON object"
+            )
+        return metadata
+    if not isinstance(metadata, Mapping):
+        raise ValueError(
+            f"metadata for row {row_id!r} must be a mapping, text or None"
+        )
+    if any(not isinstance(key, str) for key in metadata):
+        raise ValueError(f"metadata keys for row {row_id!r} must be strings")
+    try:
+        return json.dumps(dict(metadata), sort_keys=True)
+    except TypeError:
+        raise ValueError(
+            f"metadata for row {row_id!r} is not JSON-serializable"
+        ) from None
+
+
+def _metadata_differs(stored: str | None, text: str | None) -> bool:
+    """Whether writing ``text`` would actually change this row.
+
+    Byte equality first, then value equality: a stored dict whose keys happen to
+    be in a different order than the canonical form says the same thing, and
+    rewriting it would be churn rather than a change.
+    """
+    if stored == text:
+        return False
+    if stored is None or text is None:
+        return True
+    try:
+        return json.loads(stored) != json.loads(text)
+    except ValueError:
+        # Unparseable stored metadata is not equal to anything we would write.
+        return True
 
 
 class VectorStore:
@@ -401,6 +463,110 @@ class VectorStore:
                 replacement,
             )
         self._invalidate_cache()
+
+    def patch_metadata(
+        self,
+        updates,
+        *,
+        expected: list[tuple],
+        validate_source=None,
+    ) -> int:
+        """Atomically publish new ``metadata`` for existing rows. Nothing else.
+
+        The narrow seam the §12 Batch I-C graph-identity backfill publishes
+        through, so a metadata-only migration reuses this store's existing
+        optimistic publication boundary instead of mutating rows with ad-hoc
+        SQL. ``replace_entries`` is left exactly as it was: it re-embeds by
+        design, and re-embedding is the one thing a metadata backfill must not
+        do.
+
+        Only the ``metadata`` column is written. ``id``, ``domain``, ``text``,
+        ``vector`` and ``created_at`` are never part of the UPDATE, so no
+        authored text, embedding, ranking order or source timestamp can move
+        through this path.
+
+        Args:
+            updates: A mapping of row ID → new metadata, or an iterable of
+                ``(row_id, metadata)`` pairs. A metadata value is either a
+                mapping (written as canonical, key-sorted JSON), a ``str``
+                holding a JSON object (written verbatim — the form a rollback
+                uses to restore the previous bytes exactly), or ``None`` (the
+                column is set to SQL NULL, so a row that had no metadata can be
+                put back to having none).
+            expected: The committed snapshot the caller prepared against, as
+                returned by :meth:`snapshot`. Compared again *inside* the write
+                transaction.
+            validate_source: Optional external-source check, called inside the
+                same transaction, exactly as in :meth:`add` and
+                :meth:`replace_entries`.
+
+        Returns:
+            How many rows were actually rewritten. A no-op update — the stored
+            metadata already says the same thing — rewrites nothing and is
+            reported as zero.
+
+        Raises:
+            ValueError: A malformed ``updates`` payload, a duplicated row ID, a
+                non-serializable metadata value, or a ``str`` payload that is
+                not a JSON object. Nothing is written.
+            KeyError: An update names a row this store does not hold. Nothing is
+                written, so readers keep the previous committed rows.
+            RuntimeError: The store changed during preparation — the existing
+                retry-required refusal shared with the other write paths.
+        """
+        self._check_open()
+        prepared = self._prepare_metadata_updates(updates)
+        if not prepared:
+            return 0
+
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._validate_publication(conn, expected, validate_source)
+            stored = dict(
+                conn.execute("SELECT id, metadata FROM vectors").fetchall()
+            )
+            missing = sorted(set(prepared) - set(stored))
+            if missing:
+                raise KeyError(f"unknown vector row ids: {', '.join(missing)}")
+
+            changed = [
+                (text, row_id)
+                for row_id, text in sorted(prepared.items())
+                if _metadata_differs(stored[row_id], text)
+            ]
+            if not changed:
+                # No row is rewritten at all: a no-op must not churn bytes that
+                # another reader is comparing snapshots against.
+                return 0
+            conn.executemany(
+                "UPDATE vectors SET metadata = ? WHERE id = ?", changed
+            )
+        self._invalidate_cache()
+        return len(changed)
+
+    @staticmethod
+    def _prepare_metadata_updates(updates) -> dict[str, str | None]:
+        """Validate the payload and render each value to its stored text.
+
+        Everything that can be refused is refused here, before a transaction is
+        opened, because a publication that validates halfway through is a
+        publication that can leave half a migration behind.
+        """
+        items = updates.items() if isinstance(updates, Mapping) else updates
+        prepared: dict[str, str | None] = {}
+        for item in items:
+            try:
+                row_id, metadata = item
+            except (TypeError, ValueError):
+                raise ValueError(
+                    "metadata updates must be a mapping or (row_id, metadata) pairs"
+                ) from None
+            if not isinstance(row_id, str) or not row_id:
+                raise ValueError("a metadata update row id must be a non-empty str")
+            if row_id in prepared:
+                raise ValueError(f"duplicate metadata update for row {row_id!r}")
+            prepared[row_id] = _metadata_payload_text(row_id, metadata)
+        return prepared
 
     def delete(self, entry_id: str) -> None:
         """Remove an entry from the vector store."""
