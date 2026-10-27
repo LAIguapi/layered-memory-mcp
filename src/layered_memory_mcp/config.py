@@ -450,6 +450,47 @@ def _normalize_agent_extensions(raw: object) -> dict:
     return out
 
 
+def _resolve_graph_db_path(value: object) -> Path | None:
+    """Normalise the declared graph database target, or refuse it.
+
+    v3.6.0 Batch I-A. Three answers only, and "guess one" is not among them:
+
+    * nothing declared (``None``, or a blank string) → ``None``. The graph is
+      *not configured*, and the runtime assembly reports exactly that. A path
+      is never derived from ``home``, ``knowledge_dir`` or the agent's private
+      memory path: a backend that can find a location on its own is a backend
+      that can find the wrong one.
+    * an absolute path (``~`` expanded) → that :class:`~pathlib.Path`. Nothing
+      is created here — not the file, not its parent — because resolving a
+      config value must not have a filesystem side effect.
+    * anything else → ``ValueError``, matching ``graph_mode`` in the same
+      section rather than the per-key fallback the advisory sections use. A
+      relative path would silently resolve against whatever directory the
+      server happened to start in, which is the same class of mistake as a
+      guessed one; a non-string (``db_path: true``) never named a file at all.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (str, Path)):
+        raise ValueError(
+            f"Invalid graph_db_path: {value!r}. Must be an absolute filesystem "
+            "path to the graph database, or unset."
+        )
+    text = str(value)
+    if "\n" in text or "\r" in text:
+        raise ValueError("Invalid graph_db_path: must not contain newlines.")
+    text = text.strip()
+    if not text:
+        return None
+    path = Path(text).expanduser()
+    if not path.is_absolute():
+        raise ValueError(
+            f"Invalid graph_db_path: {text!r}. Must be an absolute path — a "
+            "relative one would resolve against the server's working directory."
+        )
+    return path
+
+
 def _coerce_str_list(value: object) -> list[str]:
     """Coerce a YAML scalar or list into a clean list of strings."""
     if value is None:
@@ -539,6 +580,9 @@ class MemoryConfig:
         # v3.6.0 — memory-graph integration mode (see GRAPH_MODES). One
         # validated switch for graph-assisted recall and semantic graph writes.
         graph_mode: str | None = None,
+        # v3.6.0 Batch I — the one explicit graph database target. A declared
+        # path, never a derived one; see _resolve_graph_db_path.
+        graph_db_path: str | None = None,
     ):
         self.home = Path(home) if home else default_home()
 
@@ -1122,10 +1166,12 @@ class MemoryConfig:
         # still degrades to the default, matching the rest of this file —
         # nothing was declared, so nothing is overridden.
         #
-        # Deliberately NOT here: a backend, a path, a connection. The store is
-        # injected by the runtime assembly (graph_runtime.py); a config that
-        # could build one would make the graph a second truth source by
-        # default, which §5 forbids in this batch.
+        # Deliberately NOT here: a backend or a connection. The store is
+        # injected by the runtime assembly (graph_runtime_assembly.py); a config
+        # that could build one would make the graph a second truth source by
+        # default, which §5 forbids in this batch. ``db_path`` below is the one
+        # exception §12 Batch I adds, and it is a *declared target* rather than
+        # an opened one: resolving it opens nothing and creates nothing.
         _graph_yaml = _load_yaml_section(self.home, "graph")
         _graph_mode = (
             graph_mode
@@ -1140,6 +1186,28 @@ class MemoryConfig:
                 f"Invalid graph_mode: {self.graph_mode!r}. Must be one of "
                 f"{', '.join(repr(m) for m in GRAPH_MODES)}."
             )
+
+        # v3.6.0 Batch I: the graph database target, on the same resolution
+        # chain as the mode — constructor → LAYERED_MEMORY_GRAPH_DB_PATH →
+        # `graph.db_path` in <home>/config.yaml → unset:
+        #
+        #   graph:
+        #     mode: shadow
+        #     db_path: /srv/layered-memory/graph.db
+        #
+        # Unset is a *complete* answer, not a prompt to infer one: an operator
+        # who has not named a database has not consented to one existing, and
+        # the assembly reports `graph_store_not_configured` rather than
+        # materialising a file next to the knowledge store or, worse, next to
+        # the agent's own memory. The mode and the path are independent — a
+        # mode may be enabled before a backend exists, and a path may be
+        # declared while the mode is still legacy.
+        self.graph_db_path: Path | None = _resolve_graph_db_path(
+            graph_db_path
+            if graph_db_path is not None
+            else os.environ.get("LAYERED_MEMORY_GRAPH_DB_PATH")
+            or _graph_yaml.get("db_path")
+        )
 
         # Resolve namespace-aware knowledge directories
         if self.namespace != "shared":

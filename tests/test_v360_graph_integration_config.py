@@ -36,7 +36,7 @@ import pytest
 
 from layered_memory_mcp.config import GRAPH_MODES, MemoryConfig
 
-_GRAPH_ENV_VARS = ("LAYERED_MEMORY_GRAPH_MODE",)
+_GRAPH_ENV_VARS = ("LAYERED_MEMORY_GRAPH_MODE", "LAYERED_MEMORY_GRAPH_DB_PATH")
 
 
 @pytest.fixture(autouse=True)
@@ -190,8 +190,10 @@ def test_an_invalid_mode_in_config_yaml_still_fails_loudly(tmp_path):
 def test_enabling_a_mode_constructs_no_graph_backend(tmp_path):
     config = _config(tmp_path, graph_mode="graph")
 
-    # No store, no handle, no path: the backend is injected by the runtime
-    # assembly, not derived from a default config.
+    # No store and no handle: the backend is injected by the runtime assembly,
+    # not derived from a config. ``graph_db_path`` is a *declared* target
+    # (§12 Batch I scope item 1) — a string the operator wrote, not a
+    # connection — and it is None unless they wrote one.
     assert not [
         name
         for name in dir(config)
@@ -201,8 +203,99 @@ def test_enabling_a_mode_constructs_no_graph_backend(tmp_path):
             "graph_recall_enabled",
             "graph_write_enabled",
             "graph_shadow_enabled",
+            "graph_db_path",
         }
     ]
+    assert config.graph_db_path is None
+
+
+# ---------------------------------------------------------------------------
+# The graph database path (v3.6.0 Batch I-A)
+# ---------------------------------------------------------------------------
+
+def test_no_database_path_is_configured_by_default(tmp_path):
+    config = _config(tmp_path, graph_mode="graph")
+
+    # Not guessed from the home, the knowledge dir or the agent memory path:
+    # an unconfigured graph has no file, and the assembly says so.
+    assert config.graph_db_path is None
+
+
+def test_the_constructor_sets_the_database_path(tmp_path):
+    target = tmp_path / "graph-data" / "graph.db"
+    assert _config(tmp_path, graph_db_path=str(target)).graph_db_path == target
+
+
+def test_setting_a_path_creates_no_file_and_no_directory(tmp_path):
+    target = tmp_path / "graph-data" / "graph.db"
+    _config(tmp_path, graph_db_path=str(target))
+
+    assert not target.exists()
+    assert not target.parent.exists()
+
+
+def test_the_environment_sets_the_database_path(tmp_path, monkeypatch):
+    target = tmp_path / "from-env.db"
+    monkeypatch.setenv("LAYERED_MEMORY_GRAPH_DB_PATH", str(target))
+    assert _config(tmp_path).graph_db_path == target
+
+
+def test_the_constructor_beats_the_environment_for_the_path(tmp_path, monkeypatch):
+    monkeypatch.setenv("LAYERED_MEMORY_GRAPH_DB_PATH", str(tmp_path / "from-env.db"))
+    target = tmp_path / "explicit.db"
+    assert _config(tmp_path, graph_db_path=str(target)).graph_db_path == target
+
+
+def test_config_yaml_sets_the_database_path(tmp_path):
+    target = tmp_path / "from-yaml.db"
+    _write_graph_yaml(tmp_path, f"graph:\n  mode: shadow\n  db_path: {target}\n")
+    assert _config(tmp_path).graph_db_path == target
+
+
+def test_the_environment_beats_config_yaml_for_the_path(tmp_path, monkeypatch):
+    _write_graph_yaml(tmp_path, f"graph:\n  db_path: {tmp_path / 'from-yaml.db'}\n")
+    target = tmp_path / "from-env.db"
+    monkeypatch.setenv("LAYERED_MEMORY_GRAPH_DB_PATH", str(target))
+    assert _config(tmp_path).graph_db_path == target
+
+
+def test_a_malformed_graph_section_leaves_the_path_unset(tmp_path):
+    _write_graph_yaml(tmp_path, "graph: not-a-mapping\n")
+    assert _config(tmp_path).graph_db_path is None
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_a_blank_path_means_unconfigured_rather_than_a_guess(tmp_path, blank):
+    assert _config(tmp_path, graph_db_path=blank).graph_db_path is None
+
+
+def test_a_user_relative_path_is_expanded(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
+    assert _config(tmp_path, graph_db_path="~/graph.db").graph_db_path == (
+        tmp_path / "fake-home" / "graph.db"
+    )
+
+
+@pytest.mark.parametrize("bad", ["graph.db", "data/graph.db", "./graph.db"])
+def test_a_relative_path_is_refused_instead_of_resolved_against_the_cwd(
+    tmp_path, bad
+):
+    with pytest.raises(ValueError) as excinfo:
+        _config(tmp_path, graph_db_path=bad)
+    assert "graph_db_path" in str(excinfo.value)
+
+
+def test_a_multi_line_path_is_refused(tmp_path):
+    with pytest.raises(ValueError) as excinfo:
+        _config(tmp_path, graph_db_path=f"{tmp_path}/a\n{tmp_path}/b")
+    assert "graph_db_path" in str(excinfo.value)
+
+
+def test_a_non_path_value_in_config_yaml_is_refused(tmp_path):
+    _write_graph_yaml(tmp_path, "graph:\n  db_path: true\n")
+    with pytest.raises(ValueError) as excinfo:
+        _config(tmp_path)
+    assert "graph_db_path" in str(excinfo.value)
 
 
 def test_the_config_module_opens_no_graph_database(tmp_path, monkeypatch):

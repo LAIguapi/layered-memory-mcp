@@ -142,6 +142,35 @@ def entry_embedding_text(entry: "KnowledgeEntry") -> str:
     return "\n".join(parts).strip()
 
 
+def entry_metadata(entry: "KnowledgeEntry") -> dict:
+    """The metadata one stored row carries: display fields plus graph identity.
+
+    One producer for both write paths (``add`` and ``replace_entries``), because
+    two inline dicts are how the two paths would start disagreeing about what a
+    row says about itself.
+
+    v3.6.0 Batch I-A adds the canonical ``graph_node_id`` beside the existing
+    keys — additive, so every existing consumer of ``type``/``confidence``/
+    ``tags``/``section`` is unaffected. An entry whose identity cannot produce a
+    stable node ID simply has no such key, which the recall seam already reports
+    as an unmapped row rather than treating as a fabricated one.
+
+    The import is function-local on purpose: this module sits on the write hot
+    path and the graph layer is not a dependency of embedding or search.
+    """
+    from ..graph_seed_metadata import merge_graph_seed_metadata
+
+    return merge_graph_seed_metadata(
+        {
+            "type": entry.type.value,
+            "confidence": entry.confidence,
+            "tags": entry.tags,
+            "section": entry.section,
+        },
+        entry,
+    )
+
+
 class VectorStore:
     """SQLite-backed vector store for semantic search.
 
@@ -300,12 +329,7 @@ class VectorStore:
                 raise ValueError("embedding returned invalid shape or non-finite values")
             vector_json = json.dumps(vectors[0].tolist())
 
-        metadata = {
-            "type": entry.type.value,
-            "confidence": entry.confidence,
-            "tags": entry.tags,
-            "section": entry.section,
-        }
+        metadata = entry_metadata(entry)
 
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -361,10 +385,8 @@ class VectorStore:
         if vectors.shape != (len(entries), EMBED_DIM) or not np.isfinite(vectors).all():
             raise ValueError("embedding returned invalid shape or non-finite values")
         replacement = [
-            (entry.id, entry.domain, text, json.dumps(vector.tolist()), json.dumps({
-                "type": entry.type.value, "confidence": entry.confidence,
-                "tags": entry.tags, "section": entry.section,
-            }))
+            (entry.id, entry.domain, text, json.dumps(vector.tolist()),
+             json.dumps(entry_metadata(entry)))
             for entry, text, vector in zip(entries, texts, vectors)
         ]
         with self._connect() as conn:
