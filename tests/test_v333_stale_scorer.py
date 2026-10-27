@@ -1,11 +1,11 @@
 """v3.3.3 — stale scoring must not convict retrospective notes.
 
-The live library scored 6 "stale" sections, all six false positives: the old
-detector flagged a section when a marker from ``_TRANSIENT_MARKERS`` (which
-included the scope qualifiers 临时 / 暂时) appeared anywhere in the heading or
-leading two lines AND any past date appeared in the same text. Every dated
-lesson — "（2026-09-11 实测）", "（2026-07-16，含实证）" — therefore tripped it,
-costing 18 points of a 56-point score for nothing.
+The old detector flagged a section when a marker from ``_TRANSIENT_MARKERS``
+(which included the scope qualifiers 临时 / 暂时) appeared anywhere in the heading
+or leading two lines AND any past date appeared in the same text. Dated lessons
+containing those qualifiers — for example, "（2026-09-11 实测）" or
+"（2026-07-16，含实证）" — could therefore be misclassified as stale despite
+having no overdue promise.
 
 A section can only be *overdue* if it carries a promise: the fix keeps only
 forward-looking markers, and requires the date to sit on the same line as that
@@ -32,7 +32,7 @@ def _stale(tmp_path: Path, text: str) -> list[dict]:
 
 
 class TestRetrospectiveNotesAreNotStale:
-    """The six live false positives, in their general shape."""
+    """Retrospective notes must not be mistaken for overdue promises."""
 
     def test_scope_qualifier_with_observation_date_is_not_stale(self, tmp_path):
         stale = _stale(tmp_path, (

@@ -50,9 +50,8 @@ def default_state_db_path(adapter: object | None = None) -> Path | None:
 
     An agent that keeps sessions in a SQLite DB (Hermes: ``~/.hermes/state.db``)
     does *not* keep them in the JSON directory :func:`default_sessions_dir`
-    points at — that directory only holds stale request dumps these days, which
-    is why a directory scan can come back with zero sessions while the agent has
-    been busy for weeks.
+    points at — that directory holds legacy request dumps. Scanning only the
+    directory can therefore miss recent sessions stored in the database.
 
     ``None`` means the resolved adapter has no such database; callers treat that
     as "no live-session source" rather than as an error.

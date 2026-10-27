@@ -1,12 +1,9 @@
 """v3.4.6 — write paths must not report success for an id that matched no row.
 
-Reported shape (two live incidents, 2026-10-07): an agent called ``update_todo``
-with a mistyped id — once the real ``8ff292e9-…`` with one character corrupted,
-once a fabricated UUID for a row the agent had only seen truncated. Both calls
-returned ``{"success": true, "id": "<the bad id>"}`` and the row never changed.
-Because the reply looked identical to a real edit, the mistake was invisible until
-a later read-back showed the stale content — i.e. the *tool* was lying, not the
-caller misunderstanding.
+An ``update_todo`` call with a mistyped or fabricated id could return
+``{"success": true, "id": "<the bad id>"}`` even though no row changed.
+Because the reply looked identical to an applied edit, a caller could only
+detect the failed write by reading the row back.
 
 Same class of defect on three paths, all locked down here:
 
@@ -63,7 +60,7 @@ class TestUnknownIdIsNotSuccess:
         assert "no-such-id" in result["error"]
 
     def test_update_one_character_off_is_reported(self, tmp_path):
-        """The live incident: a single corrupted character must not read as applied."""
+        """An id with one corrupted character must not report an applied update."""
         store = _new_store(tmp_path)
         todo_id = _add(store)
         corrupted = ("d" + todo_id[1:]) if not todo_id.startswith("d") else ("e" + todo_id[1:])

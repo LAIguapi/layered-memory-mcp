@@ -1,11 +1,9 @@
 """v3.4.1 — terminal timestamps for TODO status changes.
 
-Reported shape (audit of the live DB, 2026-10-06): six rows sat in ``cancelled``
-with ``completed_at`` NULL and no cancel timestamp anywhere — "when was this
-abandoned?" could only be answered by ``updated_at``, which any later edit
-refreshes. Worse, nothing cleared ``completed_at`` when a row moved back out of
-``completed``, so the next reopen would have produced "still open, but finished
-at …" — a self-contradicting row that no reader can trust.
+Cancelled tasks had no dedicated cancellation timestamp, leaving only
+``updated_at``, which later edits can overwrite. Reopening a completed task also
+left ``completed_at`` unchanged, so an open task could incorrectly retain a
+finish time.
 
 Rules locked down here:
 

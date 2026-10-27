@@ -83,10 +83,9 @@ def test_audit_detects_oversized(kb):
 def test_audit_oversized_penalty_moves_on_every_fix(kb):
     """Size is docked on excess bytes, so each fixed file must move the score.
 
-    The count-based cap this replaced had already saturated on the live store
-    (45 oversized files, penalty pinned at its 24-point ceiling): fixing 39 of
-    them changed the score by exactly zero, which is why that backlog was never
-    touched. Lock the property down — one file fixed, visible points back.
+    A capped file-count penalty can hide partial cleanup progress while enough
+    files remain above the size threshold. Below the excess-byte penalty cap,
+    fixing an oversized file must reduce the penalty.
     """
     import random
     import string

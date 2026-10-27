@@ -19,9 +19,8 @@ Deliberately out of scope:
 * **stdio servers.** They are per-session and short-lived, and stdout carries the
   JSON-RPC stream — a background thread must never write there. The ride-along
   already covers them.
-* **A full rot audit.** ``audit_rot`` is an O(n²) scan (seconds of CPU on a real
-  store) and the health-watchdog cron already runs it weekly; paying that cost
-  every tick to emit a log line nobody reads is not worth it.
+* **A full rot audit.** ``audit_rot`` is an O(n²) scan, better scheduled
+  separately than repeated on every maintenance tick.
 """
 
 from __future__ import annotations

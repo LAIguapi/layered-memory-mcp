@@ -1,16 +1,16 @@
 """v3.3.2 — rot-audit performance/recall + L0 index generation robustness.
 
-Three defects found in production on 2026-10-06:
+Three regression cases:
 
   Bug 1  The same-file duplicate scan in ``audit_rot`` was an O(n²) loop calling
          ``SequenceMatcher.ratio()`` on full section bodies with no prefilter.
-         On the live library (791 sections → ~312k pairs) the MCP call hit the
-         60s client timeout every time, so the health score was unobtainable.
+         On large libraries, this could exceed the MCP client's timeout and
+         prevent the health score from being returned.
 
   Bug 2  The same scan only compared whole bodies. A re-appended *shorter* copy
          of a section (identical heading, body much shorter) landed below the
-         similarity threshold and was never reported — which is exactly how two
-         copies of one section were sitting in ``layered-memory.md`` unnoticed.
+         similarity threshold and could go unreported despite the matching
+         heading.
 
   Bug 3  ``l0_manager._generate_hermes_index`` did
          ``gd.get("keywords", "").strip()`` on an *optional* regex group. A line
@@ -209,8 +209,8 @@ class TestAuditPrefilter:
 
 class TestIndexGenerationRobustness:
     def test_line_without_keywords_does_not_crash(self, tmp_path, monkeypatch):
-        """Exactly the live failure: one L1 file with no keywords took down
-        L0 generation for inject/create/update/sync alike."""
+        """An L1 index line without keywords must not break L0 generation
+        for inject/create/update/sync."""
         monkeypatch.setattr(
             l0_manager, "generate_l0_index",
             lambda knowledge_dir: "[no-keywords.md] 只有标题没有关键词",

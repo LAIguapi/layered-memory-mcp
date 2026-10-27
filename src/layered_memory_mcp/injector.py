@@ -220,10 +220,9 @@ def _consolidation_writeback(
     # The ceiling compares the write-back against the sections it REPLACES, which
     # is meaningful once several have piled up. With a single existing member the
     # incoming note is itself part of what must be preserved, so demanding
-    # shrinkage would refuse every first consolidation and deadlock the gate
-    # (measured on the live service: a 22-character member cannot host a merged
-    # body in under 0.9 × 22 characters). Anti-laziness therefore starts at two
-    # existing members; a single member only has to come back as ONE section.
+    # shrinkage could refuse the first consolidation and deadlock the gate.
+    # Anti-laziness therefore starts at two existing members; a single member
+    # only has to come back as ONE section.
     if len(family) >= 2 and ceiling and total_old and new_len >= total_old * ceiling:
         return {
             "refused": {

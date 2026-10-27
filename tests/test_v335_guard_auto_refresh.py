@@ -4,9 +4,8 @@ The guard on the host is a *copy* of the payload bundled in this package, so
 every release left it one version behind. Worse, the ``auto`` policy could not
 heal that on its own: ``ensure_guard_installed`` routed a version drift into
 ``install_guard``, which refuses to overwrite without ``force=True`` — so the
-drift was permanent and ``check_guard_status`` reported ``update_available``
-forever (measured against a real host: deployed 3.3.0 while the package was
-3.3.4, with byte-identical ``guard.py`` and only ``plugin.yaml`` differing).
+drift could persist and ``check_guard_status`` could keep reporting
+``update_available`` even when only version metadata differed.
 
 ``refresh_deployed_plugin`` closes that: files-only re-copy when the versions
 differ, invoked from the framework's read path. These tests cover the repair

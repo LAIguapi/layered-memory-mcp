@@ -1,7 +1,6 @@
 """v3.2.1 — heading hygiene regression tests.
 
-Two real bugs found in the wild (knowledge base health_score had decayed to
-32/100, with 9 garbled headings and 10 stub headings in the live library):
+Two heading-derivation defects:
 
   Bug 1  _suggest_migration cleaned headings with an ALLOW-LIST regex
          (``[^a-zA-Z0-9\\u4e00-\\u9fff\\s\\-]``, then ``[^\\w\\s\\-·‧...]``).

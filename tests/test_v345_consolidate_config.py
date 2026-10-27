@@ -1,11 +1,9 @@
 """v3.4.5 — the consolidation knobs are readable from the operator's config.yaml.
 
-Why this test file exists: `consolidate_size_ceiling` was settable only through a
-constructor argument or an env var, so on a deployed host it was effectively
-frozen at its 0.9 default — a recommended tightening to 0.7 stayed "recommended"
-for a week while every write kept being judged against 0.9. A tuning knob whose
-only local spelling is "edit the library" or "add an env var to a systemd unit"
-is a knob that never moves.
+Previously, `consolidate_size_ceiling` was settable only through a constructor
+argument or an env var. Setting it in config.yaml had no effect, leaving the
+0.9 default in use unless another override was supplied. These tests cover
+config-file support and its precedence relative to other configuration sources.
 """
 
 from __future__ import annotations

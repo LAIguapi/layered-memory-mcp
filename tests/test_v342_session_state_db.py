@@ -1,16 +1,15 @@
 """v3.4.2 — session scanning reads Hermes' live session database.
 
-Why: the session-file directory this module was written for now only holds stale
-request dumps, so ``scan_sessions`` reported **zero** sessions while the agent had
-been running for weeks. The whole session-driven pipeline (knowledge extraction,
-keyword search, the memory-compression job) silently degraded to "nothing new" —
-the worst failure mode, because it looks like success.
+Hermes stores current sessions in the database rather than the legacy
+request-dump directory. A directory-only ``scan_sessions`` can miss recent
+sessions, leaving knowledge extraction, keyword search, and compression without
+current input.
 
 Locked down here:
 
 1. sessions come out of ``state.db`` (title/user messages/decisions intact)
-2. ``cron`` sessions are skipped by default and **counted** — on a real host they
-   are ~87% of the table (5763/6607) and would crowd out interactive sessions
+2. ``cron`` sessions are skipped by default and **counted**, so repetitive job
+   output does not crowd out interactive sessions
 3. operator-configured ``exclude_markers`` withhold matching sessions entirely
    and are reported in ``stats`` instead of vanishing (privacy control: the scan
    output is handed to a model that may run off-machine)
@@ -129,11 +128,9 @@ class TestReadStateDbSessions:
     def test_marker_deep_in_a_long_session_is_still_caught(self, tmp_path):
         """Regression: an excerpt-based check let markers buried in long sessions through.
 
-        Live finding (2026-10-06): with real sessions the filter reported zero
-        exclusions even though the session plainly contained the configured
-        marker — the check only saw the head+tail sample and 200-char excerpts,
-        so anything deeper was invisible. A privacy filter that under-reports is
-        worse than none, because the operator trusts the count.
+        A check limited to head+tail samples and 200-char excerpts can miss a
+        configured marker elsewhere in the session. Filtering must inspect full
+        message content so excluded-session counts do not under-report matches.
         """
         head = [("user", f"placeholder head {i} " + "x" * 600) for i in range(30)]
         buried = [("assistant", "opening " + "y" * 1500 + " placeholder-secret " + "z" * 1500)]

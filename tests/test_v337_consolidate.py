@@ -150,10 +150,9 @@ class TestWriteback:
     def test_single_member_family_can_always_be_consolidated(self, tmp_path):
         """The ceiling compares against the replaced family, so it starts at 2.
 
-        Regression for a deadlock found by running the handshake against the live
-        service: with one existing member, the merged body is naturally longer
-        than that member, so a ceiling applied here would refuse every first
-        consolidation while still blocking the write.
+        With one existing member, preserving incoming facts can make the merged
+        body longer than that member, so a ceiling applied here could refuse the
+        first consolidation while still blocking the write.
         """
         cfg = _seed_family(tmp_path, bodies=(BODY_A,))
         deferred = inject_knowledge(cfg, "ops", TOPIC_B, BODY_B, mode="upsert")

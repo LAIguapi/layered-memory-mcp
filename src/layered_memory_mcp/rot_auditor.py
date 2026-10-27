@@ -34,12 +34,9 @@ if TYPE_CHECKING:
 # Thresholds
 OVERSIZED_BYTES = 4096          # files above this are flagged (P1)
 # Size is docked on *excess bytes*, not on the file count. A count-based penalty
-# with a cap saturates: with 45 files over the limit (measured on the live store)
-# a cap of 24 was already fully charged, so fixing 39 of them moved the score by
-# exactly zero — an incentive that only pays once the work is nearly finished is
-# no incentive at all (that backlog sat untouched for 8 weeks). Excess-denominated
-# points keep falling with every file fixed, and a 57KB file still costs more than
-# a 4.5KB one.
+# with a cap can hide partial cleanup progress while enough files remain above
+# the size threshold. Excess-denominated points reflect how far files exceed
+# that threshold: for example, a 57KB file costs more than a 4.5KB one.
 OVERSIZED_BYTES_PER_POINT = 24_576  # 24KB of excess size == one docked point
 OVERSIZED_PENALTY_CAP = 24          # never dock more than this for size alone
 GARBLED_MIN_LEN = 30           # heading length above which we check for garbling
@@ -50,8 +47,8 @@ CROSS_DUP_SIMILARITY = 0.82    # section-pair similarity to flag as duplicate (P
 #
 # Retrospective qualifiers such as 临时 / 暂时 are deliberately absent: they
 # describe the *scope* of a note, not a pending action, and pairing them with an
-# observation date ("（2026-09-11 实测）") flagged every dated lesson in the
-# library — a measured 100% false-positive rate, 18 of 56 points in the score.
+# observation date ("（2026-09-11 实测）") can misclassify a retrospective lesson
+# as overdue even though it contains no pending promise.
 _PENDING_MARKERS = [
     "下次执行", "下次", "待测试", "待后续", "待实施", "待验证", "待复测", "待定",
     "尚未", "未完成", "未应用", "未修", "未落地", "稍后", "先放", "如仍触发",
@@ -59,9 +56,8 @@ _PENDING_MARKERS = [
 ]
 
 # A promise that was already discharged cannot be overdue. Lines that record a
-# completion ("…TODO dd1eb34c 已完成") carry both a pending marker and a past
-# date, but they are history — flagging them was the last false-positive class
-# left after v3.3.3.
+# completion ("…TODO <id> 已完成") carry both a pending marker and a past
+# date, but they are history — a false-positive case still possible in v3.3.3.
 _COMPLETED_MARKERS = [
     "已完成", "已解决", "已闭环", "已生效", "已修复", "已归档", "已发布",
     "已交付", "已核实", "已确认",
@@ -144,9 +140,8 @@ def audit_rot(config: "MemoryConfig") -> dict:
             # P3 — stale: a *forward-looking* marker and an expired date ON THE
             # SAME LINE. All three conditions matter:
             #   • forward-looking marker — a pending action can go overdue; a
-            #     retrospective note cannot. (Requiring this is what removed the
-            #     100%-false-positive behaviour where every dated lesson was
-            #     flagged for the mere presence of 临时/暂时.)
+            #     retrospective note cannot. Requiring this avoids flagging
+            #     dated lessons for the mere presence of 临时/暂时.
             #   • a past date — the deadline has passed.
             #   • same line — otherwise an unrelated observation date elsewhere
             #     in the lead ("…（2026-09-11 实测）") would convict a note whose
@@ -155,7 +150,7 @@ def audit_rot(config: "MemoryConfig") -> dict:
             stale_hit: tuple[str, str] | None = None
             for line in (heading, *body.split("\n")[:2]):
                 # A line that records the discharge of its own promise is
-                # history, not rot ("…TODO dd1eb34c 已完成（2026-07-26）").
+                # history, not rot ("…TODO <id> 已完成（2026-07-26）").
                 if any(cm in line for cm in _COMPLETED_MARKERS):
                     continue
                 marker_hit = next((mk for mk in _PENDING_MARKERS if mk in line), None)

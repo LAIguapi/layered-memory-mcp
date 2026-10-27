@@ -1,10 +1,10 @@
-"""v3.3.4 — two detector-quality fixes found while auditing the live library.
+"""v3.3.4 — completed-promise detection and promotion-name quality fixes.
 
 1. Stale (P3): a line that records the *discharge* of its own promise
-   (``… TODO dd1eb34c 已完成（2026-07-26）``) carries both a pending marker and a
-   past date, yet it is history. It was the last false-positive class left after
+   (``… TODO <id> 已完成（2026-07-26）``) carries both a pending marker and a
+   past date, yet it is history. This false-positive case remained possible in
    v3.3.3.
-2. Promotion naming: the suggested domain name came back as ``2026`` because a
+2. Promotion naming: the suggested domain name could become ``2026`` when a
    bare year, repeated across dated headings, won the frequency vote — the
    tokenizer splits ``2026-07-30`` into ``2026`` / ``07`` / ``30``.
 
@@ -30,7 +30,7 @@ def _stale(tmp_path: Path, text: str) -> list[dict]:
 
 class TestDischargedPromisesAreNotStale:
     def test_completed_todo_with_past_date_is_not_stale(self, tmp_path):
-        """The live shape that produced the last false positive."""
+        """A completed TODO with a past date is history, not an overdue promise."""
         stale = _stale(tmp_path, (
             "## 部署纠偏\n"
             "⚠️ v2.11.0 已于 2026-07-26 升级生效（TODO dd1eb34c 已完成，详见下节）。\n"
@@ -71,7 +71,7 @@ class TestPromotionNamingIgnoresNumericTokens:
             assert _is_noise_token(tok) is False
 
     def test_dated_headings_do_not_yield_a_year_domain(self):
-        """The live failure: 29 dated headings suggested '2026.md'."""
+        """Repeated years in dated headings must not become the domain name."""
         headings = [
             "用词文风审查观（2026-07-30）",
             "工作风格（2026-08-04）",

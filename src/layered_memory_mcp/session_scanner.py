@@ -27,10 +27,8 @@ DECISION_KEYWORDS = (
     "verified", "confirmed", "resolved", "architecture",
 )
 
-# Session sources skipped by default when reading the Hermes DB. Cron runs
-# dominate the table (field-tested: 5763 of 6607 sessions on one host, 12 of the
-# last 3 days' 137), and they are mostly repetitive job output — scanning them
-# would crowd out the interactive sessions that actually carry knowledge.
+# Session sources skipped by default when reading the Hermes DB. Repetitive
+# cron output can crowd out interactive sessions that carry durable knowledge.
 DEFAULT_EXCLUDED_SESSION_SOURCES = ("cron",)
 
 # Session files must be at least 100 bytes (skip config/metadata files)
@@ -359,15 +357,14 @@ def read_state_db_sessions(
 ) -> dict:
     """Read recent sessions straight out of Hermes' ``state.db``.
 
-    Why this exists: the session-file directory this module was written for now
-    only holds stale request dumps, so a directory scan reports zero sessions
-    while the agent has been running for weeks — the whole extraction pipeline
-    silently degrades to "nothing new".
+    Hermes stores current sessions in the database rather than the legacy
+    request-dump directory. Scanning only that directory can miss recent
+    sessions and leave the extraction pipeline without current input.
 
     Two filters, both deliberate:
 
     * ``exclude_sources`` (default ``("cron",)``) drops scheduled-job sessions.
-      They dominate the table and carry almost no durable knowledge.
+      Repetitive job output can otherwise crowd out interactive sessions.
     * ``exclude_markers`` drops any session whose title/messages contain one of
       the given substrings (case-insensitive). This is a **privacy** control, not
       housekeeping: the caller is commonly a model running outside this machine,

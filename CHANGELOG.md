@@ -190,12 +190,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pointer / knowledge-index entry into the agent's native memory file
   (`MEMORY.md`, `CLAUDE.md`, …), and when no path is configured it *auto-detects*
   one from absolute user-level locations. Auto-detection is fine for reading and
-  reporting; as a silent write target it meant any ambiguous config resolved a
-  live file. A throwaway script on a bare `MemoryConfig(home=<tmpdir>)` called
-  `inject_knowledge`, the ride-along maintenance auto-detected
-  `~/.hermes/memories/MEMORY.md`, and a stray `[L0] misc: …` pointer landed in a
-  real agent's memory. A projection write now requires an **explicit target** or
-  an **explicit opt-in**: a caller-supplied `memory_path`, `agent_memory.path`,
+  reporting; using it as a silent write target could let an ambiguous config
+  write outside its own home. For example, `inject_knowledge` with a temporary
+  `MemoryConfig(home=<tmpdir>)` could trigger ride-along maintenance on an
+  auto-detected file such as `~/.hermes/memories/MEMORY.md`. A projection write
+  now requires an **explicit target** or an **explicit opt-in**: a caller-supplied
+  `memory_path`, `agent_memory.path`,
   `agent_memory.allow_auto_detect_write: true`, a detected file inside `<home>`,
   or a `<home>` that is this install's real configured home and not a temp/test
   sandbox (which is what keeps an existing deployment's projection working).
@@ -578,12 +578,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`update_todo` / `delete_todo` answered "success" for an id that matched no
   row.** Both paths ran the statement and returned `{"success": true, "id": …}`
   without ever looking at the result, so a mistyped or fabricated id was
-  indistinguishable from an applied edit. This is not a theoretical slip: an
-  agent hand-typed a UUID (once with one character corrupted, once invented
-  outright, because it had only seen a truncated id) and both calls reported
-  success while the row stayed untouched — the mistake only surfaced on a later
-  read-back, as stale content. Silent success on a write is worse than a loud
-  failure: it makes the caller's own audit unverifiable. `update()` and
+  indistinguishable from an applied edit even though no row changed. A caller
+  could only detect the failed write by reading the row back. `update()` and
   `delete()` now check `rowcount` and return `{"success": false, "error": "TODO
   not found: <id>"}` (SQLite reports `rowcount == 1` for a no-op edit that
   matched the row, so idempotent updates still succeed). The dashboard
@@ -601,27 +597,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The consolidation knobs are now readable from the operator's config.yaml**
   (`consolidate: {enabled, min_family, size_ceiling}`). Precedence is
   constructor → env → config.yaml → default, matching `write_guard` and
-  `session_scan`. Why it matters: `consolidate_size_ceiling` could previously
-  only be moved by editing this package or by adding an env var to a systemd
-  unit, so on a deployed host it sat at its 0.9 default — a recommended
-  tightening to 0.7 stayed "recommended" for a week while every write-back kept
-  being judged against 0.9. A tuning knob whose only local spelling is "patch the
-  library" is a knob that never moves; "how much compaction is enough" is a
-  judgement about the operator's knowledge base, not a framework constant.
+  `session_scan`. Previously, `consolidate_size_ceiling` could only be set
+  through a constructor argument or an env var; setting it in config.yaml had
+  no effect, leaving the 0.9 default in use unless another override was supplied.
+  Operators can now tune how much compaction is required through the same
+  configuration file as the other framework settings.
 
 ## [3.4.4] - 2026-10-07
 
 ### Fixed
 
-- **The size penalty stopped responding, so the backlog it was meant to flag was
-  never touched.** `oversized` docked `min(count * 4, 24)` points: with 45 files
-  over the 4KB threshold on the live store the cap was already fully charged, so
-  fixing 39 of them moved the score by exactly zero — 89% of the work for no
-  visible return, which is why that backlog sat for 8 weeks. The penalty is now
-  charged on **excess bytes** (`OVERSIZED_BYTES_PER_POINT` = 24KB per point,
-  still capped at 24), so every fixed file moves the score and a 57KB file costs
-  more than a 4.5KB one. Live effect: 45 files / 505KB of excess now docks 21
-  points instead of a saturated 24, and drops as files are consolidated.
+- **The count-based size penalty could hide partial cleanup progress.**
+  `oversized` docked `min(count * 4, 24)` points for files over the 4KB threshold.
+  Once the cap was reached, reducing the oversized-file count could leave the
+  score unchanged while enough files remained above the threshold. The penalty
+  is now charged on **excess bytes** (`OVERSIZED_BYTES_PER_POINT` = 24KB per point,
+  still capped at 24), so the score reflects excess size rather than only file
+  count: for example, a 57KB file costs more than a 4.5KB one.
 - **Test-suite isolation test failed whenever TMPDIR lived inside `~/.hermes`.**
   `test_home_is_redirected` asserted the sandbox home is not *path-prefixed* by
   `~/.hermes`, but Hermes points TMPDIR at `~/.hermes/cache/scratch`, so pytest's
@@ -637,13 +629,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The session export filter under-reported: it checked excerpts, not content.**
   `exclude_markers` was matched against the *summarised* session (head+tail sample
   of at most 50 messages, user messages only when under 500 chars, assistant
-  topics truncated to 200), so a marker buried in a long message was never seen —
-  the very first live run against real sessions reported `excluded_sessions: 0`
-  while the configured markers were plainly present in 13 and 14 of that
-  session's messages. A privacy filter that under-reports is worse than none,
-  because the operator trusts the count: the check now runs against the database
-  itself (title plus a full-content `LIKE` per marker) before any summary is
-  built, so what is filtered is decided by what the session actually contains.
+  topics truncated to 200), so a marker buried in a long message could be missed
+  and `excluded_sessions` could under-report matches. The check now runs against
+  the database itself (title plus a full-content `LIKE` per marker) before any
+  summary is built, so filtering depends on what the session actually contains.
 
 ## [3.4.2] - 2026-10-06
 
@@ -651,10 +640,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Session scanning read a directory that no longer holds sessions.** Hermes keeps
   live sessions in a SQLite database (`~/.hermes/state.db`); the JSON directory
-  `sessions_dir` points at now only accumulates stale request dumps. A scan
-  therefore reported **zero** sessions while the agent had been busy for weeks, and
-  everything downstream (knowledge extraction, keyword search, an external
-  compression job) degraded to "nothing new" — a failure that looks like success.
+  `sessions_dir` points at now only accumulates stale request dumps. A
+  directory-only scan could therefore miss recent sessions and leave downstream
+  knowledge extraction, keyword search, and compression without current input.
   `scan_sessions()` and `search_sessions_by_keyword()` now read the database first
   and keep the file directory as a fallback, so file-based setups are unaffected.
 
@@ -664,9 +652,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keyword hits straight from `state.db`, timestamp-windowed, opened **read-only**
   (never take a writable handle on a live agent's database).
 - **Source filter**: `cron` sessions are skipped by default and counted in
-  `stats.skipped_sources`. On a real host they are ~87% of the table (5763/6607
-  rows; 12 of the last 3 days' 137 sessions were interactive), so leaving them in
-  would crowd out exactly the sessions that carry durable knowledge.
+  `stats.skipped_sources`. Repetitive scheduled-job output can otherwise crowd
+  out interactive sessions that carry durable knowledge.
 - **Export filter**: `session_scan.exclude_markers` in `config.yaml` withholds any
   session whose title or body matches one of the given substrings, and reports the
   hit in `stats.excluded_by_marker` instead of silently dropping it. This is a
@@ -683,12 +670,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **TODO terminal timestamps: `cancelled` had none, and a reopened row kept its
   finish time.** `todos` carried a single `completed_at` column, stamped only when
-  `status` became `completed`. Two consequences, both found by auditing the live
-  DB: (a) six `cancelled` rows had `completed_at` NULL and no cancel time at all,
-  so “when was this abandoned?” could only be answered by `updated_at` — which any
-  later edit (e.g. appending a note) silently refreshes; and (b) nothing cleared
-  `completed_at` when a row moved back out of `completed`, so the first reopen
-  would have produced a still-open task that claimed a finish time.
+  `status` became `completed`. Cancelled tasks had no dedicated cancellation
+  timestamp, leaving only `updated_at`, which later edits can overwrite.
+  Reopening a completed task also left `completed_at` unchanged, so an open task
+  could incorrectly retain a finish time.
 
   `update()` now owns both stamps as a single status machine: `completed` stamps
   `completed_at` and clears `cancelled_at`; `cancelled` stamps the new
@@ -723,8 +708,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Bounded on purpose:
 
   * `audit_rot` is **not** in the loop — a full rot audit is an O(n²) scan
-    (seconds of CPU on a real store) and the weekly health-watchdog cron already
-    runs it.
+    better scheduled separately than repeated on every maintenance tick.
   * stdio servers do not start it — they are per-session and short-lived, and
     stdout carries the JSON-RPC stream, so a background thread must not write
     there. The ride-along still covers them.
@@ -752,11 +736,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   consolidation" is the real risk; a single member only has to come back as one
   section.
 
-  Found by running the handshake against the live service minutes after 3.3.7 was
-  installed — a 22-character member cannot host a merged body in under 0.9 × 22
-  characters. No live data was affected: the library has no same-skeleton families
-  (`same_file_duplicate: 0`), so the gate had nothing to block, and the flaw was
-  reachable only through the probe. Regression test added.
+  Regression coverage verifies that a single-member family can be consolidated
+  even when preserving the incoming facts makes the merged body longer.
 
 ## [3.3.7] - 2026-10-06
 
@@ -829,10 +810,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   left it one version behind — and the ``auto`` policy could not heal it:
   ``ensure_guard_installed`` routed a version drift into ``install_guard``,
   which refuses to overwrite without ``force=True``. The result was sticky:
-  ``check_guard_status`` reported ``update_available`` forever. Measured on a
-  real host: deployed 3.3.0 against a 3.3.4 package, ``guard.py`` byte-identical
-  and only ``plugin.yaml`` differing, so nothing but bookkeeping was wrong —
-  which is exactly the kind of silent drift that hides a real one later.
+  ``check_guard_status`` could keep reporting ``update_available`` without
+  refreshing the copied payload, even when only version metadata differed.
 
 ### Added
 
@@ -861,13 +840,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **Stale detection: a discharged promise is history, not rot.** A line such as
-  `… TODO dd1eb34c 已完成（2026-07-26）` carries both a pending marker and a past
-  date, so v3.3.3 still flagged it — the last false-positive class in the live
-  library. Lines recording a completion (`已完成`, `已解决`, `已闭环`, `已生效`,
+  `… TODO <id> 已完成（2026-07-26）` carries both a pending marker and a past
+  date, so v3.3.3 could still flag it despite the recorded completion.
+  Lines recording a completion (`已完成`, `已解决`, `已闭环`, `已生效`,
   …) are now skipped. `尚未完成` is deliberately unaffected: it contains 完成 but
   not `已完成`, so a genuinely open item is still reported.
 - **Promotion hint no longer suggests a domain named after a year.** The
-  suggested name came back as `2026.md`: the heading tokenizer splits
+  suggested name could become `2026.md`: the heading tokenizer splits
   `2026-07-30` into `2026` / `07` / `30`, and a year repeated across dated
   headings won the frequency vote outright (it also won strategy 1 whenever
   every heading started with it). Pure-digit tokens are now excluded from both
@@ -881,10 +860,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Stale detection no longer convicts retrospective notes.** The auditor
   flagged a section when a marker appeared anywhere in the heading or the
   leading two lines together with any past date in that same text — and the
-  marker list contained the scope qualifiers `临时` / `暂时`. Every dated lesson
-  (`（2026-09-11 实测）`, `（2026-07-16，含实证）`) therefore tripped it: six of
-  six reported "stale" sections in the live library were false positives, and
-  they cost 18 points of a 56-point score.
+  marker list contained the scope qualifiers `临时` / `暂时`. Dated lessons
+  containing those qualifiers (for example, `（2026-09-11 实测）` or
+  `（2026-07-16，含实证）`) could therefore be misclassified as stale, lowering
+  the health score without identifying an overdue promise.
   A section can only be *overdue* if it carries a promise, so the marker list is
   now forward-looking only (`下次执行`, `待…`, `尚未…`, `未落地`, `TODO`, …) and
   the date must sit **on the same line** as the marker — otherwise an unrelated
@@ -897,8 +876,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`audit_rot` no longer times out on a large store.** The same-file duplicate
   scan was an O(n²) loop calling `SequenceMatcher.ratio()` on every pair of
-  section bodies; on a 791-section library (~312k pairs) the MCP call hit the
-  60s client timeout every time, leaving the health score unobtainable. The
+  section bodies. On large libraries, this could exceed the MCP client's
+  timeout and prevent the health score from being returned. The
   comparison is now ordered cheapest-first: an exact length-ratio bound
   (`ratio() <= 2*min/(la+lb)`, so it can never discard a real match), then the
   O(1)/O(n) `real_quick_ratio` / `quick_ratio` upper bounds, and only then
@@ -1096,9 +1075,8 @@ A pointer with a long summary failed the length test, so `compact_memory()`
 treated it as bloat and `inject_knowledge`-ed it back into the L1 file body.
 That write triggered `dual_write`, which regenerated an L0 pointer now
 prefixed with the *previous* pointer text — `[L0] x: [L0] x: …`. Each
-compaction cycle nested one more `[L0]` layer, unbounded. Observed in the
-wild as dozens of `[L0] [L0] [L0] …` garbage sections inside L1 files after
-high-frequency `inject_knowledge` calls.
+compaction cycle nested one more `[L0]` layer, unbounded, allowing repeated
+`inject_knowledge` calls to accumulate nested pointer text inside L1 files.
 
 **Fix:** length no longer disqualifies an index entry. `_is_index_entry()`
 returns true for **any** `[L0]`-prefixed entry, so pointers are never routed
@@ -1118,9 +1096,9 @@ actually overflowed, because it could not see the *real* capacity limit.
 **Root cause:** `_get_memory_max_chars` defaulted to a hard-coded `50_000`
 chars and only honored the `MEMORY_MAX_CHARS` env var. Hermes' real memory
 limit lives in `config.yaml` (`memory.memory_char_limit`, default 2000,
-user-adjustable). With no env var set, the framework thought capacity was
-50000 while the true limit was 4000 — so a 3974-char (≈99% full) MEMORY.md
-registered as ~8% usage and never tripped the compaction threshold.
+user-adjustable). With no env var set, a configured limit below the 50,000-char
+fallback caused the framework to underestimate memory usage, potentially
+preventing compaction from triggering even when memory was nearly full.
 
 **Fix:** the limit is now resolved through a priority chain that reads the
 user's actual configuration instead of guessing:

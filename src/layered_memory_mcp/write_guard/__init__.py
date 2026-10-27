@@ -632,8 +632,7 @@ def ensure_guard_installed(
     if before["status"] == "update_available":
         # A version drift is not an install: install_guard refuses it without
         # force=True (to protect a host somebody else configured), so routing it
-        # there made the drift permanent under the auto policy — which is
-        # exactly how a deployed guard stayed behind a released framework.
+        # there would leave the copied payload outdated under the auto policy.
         refreshed = refresh_deployed_plugin(home, mode="auto", state_path=st_path)
         after = check_guard_status(home, config_path=cfg_path, state_path=st_path)
         return {
