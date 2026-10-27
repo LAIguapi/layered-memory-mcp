@@ -1,6 +1,6 @@
 # Layered Memory MCP — Layered Memory Graph v1 Architecture
 
-> Status: IMPLEMENTATION BASELINE — Batch I-C complete; Batch I-D next
+> Status: IMPLEMENTATION BASELINE — Batch I-D complete; Batch J next
 > Branch: `refactor/memory-graph-v1`
 > Baseline commit: `668e402` (`chore: freeze pre-graph refactor baseline`)
 > Version: 3.6.0
@@ -809,43 +809,77 @@ I-C exit criteria:
 - no external graph service or new mandatory dependency;
 - no removal of the legacy recall/write paths.
 
-#### Batch I-D — semantic write-path assembly (planned)
+#### Batch I-D — guarded semantic write-path assembly (complete)
 
-I-D is the next production assembly seam. It must connect one explicit semantic
-write path to the already-built graph write orchestration without making the
-legacy injector and the graph writer two independent authorities.
+I-D connected exactly one write entrance — MCP ``inject_knowledge_tool`` — to
+the explicit semantic-write seam. The entrance remains L1/changelog-first and
+authoritative; the graph block is additive and never claims a cross-storage
+transaction. REST ``/knowledge`` CRUD, file-level CRUD, ``batch_inject`` and
+``recall_knowledge`` remain deliberately outside this batch because their
+identity/provenance contracts are different or they do not carry graph seed
+metadata.
 
-The batch may:
+The caller may provide one serialized ``SemanticWriteRequest``. The request is
+validated without repair and is the only source of graph identity, node
+content, assertions, supersession, contradiction, or target IDs. Ordinary
+``domain``, ``section``, Markdown content, filenames, and hashes never become
+graph semantics by inference. Invalid requests are refused before the L1 write
+and return bounded field/type labels only.
 
-- select exactly one existing MCP write entrance whose input already carries a
-  stable source identity and provenance contract;
-- construct the graph write request from the existing write result and append
-  the required memory event before applying semantic graph state changes;
-- preserve the legacy write result and default ``legacy`` mode while the new
-  path is opt-in or diagnostic-only;
-- expose bounded status and failure reasons without returning source content,
-  private paths, or exception messages;
-- prove that graph-write failure cannot silently report a successful legacy
-  write as a successful graph write, and that retry/replay is deterministic.
+The mode behavior is intentionally asymmetric:
 
-I-D must not:
+- ``legacy`` preserves the old response and performs zero graph operations;
+- ``shadow`` validates and plans the explicit decision without rebuilding or
+  mutating a graph store;
+- ``graph_recall`` remains read-only for this write entrance;
+- ``graph_write`` and ``graph`` refuse an otherwise valid request with
+  ``graph_write_source_events_required`` because this tool does not possess a
+  complete ``MemoryEvent`` source stream.
 
-- wire every similarly named write entrance at once;
-- let the graph store accept model output or direct caller mutations outside
-  the single write seam;
-- infer identity from filename, heading, domain, body text, or a new UUID;
+The last refusal is a safety boundary, not a missing convenience. The current
+``GraphStore.rebuild(source_events)`` contract is destructive full replacement:
+events outside the supplied stream do not survive. Rebuilding from only the
+current request would therefore erase graph state produced by earlier writes.
+I-D consequently performs no runtime seam call and no store operation on that
+path; ``committed`` is false, while ``legacy_write_ok`` still reports whether
+the authoritative L1 write succeeded. A graph failure or refusal never rolls
+back L1, and a successful L1 write is never reported as a successful graph
+commit.
+
+I-D explicitly does not:
+
+- infer claims/entities or automatically guess ``SUPERSEDES``/
+  ``CONTRADICTS`` from Markdown;
+- invent identity from filename, heading, domain, body text, or a new UUID;
+- claim that ``MEMORY_CHANGELOG`` is a complete ``MemoryEvent`` stream;
 - perform a real-memory backfill, default-mode switch, REST integration,
-  physical deletion, or cross-storage transaction claim;
+  physical deletion, or cross-storage transaction;
 - make L1, vector metadata, or the graph a second editable ledger;
-- remove or rewrite the legacy injector before equivalence and rollback have
-  been demonstrated on isolated fixtures.
+- open a live graph projection path until a later batch owns and supplies the
+  complete source-event stream required by ``rebuild``.
 
-I-D preflight must first enumerate all current write entrances and their
-identity/provenance contracts. The implementation brief must then name one
-allowed entrance, the explicitly deferred entrances, an exact file allowlist,
-an isolated fixture boundary, rollback behavior, and focused/full verification
-commands. The batch is not ready for coding until that boundary is written and
-reviewed.
+Accepted in commit ``6846baa`` (``feat: add guarded semantic graph write
+seam``):
+
+- focused I-D/runtime/config tests: ``188 passed``;
+- full suite: ``1640 passed, 2 skipped``;
+- compile, diff, allowlist, and protected-path checks passed;
+- security audit: ``0 CRITICAL / 0 HIGH / 0 MEDIUM`` (LOW results are existing
+  project-name/path matches).
+
+I-D exit criteria:
+
+- default legacy calls remain graph-free and response-compatible;
+- explicit requests are validated and bounded without leaking source content,
+  private paths, or backend diagnostics;
+- ``shadow`` is plan-only;
+- write-enabled modes cannot reach ``run_semantic_graph_write`` or
+  ``GraphStore.rebuild`` without the required source-event ownership;
+- a pre-populated graph snapshot remains byte-identical on the refusal path;
+- L1 success, L1 failure, no-change, and deferred outcomes are distinct from
+  graph commit status;
+- the full existing test suite passes and default ``MemoryConfig()`` remains
+  ``legacy``.
 
 ### Batch J — measured shadow evaluation (planned)
 
