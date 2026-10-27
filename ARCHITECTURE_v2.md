@@ -1,6 +1,6 @@
 # Layered Memory MCP — Layered Memory Graph v1 Architecture
 
-> Status: IMPLEMENTATION BASELINE — Batch I-B complete; Batch I-C next
+> Status: IMPLEMENTATION BASELINE — Batch I-C complete; Batch I-D next
 > Branch: `refactor/memory-graph-v1`
 > Baseline commit: `668e402` (`chore: freeze pre-graph refactor baseline`)
 > Version: 3.6.0
@@ -723,12 +723,13 @@ focused I-A tests `88 passed`; full suite `1504 passed, 2 skipped`.
 Accepted in commit `37da26f` (`feat: wire graph recall into semantic search`):
 focused I-B tests `102 passed`; full suite `1518 passed, 2 skipped`.
 
-#### Batch I-C — legacy identity backfill and reconciliation (next)
+#### Batch I-C — legacy identity backfill and reconciliation (complete)
 
-I-C is a controlled data-preparation batch, not a default cutover. Its first
-deliverable is a read-only inventory and dry-run planner over explicitly
-supplied, isolated L1/vector/changelog snapshots. It must classify every input
-row before any write:
+I-C is a controlled data-preparation batch, not a default cutover. Its
+deliverables are a read-only inventory and dry-run planner over explicitly
+supplied, isolated L1/vector/changelog snapshots, plus a reversible
+vector-metadata publication seam. It classifies every input row before any
+write:
 
 1. **Eligible mapping.** A vector row with a valid stable entry ID maps to the
    canonical legacy claim node ID through the existing identity function.
@@ -747,8 +748,11 @@ properties:
   embeddings, ranking order, or source timestamps;
 - use the existing atomic vector publication boundary rather than ad-hoc SQL
   mutation of individual rows;
-- import graph nodes/edges only from the explicit L1 and changelog snapshots;
-  do not let vector metadata become an independent semantic truth source;
+- keep graph projection separate from vector metadata publication. The I-C
+  implementation does not implicitly create graph nodes/edges or open a live
+  graph store; any graph projection must be explicitly supplied, independently
+  auditable, disposable, and rebuildable from the same snapshots;
+- do not let vector metadata become an independent semantic truth source;
 - be idempotent: rerunning the same snapshots produces the same graph state and
   reports zero additional changes;
 - emit counts and stable reason codes, but never emit source paths, credentials,
@@ -757,16 +761,32 @@ properties:
 Rollback is projection rollback, not source deletion. Before apply, the
 planner must capture a content-free snapshot fingerprint and the exact set of
 rows it intends to change. If the fingerprint is stale, identity coverage is
-incomplete, or graph import/reconciliation fails, the apply must abort before
-publication. A successful metadata publication must be reversible by restoring
-the prior vector snapshot; the L1 snapshot and append-only changelog are never
-rewritten or deleted. Graph data remains disposable until the reconciliation
-report and reopen/rebuild checks pass.
+incomplete, or the planner rejected any supplied input, the apply must abort
+before publication. ``require_clean=False`` can override incomplete row
+coverage only; it cannot override an input-contract error. A successful
+metadata publication must be reversible by restoring the prior vector
+snapshot; the L1 snapshot and append-only changelog are never rewritten or
+deleted. Graph data remains disposable until the reconciliation report and
+reopen/rebuild checks pass.
 
 I-C explicitly does not include LLM extraction, entity resolution, conflict
 arbitration, automatic access to the real memory directory, default mode
 switching, physical deletion, REST integration, or write-path ownership
 changes. Those remain later, independently gated work.
+
+I-C was accepted in commit ``a28669e`` (``feat: add reversible graph identity
+backfill``):
+
+- focused I-C tests: ``77 passed``;
+- related graph/runtime regression tests: ``190 passed``;
+- full suite: ``1595 passed, 2 skipped``;
+- compile, diff, allowlist, and protected-path checks passed;
+- security audit: ``0 CRITICAL / 0 HIGH / 0 MEDIUM`` (two pre-existing LOW
+  project-name/path matches).
+
+The implementation is intentionally limited to vector metadata reconciliation.
+It does not claim cross-storage transactionality, live graph projection, real
+memory migration, or graph-aware default behavior.
 
 I-C exit criteria:
 
@@ -776,7 +796,8 @@ I-C exit criteria:
   unchanged;
 - apply tests prove stale-snapshot rejection and restoration of the previous
   vector snapshot;
-- graph import and vector metadata reconciliation are independently auditable;
+- graph projection and vector metadata reconciliation have separate seams and
+  are independently auditable;
 - the full existing test suite passes and default `MemoryConfig()`/MCP
   behavior remains `legacy`.
 
@@ -787,6 +808,44 @@ I-C exit criteria:
 - no direct access to production configuration or real user memory in tests;
 - no external graph service or new mandatory dependency;
 - no removal of the legacy recall/write paths.
+
+#### Batch I-D — semantic write-path assembly (planned)
+
+I-D is the next production assembly seam. It must connect one explicit semantic
+write path to the already-built graph write orchestration without making the
+legacy injector and the graph writer two independent authorities.
+
+The batch may:
+
+- select exactly one existing MCP write entrance whose input already carries a
+  stable source identity and provenance contract;
+- construct the graph write request from the existing write result and append
+  the required memory event before applying semantic graph state changes;
+- preserve the legacy write result and default ``legacy`` mode while the new
+  path is opt-in or diagnostic-only;
+- expose bounded status and failure reasons without returning source content,
+  private paths, or exception messages;
+- prove that graph-write failure cannot silently report a successful legacy
+  write as a successful graph write, and that retry/replay is deterministic.
+
+I-D must not:
+
+- wire every similarly named write entrance at once;
+- let the graph store accept model output or direct caller mutations outside
+  the single write seam;
+- infer identity from filename, heading, domain, body text, or a new UUID;
+- perform a real-memory backfill, default-mode switch, REST integration,
+  physical deletion, or cross-storage transaction claim;
+- make L1, vector metadata, or the graph a second editable ledger;
+- remove or rewrite the legacy injector before equivalence and rollback have
+  been demonstrated on isolated fixtures.
+
+I-D preflight must first enumerate all current write entrances and their
+identity/provenance contracts. The implementation brief must then name one
+allowed entrance, the explicitly deferred entrances, an exact file allowlist,
+an isolated fixture boundary, rollback behavior, and focused/full verification
+commands. The batch is not ready for coding until that boundary is written and
+reviewed.
 
 ### Batch J — measured shadow evaluation (planned)
 
