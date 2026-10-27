@@ -1,10 +1,10 @@
 # Layered Memory MCP — Layered Memory Graph v1 Architecture
 
-> Status: IMPLEMENTATION BASELINE — approved direction, implementation in batches
+> Status: IMPLEMENTATION BASELINE — Batch H complete; Batch I next
 > Branch: `refactor/memory-graph-v1`
 > Baseline commit: `668e402` (`chore: freeze pre-graph refactor baseline`)
-> Version: 3.6 target
-> Date: 2026-10-27
+> Version: 3.6.0
+> Date: 2026-10-28
 
 ## 1. Executive decision
 
@@ -665,12 +665,91 @@ Each batch must be independently reviewable and testable.
 - Supersession, contradiction, and projection events.
 - Regression tests for current write tools.
 
-### Batch H — cutover and cleanup
+### Batch H — reversible runtime integration (complete)
 
-- Enable graph-aware recall behind a feature flag.
-- Compare old/new outputs on the same fixtures.
-- Remove only obsolete paths after measured equivalence or intentional behavior
-  change is recorded.
+- Add the explicit runtime modes `legacy`, `shadow`, `graph_recall`,
+  `graph_write`, and `graph`.
+- Keep `legacy` as the default and preserve the original L1 result on graph
+  failure, missing mappings, unavailable stores, or invalid graph metadata.
+- Add additive graph recall output and an explicit semantic graph-write seam;
+  do not silently turn the existing injector into a second write path.
+- Add runtime/config/version regression tests and verify that the default path
+  performs no graph operation.
+- Accepted in commit `660c8e2` (`feat: add reversible graph runtime
+  integration`): `1441 passed, 2 skipped`; focused Batch H tests `117 passed`.
+
+Batch H is integration scaffolding, not production cutover. It does not yet
+construct a persistent graph store, generate graph node IDs for real vector
+rows, run a legacy backfill, enable graph-aware defaults, or publish graph
+quality metrics.
+
+### Batch I — production assembly and migration readiness (next)
+
+Batch I makes the existing graph pieces executable against an isolated,
+configured runtime without changing the default behavior or reading/writing the
+real user memory store.
+
+Scope:
+
+1. **Persistent store assembly.** Resolve one explicit graph database path from
+   the framework configuration, initialize the SQLite graph schema through the
+   existing `GraphStore` contract, and expose health/rebuild diagnostics. The
+   path must be injectable in tests and must never be inferred from an agent's
+   private memory path.
+2. **Stable retrieval identity.** Define and test the producer that maps a
+   searchable L1/vector projection to a deterministic `graph_node_id` and
+   graph seed metadata. Missing, malformed, or ambiguous mappings remain
+   visible degradation states; they are not silently fabricated.
+3. **Legacy backfill preparation.** Build a dry-run, idempotent backfill
+   orchestration over an explicitly supplied source root and changelog snapshot.
+   It must produce an import/reconciliation report before any graph write, and
+   must support aborting without changing the source L1/vector data. No real
+   memory directory is used by Batch I tests.
+4. **Operational observability.** Add bounded counters and status fields for
+   graph availability, mapping coverage, fallback reasons, rebuild outcome,
+   and projection lag. Metrics are diagnostic only and cannot decide semantic
+   truth.
+5. **Documentation and release bookkeeping.** Record the actual 3.6.0 graph
+   runtime behavior and Batch I boundaries in the changelog and this document.
+
+Non-scope for Batch I:
+
+- no default switch away from `legacy`;
+- no destructive rewrite or physical deletion of L1, vector, or graph data;
+- no automatic LLM extraction, entity resolution, or conflict arbitration;
+- no direct access to `/root/.layered-memory`, agent memory directories, or
+  production configuration in tests;
+- no external graph service or new mandatory dependency;
+- no removal of the legacy recall/write paths.
+
+Exit criteria:
+
+- a configured isolated SQLite graph store can be initialized, reopened,
+  health-checked, and rebuilt deterministically;
+- representative vector/L1 fixtures receive stable graph seed metadata;
+- backfill dry-run and abort paths leave source fixtures byte-for-byte intact;
+- fallback and mapping coverage are observable without leaking paths or memory
+  contents;
+- the full existing test suite and all Batch I tests pass;
+- the default `MemoryConfig()`/MCP behavior remains `legacy`.
+
+### Batch J — measured shadow evaluation (planned)
+
+- Run graph-assisted recall beside legacy recall on a fixed, isolated fixture
+  corpus and record result differences, stale-fact exposure, provenance
+  coverage, latency, and fallback rates.
+- Define acceptance thresholds from measured repository data, not vendor
+  benchmarks.
+- Keep the default mode `legacy` until the thresholds and rollback procedure
+  are accepted.
+
+### Batch K — controlled default transition (planned)
+
+- Enable graph-aware recall only after Batch J passes its acceptance gates.
+- Migrate write ownership only after one semantic write path can reproduce the
+  existing L1/changelog/vector behavior and its rollback has been exercised.
+- Remove obsolete paths only after an explicit equivalence or intentional
+  behavior-change record.
 
 ## 13. Acceptance metrics
 
