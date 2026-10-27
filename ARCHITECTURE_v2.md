@@ -1,6 +1,6 @@
 # Layered Memory MCP — Layered Memory Graph v1 Architecture
 
-> Status: IMPLEMENTATION BASELINE — Batch H complete; Batch I next
+> Status: IMPLEMENTATION BASELINE — Batch I-B complete; Batch I-C next
 > Branch: `refactor/memory-graph-v1`
 > Baseline commit: `668e402` (`chore: freeze pre-graph refactor baseline`)
 > Version: 3.6.0
@@ -683,55 +683,110 @@ construct a persistent graph store, generate graph node IDs for real vector
 rows, run a legacy backfill, enable graph-aware defaults, or publish graph
 quality metrics.
 
-### Batch I — production assembly and migration readiness (next)
+### Batch I — production assembly and migration readiness
 
-Batch I makes the existing graph pieces executable against an isolated,
-configured runtime without changing the default behavior or reading/writing the
-real user memory store.
+Batch I is deliberately split so that runtime assembly, retrieval wiring, and
+legacy data reconciliation cannot silently become one irreversible migration.
+The default mode remains `legacy` throughout this batch, and no real user
+memory store is read or written by the Batch I test suite.
 
-Scope:
+#### Batch I-A — persistent assembly and identity producers (complete)
 
-1. **Persistent store assembly.** Resolve one explicit graph database path from
-   the framework configuration, initialize the SQLite graph schema through the
-   existing `GraphStore` contract, and expose health/rebuild diagnostics. The
-   path must be injectable in tests and must never be inferred from an agent's
-   private memory path.
-2. **Stable retrieval identity.** Define and test the producer that maps a
-   searchable L1/vector projection to a deterministic `graph_node_id` and
-   graph seed metadata. Missing, malformed, or ambiguous mappings remain
-   visible degradation states; they are not silently fabricated.
-3. **Legacy backfill preparation.** Build a dry-run, idempotent backfill
-   orchestration over an explicitly supplied source root and changelog snapshot.
-   It must produce an import/reconciliation report before any graph write, and
-   must support aborting without changing the source L1/vector data. No real
-   memory directory is used by Batch I tests.
-4. **Operational observability.** Add bounded counters and status fields for
-   graph availability, mapping coverage, fallback reasons, rebuild outcome,
-   and projection lag. Metrics are diagnostic only and cannot decide semantic
-   truth.
-5. **Documentation and release bookkeeping.** Record the actual 3.6.0 graph
-   runtime behavior and Batch I boundaries in the changelog and this document.
+- Resolve one explicit graph database path from framework configuration and
+  initialize the SQLite graph schema through the existing `GraphStore`
+  contract. The path is injectable in tests and is never inferred from an
+  agent's private memory path.
+- Define the deterministic producer that maps a searchable L1/vector entry ID
+  to the canonical `graph_node_id` used by the legacy graph importer.
+- Keep missing, malformed, and ambiguous mappings visible as degradation
+  states; never fabricate an identity from a filename, domain, heading, or
+  body text.
+- Add bounded read-only diagnostics for assembly and seed coverage without
+  leaking paths or memory contents.
 
-Non-scope for Batch I:
+Accepted in commit `deb2af6` (`feat: assemble persistent graph runtime`):
+focused I-A tests `88 passed`; full suite `1504 passed, 2 skipped`.
+
+#### Batch I-B — semantic recall wiring (complete)
+
+- Wire only the MCP `search_semantic` path to the existing graph recall seam,
+  because this path already carries explicit vector metadata containing the
+  graph seed identity.
+- Preserve the legacy response byte-for-byte in `legacy` mode: no graph call,
+  no added `graph` field, and no changed result ordering.
+- Keep `shadow` diagnostic-only and make `graph_recall`/`graph` additive;
+  graph failure, unavailable stores, malformed metadata, and missing mappings
+  must fall back to the original vector result.
+- Do not wire `recall_knowledge`, REST `/knowledge/search`, or the write path
+  in this batch; those entrances have different identity/provenance contracts.
+
+Accepted in commit `37da26f` (`feat: wire graph recall into semantic search`):
+focused I-B tests `102 passed`; full suite `1518 passed, 2 skipped`.
+
+#### Batch I-C — legacy identity backfill and reconciliation (next)
+
+I-C is a controlled data-preparation batch, not a default cutover. Its first
+deliverable is a read-only inventory and dry-run planner over explicitly
+supplied, isolated L1/vector/changelog snapshots. It must classify every input
+row before any write:
+
+1. **Eligible mapping.** A vector row with a valid stable entry ID maps to the
+   canonical legacy claim node ID through the existing identity function.
+2. **Already mapped.** The row already carries the expected graph seed
+   metadata; the operation is a no-op and is reported as such.
+3. **Unusable identity.** Blank, multiline, malformed, or conflicting IDs are
+   reported and never repaired by guessing.
+4. **Orphan or mismatch.** A vector row that cannot be matched to the supplied
+   L1 snapshot, or whose metadata disagrees with the deterministic mapping, is
+   quarantined in the report rather than silently rewritten.
+
+The apply phase, if separately enabled after a clean dry-run, has these hard
+properties:
+
+- update only graph seed metadata; do not change authored L1 text, vector text,
+  embeddings, ranking order, or source timestamps;
+- use the existing atomic vector publication boundary rather than ad-hoc SQL
+  mutation of individual rows;
+- import graph nodes/edges only from the explicit L1 and changelog snapshots;
+  do not let vector metadata become an independent semantic truth source;
+- be idempotent: rerunning the same snapshots produces the same graph state and
+  reports zero additional changes;
+- emit counts and stable reason codes, but never emit source paths, credentials,
+  or memory contents in the report.
+
+Rollback is projection rollback, not source deletion. Before apply, the
+planner must capture a content-free snapshot fingerprint and the exact set of
+rows it intends to change. If the fingerprint is stale, identity coverage is
+incomplete, or graph import/reconciliation fails, the apply must abort before
+publication. A successful metadata publication must be reversible by restoring
+the prior vector snapshot; the L1 snapshot and append-only changelog are never
+rewritten or deleted. Graph data remains disposable until the reconciliation
+report and reopen/rebuild checks pass.
+
+I-C explicitly does not include LLM extraction, entity resolution, conflict
+arbitration, automatic access to the real memory directory, default mode
+switching, physical deletion, REST integration, or write-path ownership
+changes. Those remain later, independently gated work.
+
+I-C exit criteria:
+
+- dry-run inventory accounts for every fixture row with stable reason codes;
+- eligible mappings are deterministic, idempotent, and produce no invented IDs;
+- dry-run and abort paths leave L1/vector/changelog fixtures byte-for-byte
+  unchanged;
+- apply tests prove stale-snapshot rejection and restoration of the previous
+  vector snapshot;
+- graph import and vector metadata reconciliation are independently auditable;
+- the full existing test suite passes and default `MemoryConfig()`/MCP
+  behavior remains `legacy`.
+
+#### Batch I remaining non-scope
 
 - no default switch away from `legacy`;
 - no destructive rewrite or physical deletion of L1, vector, or graph data;
-- no automatic LLM extraction, entity resolution, or conflict arbitration;
-- no direct access to `/root/.layered-memory`, agent memory directories, or
-  production configuration in tests;
+- no direct access to production configuration or real user memory in tests;
 - no external graph service or new mandatory dependency;
 - no removal of the legacy recall/write paths.
-
-Exit criteria:
-
-- a configured isolated SQLite graph store can be initialized, reopened,
-  health-checked, and rebuilt deterministically;
-- representative vector/L1 fixtures receive stable graph seed metadata;
-- backfill dry-run and abort paths leave source fixtures byte-for-byte intact;
-- fallback and mapping coverage are observable without leaking paths or memory
-  contents;
-- the full existing test suite and all Batch I tests pass;
-- the default `MemoryConfig()`/MCP behavior remains `legacy`.
 
 ### Batch J — measured shadow evaluation (planned)
 
