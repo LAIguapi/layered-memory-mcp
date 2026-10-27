@@ -432,6 +432,257 @@ def _semantic_graph_block(config: MemoryConfig, results) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
+# v3.6.0 Batch I-D: the one explicit semantic-write seam on the write path
+# ---------------------------------------------------------------------------
+# The rule this seam exists to keep: ordinary Markdown never becomes graph
+# semantics. A section-level write does not produce a node, an entity, a claim,
+# a supersession, a contradiction or a target ID — not from the domain, the
+# section, the content, the filename or a hash. The graph path runs only when
+# the caller hands over one already-decided, validated SemanticWriteRequest,
+# which keeps that judgement reviewable where it is made (ARCHITECTURE_v2.md
+# §12 Batch I-D, §3.4).
+#
+# The L1/changelog write stays the authoritative one and is reported exactly as
+# it happened: the graph block sits beside it, never rewrites it, and a graph
+# failure is never a rollback (there is no transaction spanning both stores).
+#
+# And this seam does not COMMIT a graph write. A commit means
+# ``GraphStore.rebuild``, which replaces graph state with the projection of the
+# stream it is handed; this tool holds no complete MemoryEvent stream, so a
+# commit from here would silently drop whatever an earlier write had projected.
+# A write-enabled mode therefore validates the decision and refuses it
+# (GRAPH_WRITE_SOURCE_EVENTS_REQUIRED) instead of rebuilding from a partial
+# stream. Committing belongs where the stream is explicit: a caller holding one
+# calls ``run_semantic_graph_write`` with it directly.
+
+#: The ``inject_knowledge_tool`` argument carrying that explicit decision. Named
+#: once, here, because the refusal payload derives its own field name from it —
+#: a caller reading ``<arg>_errors`` never has to guess what was refused.
+SEMANTIC_WRITE_REQUEST_ARG = "semantic_write_request"
+
+#: The request-level refusal. An invalid semantic request is a *request* error
+#: in the same sense ``Invalid mode:`` is: it is answered before the write, so
+#: nothing is written, nothing is projected, and nothing about the malformed
+#: payload is inferred or repaired.
+SEMANTIC_WRITE_REQUEST_ERROR = "invalid_semantic_write_request"
+
+#: How many distinct field locations one refusal reports.
+_SEMANTIC_WRITE_ERROR_LIMIT = 10
+
+#: The legacy write failed or was refused, so nothing was projected. Reported
+#: rather than silent: a caller that supplied a decision must be able to see
+#: that it was not applied anywhere.
+GRAPH_WRITE_LEGACY_FAILED = "graph_write_legacy_write_failed"
+
+#: The legacy path reported success without writing L1 content (a deferral
+#: handshake, a dedup skip, a no-change write). Projecting beside it would
+#: record a decision the authoritative store never took.
+GRAPH_WRITE_LEGACY_NOT_COMMITTED = "graph_write_legacy_write_not_committed"
+
+#: The decision is valid and the mode allows a write, but this entry point holds
+#: no complete ``MemoryEvent`` source stream — and ``GraphStore.rebuild`` is a
+#: *full replacement* of graph state from the stream it is handed ("nothing
+#: outside ``source_events`` survives"). Projecting this one decision's events
+#: alone would therefore erase every node and edge an earlier write left in the
+#: store. A refusal is the only honest answer available here (§10.3): a caller
+#: that holds its own stream projects it through ``run_semantic_graph_write``
+#: directly, where the stream is explicit and reviewable.
+GRAPH_WRITE_SOURCE_EVENTS_REQUIRED = "graph_write_source_events_required"
+
+#: The bounded reason label carried with that refusal — why it was refused, not
+#: what the store contains or where it lives.
+GRAPH_WRITE_SOURCE_EVENTS_WARNING = (
+    "graph_write_source_events_required:rebuild_replaces_graph_state"
+)
+
+#: ``action`` values the legacy write path returns having changed no L1 content.
+#: The deferral handshakes, the refusals and the dedup skip all return *before*
+#: the write in ``injector`` (see its ``_CHANGELOG_OPERATIONS`` note), and the
+#: two ``*_no_change`` actions wrote a body identical to the one already there,
+#: which is why neither records a changelog event either.
+_LEGACY_ACTIONS_WITHOUT_A_WRITE = frozenset({
+    "deferred_fusion",
+    "deferred_consolidate",
+    "consolidate_conflict",
+    "consolidate_refused",
+    "fuse_conflict",
+    "routing_refused",
+    "skipped",
+    "merged_no_change",
+    "append_no_change",
+})
+
+
+def _parse_semantic_write_request(payload):
+    """Validate an explicit semantic write request. Never guess one.
+
+    Returns ``(request, refusal)`` with exactly one side set: a validated
+    :class:`~layered_memory_mcp.graph_write.SemanticWriteRequest` (or ``None``
+    for "the caller supplied none", which is the normal legacy call), or the
+    bounded refusal payload to answer with.
+
+    The transport shape is the model's own JSON serialization — the dict
+    ``SemanticWriteRequest.to_dict()`` produces — so there is no second
+    semantic schema to keep in step. An already-constructed request is accepted
+    too, for an in-process caller that built one directly.
+
+    A malformed payload is refused, not repaired: no default node is invented,
+    no missing timestamp is filled in and no string is re-parsed as JSON.
+    """
+    if payload is None:
+        # Checked before the import: the normal call reaches no graph module.
+        return None, None
+
+    from .graph_write import SemanticWriteRequest
+
+    if isinstance(payload, SemanticWriteRequest):
+        return payload, None
+    if not isinstance(payload, dict):
+        return None, _semantic_write_refusal(
+            [f"{SEMANTIC_WRITE_REQUEST_ARG}:not_an_object"], "TypeError"
+        )
+    try:
+        return SemanticWriteRequest.model_validate(payload), None
+    except Exception as exc:  # noqa: BLE001 — any validation failure is a refusal
+        return None, _semantic_write_refusal(
+            _semantic_write_error_labels(exc), type(exc).__name__
+        )
+
+
+def _semantic_write_error_labels(exc: Exception) -> list[str]:
+    """Bounded ``<field location>:<error type>`` labels for one refusal.
+
+    Deliberately the *locations* and the pydantic error types only: a validation
+    message echoes the input it rejected, and the input here is the caller's own
+    node body (§15). A location is enough to fix the call.
+    """
+    errors = getattr(exc, "errors", None)
+    if not callable(errors):
+        return [f"{SEMANTIC_WRITE_REQUEST_ARG}:{type(exc).__name__}"]
+    labels = set()
+    for entry in errors():
+        location = ".".join(str(part) for part in entry.get("loc", ()))
+        labels.add(
+            f"{location or SEMANTIC_WRITE_REQUEST_ARG}:"
+            f"{entry.get('type') or 'invalid'}"
+        )
+    return sorted(labels)[:_SEMANTIC_WRITE_ERROR_LIMIT]
+
+
+def _semantic_write_refusal(labels: list[str], error_class: str) -> dict:
+    """The request-error response for an invalid semantic request."""
+    return {
+        "success": False,
+        "error": SEMANTIC_WRITE_REQUEST_ERROR,
+        "error_class": error_class,
+        f"{SEMANTIC_WRITE_REQUEST_ARG}_errors": labels,
+    }
+
+
+def _legacy_write_committed(result: dict) -> bool:
+    """Whether the authoritative L1 write actually changed knowledge.
+
+    Not the same question as ``success``: the deferred-fusion handshake and the
+    dedup skip both succeed having written nothing, and a graph node projected
+    beside one of them would mirror L1 state that does not exist.
+    """
+    if not result.get("success"):
+        return False
+    if result.get("needs_fusion"):
+        return False
+    return result.get("action") not in _LEGACY_ACTIONS_WITHOUT_A_WRITE
+
+
+def _graph_write_block(config: MemoryConfig, request, result: dict) -> dict | None:
+    """The additive graph block for a write response, or None when there is none.
+
+    Returning ``None`` is what keeps the legacy response byte-identical: the
+    normal call — no semantic request, default ``legacy`` mode — adds no key and
+    reaches no graph operation, not even the runtime seam.
+
+    Otherwise the block is purely additive and bounded: IDs, counts, statuses
+    and warning labels from the existing ``graph_write_payload``, beside the
+    untouched legacy fields. Never raises, and never reinterprets the legacy
+    outcome — ``legacy_write_ok`` is carried through as the write reported it.
+
+    The order is the one the batch requires: the legacy write first and
+    authoritative, no projection at all beside a failed, refused or deferred
+    one, and ``run_semantic_graph_write`` only where it is safe to call.
+
+    "Safe" is the narrow part, and it is what
+    :data:`GRAPH_WRITE_SOURCE_EVENTS_REQUIRED` exists for. A projection goes
+    through ``GraphStore.rebuild``, which *replaces* graph state with the
+    projection of the event stream it is given. This tool has no such stream —
+    its one ledger is MEMORY_CHANGELOG, which is not a ``MemoryEvent`` stream —
+    so a projection from here would carry this decision's events alone and drop
+    everything a previous write had projected. So a write-enabled mode with an
+    explicit request is refused here, before the runtime seam and before any
+    store operation, rather than committing a destructive rebuild.
+
+    ``shadow`` still plans: planning reads only the supplied material, asks the
+    store for nothing and changes nothing, so it keeps its value as the
+    observation mode. ``legacy`` and the read-only modes are unchanged.
+    """
+    from .graph_runtime import (
+        GRAPH_WRITE_FAILED,
+        GraphModeDecision,
+        GraphWriteOutcome,
+        graph_write_payload,
+        run_semantic_graph_write,
+    )
+
+    mode = GraphModeDecision.from_config(config)
+    if request is None and not mode.prepares_write:
+        return None
+
+    def _bounded(status: str, legacy_write_ok: bool, warnings=()) -> dict:
+        return graph_write_payload(
+            GraphWriteOutcome(
+                mode=mode.mode,
+                status=status,
+                legacy_write_ok=legacy_write_ok,
+                warnings=sorted(warnings),
+            )
+        )
+
+    legacy_write_ok = bool(result.get("success"))
+    if not legacy_write_ok:
+        return _bounded(GRAPH_WRITE_LEGACY_FAILED, False)
+    if not _legacy_write_committed(result):
+        return _bounded(GRAPH_WRITE_LEGACY_NOT_COMMITTED, True)
+
+    if mode.write_enabled and request is not None:
+        # The refusal above: no runtime call, no store call, no rebuild — and
+        # therefore no chance of replacing an existing graph with this one
+        # decision. Reported as itself rather than as a failure or a commit.
+        return _bounded(
+            GRAPH_WRITE_SOURCE_EVENTS_REQUIRED,
+            legacy_write_ok,
+            warnings=[GRAPH_WRITE_SOURCE_EVENTS_WARNING],
+        )
+
+    try:
+        outcome = run_semantic_graph_write(
+            mode=mode,
+            request=request,
+            store=_graph_store,
+            legacy_write_ok=legacy_write_ok,
+        )
+    except Exception as exc:  # noqa: BLE001 — a graph fault is not a write fault
+        # The class name only: a store diagnostic may name a database file.
+        logger.debug("semantic graph write unavailable: %s", type(exc).__name__)
+        return _bounded(
+            GRAPH_WRITE_FAILED,
+            legacy_write_ok,
+            warnings=[f"graph_write_runtime_failed:{type(exc).__name__}"],
+        )
+
+    # Whatever this is, it is not a projection: the only paths that reach the
+    # runtime from here are "no decision to project" and shadow's planning.
+    return graph_write_payload(outcome)
+
+
+# ---------------------------------------------------------------------------
 # Helper: wrap blocking I/O for async contexts
 # ---------------------------------------------------------------------------
 
@@ -1240,6 +1491,7 @@ async def inject_knowledge_tool(
     fuse: bool = False,
     expected_hash: str | None = None,
     routing_override: str = "none",
+    semantic_write_request: dict | None = None,
 ) -> str:
     """Smart knowledge injection with dedup, section targeting, and auto L0 sync.
 
@@ -1294,6 +1546,24 @@ async def inject_knowledge_tool(
               surfaces, and the refusal names the one to use. With the default
               config (`enforce_direct_writes: false`) this argument changes
               nothing: the write happens and carries a `routing_warning`.
+        semantic_write_request: v3.6.0 OPTIONAL, and omitted on a normal call.
+              One already-decided semantic graph write, serialized exactly as
+              `SemanticWriteRequest` serializes itself ({node, occurred_at,
+              assertions?, supersedes?, contradicts?, …}). It is the ONLY way
+              this tool reaches the memory graph: the framework never derives a
+              node, an entity, a claim, a supersession, a contradiction or a
+              target ID from the domain, the section or the content — that
+              judgement is yours, and passing it here is what makes it
+              reviewable. An invalid payload is refused before anything is
+              written (error="invalid_semantic_write_request") rather than
+              repaired. NOTE: this entry point does not COMMIT it. A graph
+              commit replaces graph state from a complete MemoryEvent stream,
+              and this tool holds no such stream, so under `graph_write`/`graph`
+              the decision is validated and then refused with
+              `graph.status="graph_write_source_events_required"` and
+              `graph.committed=false` — never a partial rebuild that would drop
+              earlier graph state. `shadow` reports the validated plan. The L1
+              write below is authoritative and unaffected either way.
 
     Returns:
         JSON with action taken, dedup info, L0 sync status, and warnings.
@@ -1304,6 +1574,12 @@ async def inject_knowledge_tool(
         under `routing.enforce_direct_writes` — action="routing_refused" with
         the `routing` decision, a `suggested_action` for the agent-owned surface
         it belongs to, and `routing_enforcement` describing the gate.
+        v3.6.0: carries an additive, bounded `graph` block ONLY when a
+        `semantic_write_request` was supplied or a graph write mode is
+        configured. The legacy fields above are never rewritten, reordered or
+        dropped, and `graph.committed` is the graph side alone — which from this
+        entry point is always false: a graph failure or refusal beside a
+        successful L1 write is reported, never a rollback.
     """
     config = _get_config()
 
@@ -1319,6 +1595,15 @@ async def inject_knowledge_tool(
             ),
         })
 
+    # v3.6.0: an explicit semantic decision is validated with the other
+    # arguments, before the write — a malformed one is a request error the
+    # caller can fix and retry, not a half-applied call whose L1 side landed.
+    semantic_request, semantic_refusal = _parse_semantic_write_request(
+        semantic_write_request
+    )
+    if semantic_refusal is not None:
+        return json.dumps(semantic_refusal, ensure_ascii=False)
+
     result = await asyncio.to_thread(
         inject_knowledge,
         config=config,
@@ -1331,6 +1616,16 @@ async def inject_knowledge_tool(
         expected_hash=expected_hash,
         routing_override=routing_override,
     )
+
+    # v3.6.0 Batch I-D: the explicit semantic-write seam, additive and
+    # mode-gated. With no request and the default `legacy` mode this adds no
+    # key and reaches no graph operation, so the response is exactly what it
+    # always was. The L1 result above is already final either way.
+    graph_block = await asyncio.to_thread(
+        _graph_write_block, config, semantic_request, result
+    )
+    if graph_block is not None:
+        result["graph"] = graph_block
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
