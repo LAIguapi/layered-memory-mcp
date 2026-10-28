@@ -626,7 +626,7 @@ def test_stable_frontmatter_id_drift_is_repaired_without_random_h2_false_alarm(c
         assert rows(cfg)[0][0] == entry.id != old_id
     else:
         rebuild(cfg)
-        assert rows(cfg)[0][0] != old_id  # H2 IDs are generated, not authoritative.
+        assert rows(cfg)[0][0] == old_id  # H2 IDs are derived deterministically from the heading, so rebuilds reproduce them.
         assert maintenance.maintain_vectors(cfg)["status"] == "healthy"
     assert injector.vector_store_needs_reindex(cfg) is False
 

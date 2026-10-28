@@ -258,13 +258,25 @@ def _get_config() -> MemoryConfig:
 
 
 # ---------------------------------------------------------------------------
-# v3.6.0: the memory-graph store is INJECTED, never constructed here
+# v3.6.0: the memory-graph store is INJECTED, or opened per request — never
+# constructed at import or start-up
 # ---------------------------------------------------------------------------
-# None means "no graph", which every graph-enabled mode handles as a reported
-# outage rather than an error. Nothing in this module builds a backend: a server
-# that opened a graph database on start-up would make the graph a second truth
-# source by default, which is exactly what the Batch H mode exists to prevent
-# (see ARCHITECTURE_v2.md §12; backend assembly is a later batch).
+# ``None`` means "no injected override". Nothing in this module builds a backend
+# eagerly: a server that opened a graph database on start-up would make the graph
+# a second truth source by default, which is exactly what the Batch H mode exists
+# to prevent (see ARCHITECTURE_v2.md §12).
+#
+# v3.6.0 Batch L-B adds the one caller the Batch I assembly never had, and keeps
+# the two sources of a store strictly ordered:
+#
+#   1. an injected store — caller-owned, takes precedence, never closed here;
+#   2. otherwise, and only once the mode says recall may observe the graph, the
+#      explicitly configured database, opened for the duration of *one* request
+#      through ``graph_store_session(require=True)`` and closed in its finally.
+#
+# There is deliberately no third source: no pool, no singleton connection, no
+# startup hook, no auto-import and no inferred path. An unconfigured request
+# keeps the old "no store" fallback.
 _graph_store = None
 
 
@@ -272,35 +284,95 @@ def set_graph_store(store) -> None:
     """Inject (or clear with ``None``) the memory-graph backend.
 
     The explicit seam for a runtime assembly — a deployment script, an embedding
-    host, a test. Clearing it is always safe: a graph-enabled mode then reports
-    ``graph_unavailable:no_store`` and answers from the legacy path.
+    host, a test. The injected store is *caller-owned*: it takes precedence over
+    the configured path and is never closed by this module.
+
+    Clearing it is always safe: it removes the override, so a graph-enabled
+    request falls back to the explicitly configured database (and, when none is
+    configured, to the same ``graph_unavailable:no_store`` report as before).
     """
     global _graph_store
     _graph_store = store
+
+
+def _graph_recall_report(legacy_results, store, mode):
+    """Run the existing recall seam over ``store``, or report an outage.
+
+    Never raises: recall is the hot read path, so a caller-contract error in the
+    graph seam (a malformed injected store, a duplicated result identity) is
+    reported as an outage instead of failing the tool. Only the exception
+    *class* is carried — a store diagnostic may name a database file (§15).
+    """
+    from .graph_recall import GRAPH_STATUS_UNAVAILABLE
+    from .graph_runtime import GraphRecallRuntimeReport, run_graph_assisted_recall
+
+    try:
+        return run_graph_assisted_recall(legacy_results, store, mode=mode)
+    except Exception as exc:
+        logger.debug("graph-assisted recall unavailable: %s", type(exc).__name__)
+        return GraphRecallRuntimeReport(
+            mode=mode.mode,
+            status=GRAPH_STATUS_UNAVAILABLE,
+            warnings=[f"graph_runtime_failed:{type(exc).__name__}"],
+        )
+
+
+def _request_scoped_graph_recall_report(config: MemoryConfig, legacy_results, mode):
+    """The same seam, over the configured database, for exactly this request.
+
+    Batch L-B: the open/use/close lifecycle is the assembly's own
+    ``graph_store_session``, reused rather than restated, so this path cannot
+    disagree with the diagnostics about when a store may be opened. The session
+    closes the store it opened in its ``finally``, on success and on error
+    alike, and an unconfigured or unopenable database yields ``store=None`` —
+    which the recall seam already reports as a bounded fallback.
+
+    The assembly's own status and error labels are added to the report's
+    warnings so "the graph could not assist" and "the graph was never there"
+    stay distinguishable. They are bounded tokens (a status, an exception class
+    name): never a path, a body or a backend message.
+    """
+    from .graph_runtime_assembly import GRAPH_STORE_OPENED, graph_store_session
+
+    with graph_store_session(config, require=True, mode=mode) as assembly:
+        report = _graph_recall_report(legacy_results, assembly.store, mode)
+        assembly_report = assembly.report
+
+    if assembly_report.status == GRAPH_STORE_OPENED:
+        return report
+    return report.model_copy(
+        update={
+            "warnings": sorted(
+                {
+                    *report.warnings,
+                    assembly_report.status,
+                    *assembly_report.errors,
+                }
+            )
+        }
+    )
 
 
 def _graph_recall_block(config: MemoryConfig, result: dict) -> dict | None:
     """The additive graph block for a recall response, or None in legacy mode.
 
     Returning ``None`` is what keeps the legacy response byte-identical: in
-    ``legacy`` mode this function touches nothing and adds no key.
+    ``legacy`` mode this function touches nothing, adds no key, opens no
+    database and reaches no graph operation.
 
     In a graph-enabled mode the block is purely additive — the existing
     ``results`` / ``matched_files`` / ``search_mode`` fields are never rewritten,
     reordered or re-scored. Shadow mode additionally carries the deterministic
     comparison record, which is the whole point of shadowing.
 
-    Never raises: recall is the hot read path, so a caller-contract error in the
-    graph seam (a malformed injected store, a duplicated result identity) is
-    reported as an outage in the block instead of failing the tool.
+    The store comes from one of two places, in this order: the caller-injected
+    override (used as-is, never closed), or — only without an override — the
+    explicitly configured database, opened and closed within this call.
     """
-    from .graph_recall import GRAPH_STATUS_UNAVAILABLE
     from .graph_runtime import (
         GraphModeDecision,
-        GraphRecallRuntimeReport,
         compare_recall_results,
         graph_recall_payload,
-        run_graph_assisted_recall,
     )
 
     mode = GraphModeDecision.from_config(config)
@@ -308,18 +380,11 @@ def _graph_recall_block(config: MemoryConfig, result: dict) -> dict | None:
         return None
 
     legacy_results = result.get("results") or []
-    try:
-        report = run_graph_assisted_recall(
-            legacy_results, _graph_store, mode=mode
-        )
-    except Exception as exc:
-        # The class name only: a store diagnostic may name a database file.
-        logger.debug("graph-assisted recall unavailable: %s", type(exc).__name__)
-        report = GraphRecallRuntimeReport(
-            mode=mode.mode,
-            status=GRAPH_STATUS_UNAVAILABLE,
-            warnings=[f"graph_runtime_failed:{type(exc).__name__}"],
-        )
+    if _graph_store is not None:
+        # The caller owns this store's lifecycle: used, reported, left open.
+        report = _graph_recall_report(legacy_results, _graph_store, mode)
+    else:
+        report = _request_scoped_graph_recall_report(config, legacy_results, mode)
 
     block = graph_recall_payload(report)
     if mode.shadow_enabled:

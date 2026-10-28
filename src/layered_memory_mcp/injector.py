@@ -2442,7 +2442,16 @@ def _vector_entries(domain: str, raw: str) -> list:
     REST's single-entry frontmatter files have their own model contract: their
     body need not contain an H2. Do not silently discard them during maintenance.
     Legacy Markdown is projected as one entry per bodyful H2, including repeats.
+
+    v3.6.0 Batch L-A: an ordinary-Markdown section's ``id`` is *derived* from
+    (domain, exact H2 label, occurrence among identical labels) instead of a
+    fresh ``uuid4``, so projecting an unchanged file twice yields the same row —
+    and the same graph seed — rather than a new identity each time. A
+    frontmatter-backed entry keeps its own authoritative ``id``; only the
+    ordinary-Markdown branch below derives one, and an unusable domain or label
+    is refused by ``graph_entry_identity`` rather than given a random ID.
     """
+    from .graph_entry_identity import markdown_section_entry_ids
     from .heading import embedding_heading
     from .models import KnowledgeEntry, SourceInfo, SourceType, ReviewStatus, KnowledgeType
     from .storage.frontmatter import parse_frontmatter
@@ -2452,14 +2461,17 @@ def _vector_entries(domain: str, raw: str) -> list:
         entry = KnowledgeEntry.from_markdown(raw, domain=domain)
         entry.domain = domain
         return [entry] if entry.content.strip() else []
+    sections = _bodyful_sections(raw)
+    entry_ids = markdown_section_entry_ids(domain, [s for s, _body in sections])
     return [
         KnowledgeEntry(
+            id=entry_id,
             domain=domain, section=section, content=body,
             summary=embedding_heading(section)[:200], type=KnowledgeType.FACT,
             confidence=0.9, review_status=ReviewStatus.APPROVED,
             source=SourceInfo(type=SourceType.MANUAL, extracted_by="auto_sync"),
         )
-        for section, body in _bodyful_sections(raw)
+        for (section, body), entry_id in zip(sections, entry_ids)
     ]
 
 
