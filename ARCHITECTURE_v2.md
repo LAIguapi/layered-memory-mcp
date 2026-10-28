@@ -1,6 +1,6 @@
 # Layered Memory MCP — Layered Memory Graph v1 Architecture
 
-> Status: IMPLEMENTATION BASELINE — Batch K evidence complete; K-C governance next
+> Status: IMPLEMENTATION BASELINE — Batch L complete; production population and cutover remain open
 > Branch: `refactor/memory-graph-v1`
 > Baseline commit: `668e402` (`chore: freeze pre-graph refactor baseline`)
 > Version: 3.6.0
@@ -1015,7 +1015,7 @@ that legacy recall is restored after disabling the opt-in. Removing obsolete
 paths remains out of scope until an explicit equivalence or intentional
 behavior-change record.
 
-### Batch L — stable projection identity and request-scoped graph assembly (planned)
+### Batch L — stable projection identity and request-scoped graph assembly (complete)
 
 The post-K source audit found two runtime gaps, independently checked on neutral
 in-memory inputs: ``injector._vector_entries`` minted random IDs for ordinary
@@ -1078,6 +1078,11 @@ Implementation allowlist: new ``src/layered_memory_mcp/graph_entry_identity.py``
 ``tests/test_v360_graph_recall_path.py``. Design/status updates stay in this
 document and ``CHANGELOG.md`` in separate documentation commits.
 
+The user additionally approved the single assertion/comment correction in
+``tests/test_vector_maintenance.py:629``: an unchanged H2 projection now keeps
+its derived ID across rebuilds. All other assertions in that existing test were
+retained, including frontmatter ID drift repair and maintenance health checks.
+
 Require tests for repeat/body-edit/section-insertion identity, exact-label
 collision controls, duplicate-heading boundaries, frontmatter preservation,
 temporary vector replacement and importer/seed/traversal identity agreement.
@@ -1098,6 +1103,27 @@ Code rollback is a separate batch revert; no persistent production change is
 made to reverse here. A later production migration must restore vector and graph
 backups together, rather than claiming a reindex recovers old random row IDs.
 Disabling graph recall restores legacy responses without opening the graph.
+
+#### Delivered evidence
+
+Code commit: ``262ce88``. Independent parent verification: focused identity,
+request-lifecycle, and vector-maintenance tests **115 passed**; full regression
+**1830 passed, 2 skipped**; compilation and tracked/untracked whitespace checks
+passed. Security scans covered all six changed files with **0 CRITICAL,
+0 HIGH, 0 MEDIUM**; LOW informational findings remain. AST comparison confirmed
+the injector change is confined to ``_vector_entries`` and server function changes
+to recall-store selection/lifecycle and injection documentation. The default
+remains ``legacy``; no dependencies, lockfile, startup hook, migration, production
+configuration, or production graph population were introduced.
+
+The identity is ``mdsec1_`` plus the first 32 hexadecimal SHA-256 characters
+(128 digest bits), with the version and length-prefixed exact labels in the
+hashed payload. Temporary fixtures verify importer/seed/traversal agreement,
+actual MCP semantic search over a populated SQLite graph, one open/close per
+request, injected-store precedence, safe fallbacks, and unchanged write refusal.
+This is isolated runtime evidence, not production retrieval-quality evidence.
+Production population, a complete semantic event stream, broader measured
+acceptance, and an explicitly approved default cutover remain open targets.
 
 ## 13. Acceptance metrics
 

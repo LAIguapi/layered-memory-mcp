@@ -19,6 +19,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parity checks against the existing graph-recall seam. These helpers produce
   evidence inputs only; they do not change production defaults or claim a
   cutover decision.
+- Add request-scoped persistent graph assembly to explicit graph recall modes,
+  retaining caller-owned injected-store precedence, legacy zero-open behavior,
+  and bounded fallback diagnostics. Graphs are not automatically populated.
+
+### Changed
+
+- Derive ordinary-Markdown H2 vector row identities deterministically from the
+  exact domain, section label, and occurrence among identical labels. Preserve
+  frontmatter IDs and canonical graph seed mapping. Heading/domain renames and
+  edits within duplicate-heading groups retain the documented identity limits.
+  No existing data is migrated; production reindexing requires a separately
+  approved coordinated vector/graph rebuild and backup.
 
 ## [3.5.1] - 2026-10-25
 
