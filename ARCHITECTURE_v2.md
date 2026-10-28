@@ -1220,6 +1220,40 @@ local capability separately from production migration and retrieval-quality gate
 Maintain code/documentation commit separation; no production cutover or real-data
 migration is implied by framework or CLI acceptance.
 
+#### Delivery checkpoint and migration implementation boundary
+
+Framework implementation is committed as `9115228`. Independent full regression
+on the system interpreter was repeated after that commit: 2094 tests passed,
+with no skipped tests. The working tree was clean before migration work began.
+This establishes the framework acceptance prerequisite, not production readiness.
+
+The next implementation is a separate `graph_migration` operator module (runnable
+with `python -m layered_memory_mcp.graph_migration`), not a replacement for the
+existing `domain_keywords` migration command. Its inputs and destination are
+explicit. Build and validate a private staged generation, then publish that
+generation with one filesystem boundary; leave the source byte-for-byte intact.
+Retain source backups, journal events, projection manifests and rollback evidence.
+Rollback withdraws only an unchanged migration-owned generation and retains its
+artifacts; it must refuse changed or unknown target contents.
+
+Reuse the legacy importer only on a disposable in-memory planning store, convert
+its validated snapshot into deterministic bootstrap MemoryEvents, and rebuild
+the destination from the persisted journal. Never publish the importer's partial
+per-record writes as the authority. Preserve explicit frontmatter identities;
+ordinary Markdown uses the versioned section identity projector. Unresolvable
+legacy vector identities remain accounted for and block publication unless an
+explicit, validated identity mapping or full coordinated reprojection resolves
+them. No body-similarity identity guesses or silent loss are permitted.
+
+Tests first establish dry-run zero writes and successful staged publication,
+then cover replay/duplicate apply, full readback, rollback, malformed/conflicting
+inputs, source drift, symlink/overlap refusal, publication failure and target
+drift. Use only neutral temporary fixtures and deterministic injected embeddings;
+do not access real stores, install/restart anything, or change the default mode.
+The parent independently exercises the CLI and reviews scope/security before
+marking migration acceptance complete. Documentation and code remain separate
+commits. Real migration, publication and production cutover are separate actions.
+
 ## 13. Acceptance metrics
 
 No backend switch or default cutover is justified by architecture preference
