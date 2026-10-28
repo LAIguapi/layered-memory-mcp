@@ -249,7 +249,8 @@ async def test_rest_shutdown_closes_observer_even_when_application_raises(cfg, m
     from layered_memory_mcp.api import server as api
 
     monkeypatch.setattr(api, "stores", {})
-    monkeypatch.setattr(api, "store_dirs", lambda: (cfg.knowledge_dir, cfg.home / "data"))
+    monkeypatch.setattr(api, "store_dirs",
+                        lambda config=None: (cfg.knowledge_dir, cfg.home / "data"))
     with pytest.raises(RuntimeError, match="application failed"):
         async with api.lifespan(api.create_app()):
             observer = api.stores["vector"]._cache_observer

@@ -1801,6 +1801,13 @@ def auto_maintain_after_write(
     write without ever claiming a compaction happened, so the next real pass is
     not postponed and the dedup scan keeps its own schedule.
 
+    v3.6.1: in a graph write mode this returns a suspension report and does
+    nothing. Every caller of this function — the injector ride-along, the
+    ``get_l0_index`` ride-along, the HTTP maintenance tick — would otherwise be
+    performing the refused ``compact_memory`` mutation with nobody asking for
+    it. The authority republishes agent memory and L1 from the journal; this
+    pass rewrites them from whatever is on disk, which is a different thing.
+
     Returns a report dict; ``{"skipped": True, ...}`` when auto-maintain is off.
     ``report["compact"]["status"]`` is one of ``not_triggered`` / ``migrated``
     (entries reached L1) / ``blocked_only`` (the pass ran and only blocked
@@ -1808,6 +1815,12 @@ def auto_maintain_after_write(
     ``not_triggered`` report carries ``throttled`` when the interval trigger
     was the only candidate and the attempt marker is still fresh.
     """
+    from .graph_mutation_guard import maintenance_job_suspension
+
+    suspension = maintenance_job_suspension(config, "auto_maintain")
+    if suspension is not None:
+        return {"skipped": True, **suspension}
+
     if not getattr(config, "auto_maintain", True):
         return {"skipped": True, "reason": "auto_maintain disabled"}
 

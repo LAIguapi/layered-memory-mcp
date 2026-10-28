@@ -1038,7 +1038,9 @@ def test_a_rebuild_that_reports_errors_is_returned_with_them():
         error.startswith("unresolved_edge_endpoint:")
         for error in projection.report.errors
     )
-    assert store.health().healthy is False
+    assert store.snapshot()["nodes"] == []
+    assert store.snapshot()["edges"] == []
+    assert store.health().healthy is True
 
 
 def test_a_raising_rebuild_is_surfaced_rather_than_reported_as_success():

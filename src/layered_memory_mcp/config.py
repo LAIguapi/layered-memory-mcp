@@ -450,8 +450,8 @@ def _normalize_agent_extensions(raw: object) -> dict:
     return out
 
 
-def _resolve_graph_db_path(value: object) -> Path | None:
-    """Normalise the declared graph database target, or refuse it.
+def _resolve_graph_db_path(value: object, field: str = "graph_db_path") -> Path | None:
+    """Normalise a declared graph-layer database target, or refuse it.
 
     v3.6.0 Batch I-A. Three answers only, and "guess one" is not among them:
 
@@ -468,24 +468,28 @@ def _resolve_graph_db_path(value: object) -> Path | None:
       relative path would silently resolve against whatever directory the
       server happened to start in, which is the same class of mistake as a
       guessed one; a non-string (``db_path: true``) never named a file at all.
+
+    v3.6.1 shares the rule with ``graph_journal_path`` through ``field``: the
+    two declarations have identical validity rules, and two copies of them is
+    how one target would start accepting what the other refuses.
     """
     if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, (str, Path)):
         raise ValueError(
-            f"Invalid graph_db_path: {value!r}. Must be an absolute filesystem "
-            "path to the graph database, or unset."
+            f"Invalid {field}: {value!r}. Must be an absolute filesystem "
+            "path to the database, or unset."
         )
     text = str(value)
     if "\n" in text or "\r" in text:
-        raise ValueError("Invalid graph_db_path: must not contain newlines.")
+        raise ValueError(f"Invalid {field}: must not contain newlines.")
     text = text.strip()
     if not text:
         return None
     path = Path(text).expanduser()
     if not path.is_absolute():
         raise ValueError(
-            f"Invalid graph_db_path: {text!r}. Must be an absolute path — a "
+            f"Invalid {field}: {text!r}. Must be an absolute path — a "
             "relative one would resolve against the server's working directory."
         )
     return path
@@ -583,6 +587,9 @@ class MemoryConfig:
         # v3.6.0 Batch I — the one explicit graph database target. A declared
         # path, never a derived one; see _resolve_graph_db_path.
         graph_db_path: str | None = None,
+        # v3.6.1 — the semantic decision journal (the write authority). Same
+        # resolution and validation rules as graph_db_path, declared separately.
+        graph_journal_path: str | None = None,
     ):
         self.home = Path(home) if home else default_home()
 
@@ -1207,6 +1214,29 @@ class MemoryConfig:
             if graph_db_path is not None
             else os.environ.get("LAYERED_MEMORY_GRAPH_DB_PATH")
             or _graph_yaml.get("db_path")
+        )
+
+        # v3.6.1: the semantic decision journal target, on the same resolution
+        # chain and the same three answers as `db_path` above:
+        #
+        #   graph:
+        #     mode: graph_write
+        #     db_path: /srv/layered-memory/graph.db
+        #     journal_path: /srv/layered-memory/journal.db
+        #
+        # It is a *separate* declaration on purpose. The journal is the write
+        # authority and the graph database is a projection of it, so an operator
+        # may legitimately declare a read-only graph with no journal (recall
+        # only). A write mode without a journal is reported as
+        # `graph_write_not_configured` and refuses — never a journal invented
+        # beside the graph file, which would make the authority something the
+        # framework chose rather than something the operator did.
+        self.graph_journal_path: Path | None = _resolve_graph_db_path(
+            graph_journal_path
+            if graph_journal_path is not None
+            else os.environ.get("LAYERED_MEMORY_GRAPH_JOURNAL_PATH")
+            or _graph_yaml.get("journal_path"),
+            field="graph_journal_path",
         )
 
         # Resolve namespace-aware knowledge directories

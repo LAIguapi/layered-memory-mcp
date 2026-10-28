@@ -193,7 +193,10 @@ def test_enabling_a_mode_constructs_no_graph_backend(tmp_path):
     # No store and no handle: the backend is injected by the runtime assembly,
     # not derived from a config. ``graph_db_path`` is a *declared* target
     # (§12 Batch I scope item 1) — a string the operator wrote, not a
-    # connection — and it is None unless they wrote one.
+    # connection — and it is None unless they wrote one. v3.6.1 adds exactly one
+    # more declared target on the same terms, ``graph_journal_path``: a path the
+    # operator wrote for the semantic decision journal, never a connection and
+    # never derived from ``home``.
     assert not [
         name
         for name in dir(config)
@@ -204,9 +207,11 @@ def test_enabling_a_mode_constructs_no_graph_backend(tmp_path):
             "graph_write_enabled",
             "graph_shadow_enabled",
             "graph_db_path",
+            "graph_journal_path",
         }
     ]
     assert config.graph_db_path is None
+    assert config.graph_journal_path is None
 
 
 # ---------------------------------------------------------------------------

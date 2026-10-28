@@ -117,6 +117,22 @@ class RebuildVectorsRequest(BaseModel):
 
 # ── Helper: ensure imports are available ──────────────────────────────
 
+def _graph_mutation_guard(operation: str, dry_run: bool = False) -> None:
+    """Refuse a mutating dashboard endpoint in a graph write mode (v3.6.1).
+
+    ``dry_run`` is never refused: inspecting what an action *would* do writes
+    nothing and stays available in every mode. The refusal body is the same
+    bounded payload every other transport returns, carried as ``409 Conflict``.
+    """
+    if dry_run:
+        return
+    from layered_memory_mcp.graph_mutation_guard import graph_mutation_refusal
+
+    refusal = graph_mutation_refusal(_get_config(), operation)
+    if refusal is not None:
+        raise HTTPException(status_code=409, detail=refusal)
+
+
 def _check_imports():
     if MemoryConfig is None:
         raise HTTPException(
@@ -250,6 +266,7 @@ async def get_pending_reviews(limit: int = Query(20, ge=1, le=100)):
 async def approve_knowledge(req: ReviewActionRequest):
     """Approve a pending knowledge entry."""
     _check_imports()
+    _graph_mutation_guard("dashboard_approve_knowledge", req.dry_run)
 
     if req.dry_run:
         return {
@@ -290,6 +307,7 @@ async def approve_knowledge(req: ReviewActionRequest):
 async def reject_knowledge(req: ReviewActionRequest):
     """Reject a pending knowledge entry."""
     _check_imports()
+    _graph_mutation_guard("dashboard_reject_knowledge", req.dry_run)
 
     if req.dry_run:
         return {
@@ -322,6 +340,7 @@ async def reject_knowledge(req: ReviewActionRequest):
 async def inject_knowledge_endpoint(req: InjectKnowledgeRequest):
     """Inject knowledge into L1. Supports dry-run preview."""
     _check_imports()
+    _graph_mutation_guard("dashboard_inject_knowledge", req.dry_run)
 
     if req.dry_run:
         return {
@@ -369,6 +388,7 @@ async def inject_knowledge_endpoint(req: InjectKnowledgeRequest):
 async def compact_memory_endpoint(req: CompactRequest):
     """Trigger memory compaction. Supports dry-run preview."""
     _check_imports()
+    _graph_mutation_guard("dashboard_compact_memory", req.dry_run)
 
     if req.dry_run:
         return {
@@ -478,6 +498,7 @@ async def get_todos(
 async def update_todo_endpoint(req: UpdateTodoRequest):
     """Update a TODO item status. Supports dry-run preview."""
     _check_imports()
+    _graph_mutation_guard("dashboard_update_todo", req.dry_run)
 
     if req.dry_run:
         return {
@@ -515,6 +536,7 @@ async def update_todo_endpoint(req: UpdateTodoRequest):
 async def rebuild_vectors_endpoint(req: RebuildVectorsRequest):
     """Rebuild vector store index. Supports dry-run preview."""
     _check_imports()
+    _graph_mutation_guard("dashboard_rebuild_vectors", req.dry_run)
 
     if req.dry_run:
         return {

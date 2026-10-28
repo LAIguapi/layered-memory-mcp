@@ -73,7 +73,7 @@ class KnowledgeWatcher:
 
         logger.info("Knowledge watcher started: %s (auto_sync_l0=%s)",
                      [str(d) for d in self.knowledge_dirs],
-                     self.config.auto_sync_l0 if self.config else False)
+                     self._should_auto_sync())
         self._schedule_poll()
 
     def stop(self):
@@ -88,12 +88,21 @@ class KnowledgeWatcher:
         logger.info("Knowledge watcher stopped")
 
     def _should_auto_sync(self) -> bool:
-        """Check if L0 auto-sync is enabled."""
-        return (
-            self.config is not None
-            and self.config.auto_sync_l0
-            and self.config.l0_index_file is not None
-        )
+        """Check if L0 auto-sync is enabled.
+
+        v3.6.1: never in a graph write mode. The watcher sees files, not
+        decisions, so regenerating L0 from whatever is currently on disk would
+        publish an index the journal did not produce — and would race the
+        authority's own ``publish_l0`` between its L1 write and its checkpoint.
+        Cache invalidation (``on_change``) is unaffected: it publishes nothing.
+        """
+        if self.config is None:
+            return False
+        from .graph_mutation_guard import maintenance_job_suspension
+
+        if maintenance_job_suspension(self.config, "watcher_l0_sync") is not None:
+            return False
+        return bool(self.config.auto_sync_l0 and self.config.l0_index_file is not None)
 
     def _sync_l0(self):
         """Trigger L0 index sync (non-blocking)."""

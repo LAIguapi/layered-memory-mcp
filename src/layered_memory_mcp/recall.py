@@ -273,6 +273,26 @@ def extract_relevant_sections(keyword: str, content: str, max_sections: int = 3)
 # Multi-directory support (v0.6.0: namespace + shared)
 # ---------------------------------------------------------------------------
 
+def _matched_section_entries(rel_path: str, content: str, keyword: str) -> list[dict]:
+    """The exact identity of the H2 sections in ``rel_path`` that matched.
+
+    v3.6.1. The keyword producer carries its *own* stable source identity rather
+    than leaving a later layer to infer one: ``(domain, exact H2 label,
+    occurrence among identical labels)``, hashed by the same versioned rule the
+    vector rows for those sections were minted from. The display-oriented
+    ``sections`` list beside it is deliberately not usable for this — it splits
+    on any heading level and invents ``"Overview"``/``"Untitled"`` titles, so an
+    identity taken from it would be a guess dressed as a mapping.
+
+    Degrades to an empty list, never to a fabricated ID: a file that matched on
+    its preamble or on a deeper heading simply has no H2 identity to carry, and
+    the graph layer then treats the row as unmapped and preserves it.
+    """
+    from .graph_search import keyword_section_seeds
+
+    return keyword_section_seeds(Path(rel_path).stem, content, keyword)
+
+
 def scan_knowledge_dirs(knowledge_dirs: list[str]) -> dict[str, str]:
     """Scan multiple knowledge directories, merging results.
     
@@ -358,6 +378,13 @@ def recall(
     file_keywords_map: dict[str, list[str]] = {}
     all_sections: dict[str, list[dict]] = {}
     all_wiki_links: dict[str, list[str]] = {}
+    # v3.6.1: the exact, occurrence-aware identity of the H2 sections that
+    # matched, taken from the canonical projection rather than from the
+    # display-oriented ``sections`` above. ``extract_relevant_sections`` splits
+    # on *any* heading level and falls back to synthetic "Overview"/"Untitled"
+    # titles, so a graph identity derived from it would be a guess; this is the
+    # same projection the vector rows for those sections were minted from.
+    all_section_entries: dict[str, list[dict]] = {}
 
     for rel_path, (content, _wc) in file_contents.items():
         kw_score = score_relevance(keyword, content, rel_path)
@@ -379,6 +406,9 @@ def recall(
             file_keywords_map[rel_path] = _extract_top_keywords(content, max_keywords=10)
             all_sections[rel_path] = sections
             all_wiki_links[rel_path] = wiki_links[:5] if wiki_links else []
+            all_section_entries[rel_path] = _matched_section_entries(
+                rel_path, content, keyword
+            )
 
     # -----------------------------------------------------------------------
     # Route to appropriate search mode
@@ -412,6 +442,7 @@ def recall(
                 "matched_sections": section_counts.get(file_path, 0),
                 "sections": all_sections.get(file_path, []),
                 "wiki_links": all_wiki_links.get(file_path, []),
+                "section_entries": all_section_entries.get(file_path, []),
             })
 
     else:
@@ -435,6 +466,7 @@ def recall(
                     "matched_sections": len(sections),
                     "sections": sections,
                     "wiki_links": wiki_links,
+                    "section_entries": all_section_entries.get(rel_path, []),
                 })
 
         results.sort(key=lambda x: x["score"], reverse=True)

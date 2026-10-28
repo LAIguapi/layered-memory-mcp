@@ -21,14 +21,21 @@ semantics. That distinction is the whole batch, so these tests pin it directly:
   * **A destructive projection is refused, not attempted.**
     :meth:`~layered_memory_mcp.graph_store.GraphStore.rebuild` is a *full
     replacement* of graph state from an event stream — "nothing outside
-    ``source_events`` survives". This entry point holds no complete
-    ``MemoryEvent`` stream (the one ledger it has is MEMORY_CHANGELOG, which is
-    not that stream), so in ``graph_write``/``graph`` it refuses with
-    ``graph_write_source_events_required`` and touches no store operation at
-    all. Projecting this request's events alone would erase every node a
-    previous write left behind, which is the one failure mode a write seam may
-    not have. A caller holding its own stream projects it through
-    ``run_semantic_graph_write`` directly.
+    ``source_events`` survives" — so a write mode may only commit when it holds
+    the *complete* stream.
+
+    v3.6.1 INTENTIONAL CONTRACT CHANGE. That complete stream now exists: the
+    persistent semantic journal (``graph_journal``), declared by
+    ``graph_journal_path``. So a ``graph_write``/``graph`` mode with a journal
+    configured COMMITS through ``graph_application.commit_semantic_write``
+    (covered by ``tests/test_v361_graph_application.py`` and
+    ``tests/test_v361_graph_entrances.py``), and a write mode with **no**
+    journal declared returns a bounded ``graph_write_not_configured`` refusal
+    and mutates nothing at all — not the store, and no longer the L1 file
+    either, because a write mode does not fall back to the legacy write path.
+    The configurations in *this* file deliberately declare no journal, so every
+    test below still pins the refusal half of that contract: no store
+    operation, no L1 write, no leak, and a prepopulated graph left untouched.
   * **The two write paths stay separate.** The L1/changelog outcome is
     authoritative and reported as it happened; a graph failure never rolls it
     back, never claims to have rolled it back, and never becomes a claimed
@@ -55,7 +62,13 @@ from pathlib import Path
 
 import pytest
 
+from layered_memory_mcp import server
 from layered_memory_mcp.config import MemoryConfig
+from layered_memory_mcp.graph_application import (
+    GRAPH_COMMIT_DECISION_REQUIRED,
+    GRAPH_COMMIT_NOT_CONFIGURED,
+    commit_payload,
+)
 from layered_memory_mcp.graph_fixture_store import InMemoryGraphStore
 from layered_memory_mcp.graph_models import (
     GraphNode,
@@ -353,18 +366,26 @@ def test_no_request_reaches_no_graph_runtime_in_legacy_mode(monkeypatch, tmp_pat
     assert "graph" not in response
 
 
-def test_a_graph_mode_without_a_request_reports_no_request_and_touches_no_store(
+def test_a_graph_mode_without_a_request_refuses_before_any_write(
     monkeypatch, tmp_path
 ):
-    """A successful L1 write is not a semantic decision (§3.4)."""
-    store = _RecordingStore()
-    response = _inject(monkeypatch, _config(tmp_path, "graph_write"), store=store)
+    """A successful L1 write is not a semantic decision (§3.4).
 
-    assert response["success"] is True
-    assert response["graph"]["status"] == GRAPH_WRITE_NO_REQUEST
-    assert response["graph"]["committed"] is False
-    assert response["graph"]["node_id"] == ""
+    v3.6.1: in a write mode that is now a *refusal* rather than an L1 write
+    with a ``no_request`` note beside it. The authority owns the write path, so
+    an undecided call cannot be allowed to mutate L1 and then report that the
+    graph side was skipped — it fails closed, before any effect, naming the
+    argument that was missing.
+    """
+    store = _RecordingStore()
+    config = _config(tmp_path, "graph_write")
+    response = _inject(monkeypatch, config, store=store)
+
+    assert response["success"] is False
+    assert response["error"] == GRAPH_COMMIT_DECISION_REQUIRED
+    assert server.SEMANTIC_WRITE_REQUEST_ARG in response["supported_alternative"]
     assert store.calls == []
+    assert _knowledge_files(config) == []
 
 
 # ---------------------------------------------------------------------------
@@ -418,16 +439,16 @@ def test_shadow_mode_plans_the_decision_without_rebuilding_anything(
     assert store.calls == []
 
 
-def test_graph_write_mode_refuses_because_it_holds_no_source_event_stream(
+def test_graph_write_mode_without_a_configured_journal_refuses_before_any_write(
     monkeypatch, tmp_path
 ):
-    """The seam has no complete ``MemoryEvent`` stream, and ``rebuild`` replaces.
+    """No declared authority, no write — and no legacy fallback either.
 
-    So the only safe answer is a visible refusal: no projection, no store
-    operation, and the authoritative L1 write reported exactly as it happened.
+    v3.6.1: the refusal moved from "this seam holds no event stream" to "this
+    deployment declared no journal", and it got stricter: the L1 file is not
+    written either. A write mode that mutated L1 and then refused the graph
+    half would leave readable state no decision produced.
     """
-    from layered_memory_mcp import server
-
     store = _RecordingStore()
     config = _config(tmp_path, "graph_write")
 
@@ -439,30 +460,29 @@ def test_graph_write_mode_refuses_because_it_holds_no_source_event_stream(
     )
 
     block = response["graph"]
-    assert response["success"] is True
-    assert block["status"] == server.GRAPH_WRITE_SOURCE_EVENTS_REQUIRED
+    assert response["success"] is False
+    assert block["status"] == GRAPH_COMMIT_NOT_CONFIGURED
     assert block["committed"] is False
-    assert block["legacy_write_ok"] is True
+    assert block["errors"] == ["graph_journal_not_configured"]
     assert store.calls == []
     assert store.inner.get_node(NEW_CLAIM_ID) is None
-    # The L1 write is the authoritative one, and it still happened.
-    assert _knowledge_files(config) == ["retrieval.md"]
+    assert _knowledge_files(config) == []
 
 
 def test_the_full_graph_mode_also_refuses_rather_than_rebuilding(monkeypatch, tmp_path):
-    from layered_memory_mcp import server
-
     store = _RecordingStore()
+    config = _config(tmp_path, "graph")
     response = _inject(
         monkeypatch,
-        _config(tmp_path, "graph"),
+        config,
         store=store,
         **{server.SEMANTIC_WRITE_REQUEST_ARG: _request_payload()},
     )
 
-    assert response["graph"]["status"] == server.GRAPH_WRITE_SOURCE_EVENTS_REQUIRED
+    assert response["graph"]["status"] == GRAPH_COMMIT_NOT_CONFIGURED
     assert response["graph"]["committed"] is False
     assert store.calls == []
+    assert _knowledge_files(config) == []
 
 
 def test_a_prepopulated_graph_store_is_neither_erased_nor_rewritten(
@@ -473,10 +493,10 @@ def test_a_prepopulated_graph_store_is_neither_erased_nor_rewritten(
     A store already holding a previous write's node must come out of this call
     byte-identical. A projection carrying only *this* request's events would
     have replaced that node with the new one — silent destruction of graph
-    state, reported as a successful commit.
+    state, reported as a successful commit. (With a journal configured the
+    same property is kept by projecting the *complete* journal stream; see
+    ``tests/test_v361_graph_application.py``.)
     """
-    from layered_memory_mcp import server
-
     store = _RecordingStore()
     store.inner.rebuild([_prior_event()])
     before = store.inner.snapshot()
@@ -496,23 +516,25 @@ def test_a_prepopulated_graph_store_is_neither_erased_nor_rewritten(
     assert store.inner.get_node(OLD_CLAIM_ID) is not None
     assert store.inner.get_node(NEW_CLAIM_ID) is None
 
-    assert response["success"] is True
-    assert response["graph"]["status"] == server.GRAPH_WRITE_SOURCE_EVENTS_REQUIRED
+    assert response["success"] is False
+    assert response["graph"]["status"] == GRAPH_COMMIT_NOT_CONFIGURED
     assert response["graph"]["committed"] is False
+    assert _knowledge_files(config) == []
 
 
 def test_a_write_enabled_mode_never_reaches_the_projection_seam(monkeypatch, tmp_path):
     """The refusal is upstream of the runtime: the seam is not called at all."""
-    from layered_memory_mcp import graph_runtime, graph_write, server
+    from layered_memory_mcp import graph_runtime, graph_write
 
     def _refuse(*args, **kwargs):
         raise AssertionError(
-            "a write-enabled mode without a source event stream must not reach "
+            "a write-enabled mode with no configured authority must not reach "
             "the projection seam"
         )
 
     monkeypatch.setattr(graph_runtime, "run_semantic_graph_write", _refuse)
     monkeypatch.setattr(graph_write, "project_semantic_write", _refuse)
+    monkeypatch.setattr(graph_write, "plan_semantic_write", _refuse)
 
     for mode in ("graph_write", "graph"):
         response = _inject(
@@ -521,7 +543,7 @@ def test_a_write_enabled_mode_never_reaches_the_projection_seam(monkeypatch, tmp
             store=_RecordingStore(),
             **{server.SEMANTIC_WRITE_REQUEST_ARG: _request_payload()},
         )
-        assert response["graph"]["status"] == server.GRAPH_WRITE_SOURCE_EVENTS_REQUIRED
+        assert response["graph"]["status"] == GRAPH_COMMIT_NOT_CONFIGURED
 
 
 def test_the_refusal_status_is_distinct_from_every_runtime_write_status():
@@ -557,24 +579,27 @@ def test_a_read_only_graph_mode_never_projects_a_write(monkeypatch, tmp_path):
 def test_an_enabled_mode_without_an_injected_store_also_refuses_safely(
     monkeypatch, tmp_path
 ):
-    """With or without a store, this entry point has nothing safe to project.
+    """With or without a store, an undeclared authority is the first refusal.
 
-    The missing source stream is the first and sufficient reason, so it is the
-    one reported — ``not_configured`` would be a second, narrower truth about a
-    projection that was never going to be attempted from here.
+    Both halves are named: with neither declared the refusal lists both, which
+    is what an operator needs to fix it in one pass rather than two.
     """
-    from layered_memory_mcp import server
-
+    config = _config(tmp_path, "graph_write")
     response = _inject(
         monkeypatch,
-        _config(tmp_path, "graph_write"),
+        config,
         store=None,
         **{server.SEMANTIC_WRITE_REQUEST_ARG: _request_payload()},
     )
 
-    assert response["success"] is True
-    assert response["graph"]["status"] == server.GRAPH_WRITE_SOURCE_EVENTS_REQUIRED
+    assert response["success"] is False
+    assert response["graph"]["status"] == GRAPH_COMMIT_NOT_CONFIGURED
     assert response["graph"]["committed"] is False
+    assert response["graph"]["errors"] == [
+        "graph_journal_not_configured",
+        "graph_store_not_configured",
+    ]
+    assert _knowledge_files(config) == []
 
 
 # ---------------------------------------------------------------------------
@@ -606,14 +631,12 @@ def test_the_markdown_write_projects_no_node_of_its_own(monkeypatch, tmp_path):
 def test_a_lifecycle_target_is_not_invented_from_the_existing_section(
     monkeypatch, tmp_path
 ):
-    """This entry point carries no source events, so a target cannot be checked.
+    """A supersession target is never derived from the file the write touched.
 
-    In a write mode that is the refusal. In ``shadow`` — which mutates nothing
-    — the plan still runs and reports its own honest failure, rather than a
-    dangling edge or a target guessed from the file the write touched.
+    With no declared authority the write mode refuses outright. In ``shadow`` —
+    which mutates nothing — the plan still runs and reports its own honest
+    failure, rather than a dangling edge or a target guessed from the section.
     """
-    from layered_memory_mcp import server
-
     store = _RecordingStore()
     config = _config(tmp_path, "graph_write")
     payload = _request_payload(supersedes=[_supersedes()])
@@ -626,12 +649,12 @@ def test_a_lifecycle_target_is_not_invented_from_the_existing_section(
     )
 
     block = response["graph"]
-    assert response["success"] is True
-    assert block["status"] == server.GRAPH_WRITE_SOURCE_EVENTS_REQUIRED
+    assert response["success"] is False
+    assert block["status"] == GRAPH_COMMIT_NOT_CONFIGURED
     assert block["committed"] is False
     assert block["superseded_ids"] == []
     assert store.calls == []
-    assert _knowledge_files(config) == ["retrieval.md"]
+    assert _knowledge_files(config) == []
 
     shadow_store = _RecordingStore()
     shadow = _inject(
@@ -782,10 +805,15 @@ def test_an_invalid_request_is_refused_in_legacy_mode_too(monkeypatch, tmp_path)
 # ---------------------------------------------------------------------------
 
 def test_a_legacy_request_error_is_never_projected(monkeypatch, tmp_path):
-    from layered_memory_mcp import server
+    """Exercised in ``shadow``, the mode where a legacy write still happens.
 
+    v3.6.1: ``graph_write``/``graph`` no longer run the legacy write path at
+    all, so "a failed legacy write is never projected beside" is now a property
+    of ``shadow`` — the one remaining mode where both paths run. The write-mode
+    half of the same property is asserted below: nothing is written anywhere.
+    """
     store = _RecordingStore()
-    config = _config(tmp_path, "graph_write")
+    config = _config(tmp_path, "shadow", name="legacy-error")
 
     response = _inject(
         monkeypatch,
@@ -802,10 +830,24 @@ def test_a_legacy_request_error_is_never_projected(monkeypatch, tmp_path):
     assert store.calls == []
     assert _knowledge_files(config) == []
 
+    write_config = _config(tmp_path, "graph_write", name="legacy-error")
+    refused = _inject(
+        monkeypatch,
+        write_config,
+        store=store,
+        content="   ",
+        **{server.SEMANTIC_WRITE_REQUEST_ARG: _request_payload()},
+    )
+    assert refused["success"] is False
+    assert store.calls == []
+    assert _knowledge_files(write_config) == []
+
 
 def test_a_legacy_refusal_is_never_projected(monkeypatch, tmp_path):
-    """The routing gate refuses before the write; the graph must not run after."""
-    from layered_memory_mcp import server
+    """The routing gate refuses before the write; the graph must not run after.
+
+    In ``shadow``, where the legacy write path still runs (v3.6.1).
+    """
     from layered_memory_mcp.injector import ROUTING_REFUSED_ACTION
 
     def _refused(**kwargs):
@@ -820,7 +862,7 @@ def test_a_legacy_refusal_is_never_projected(monkeypatch, tmp_path):
     store = _RecordingStore()
     response = _inject(
         monkeypatch,
-        _config(tmp_path, "graph_write"),
+        _config(tmp_path, "shadow", name="routing-refusal"),
         store=store,
         **{server.SEMANTIC_WRITE_REQUEST_ARG: _request_payload()},
     )
@@ -833,9 +875,10 @@ def test_a_legacy_refusal_is_never_projected(monkeypatch, tmp_path):
 
 
 def test_a_deferred_fusion_handshake_is_never_projected(monkeypatch, tmp_path):
-    """Nothing was written yet, so there is no L1 state for a graph node to mirror."""
-    from layered_memory_mcp import server
+    """Nothing was written yet, so there is no L1 state for a graph node to mirror.
 
+    In ``shadow``, where the legacy handshake still runs (v3.6.1).
+    """
     def _deferred(**kwargs):
         return {
             "success": True,
@@ -850,7 +893,7 @@ def test_a_deferred_fusion_handshake_is_never_projected(monkeypatch, tmp_path):
     store = _RecordingStore()
     response = _inject(
         monkeypatch,
-        _config(tmp_path, "graph_write"),
+        _config(tmp_path, "shadow", name="deferred"),
         store=store,
         **{server.SEMANTIC_WRITE_REQUEST_ARG: _request_payload()},
     )
@@ -874,9 +917,10 @@ def test_a_deferred_fusion_handshake_is_never_projected(monkeypatch, tmp_path):
 def test_a_successful_write_that_changed_nothing_is_never_projected(
     monkeypatch, tmp_path, action
 ):
-    """Every legacy action that succeeds without writing L1 content."""
-    from layered_memory_mcp import server
+    """Every legacy action that succeeds without writing L1 content.
 
+    In ``shadow``, where the legacy write path still runs (v3.6.1).
+    """
     def _skipped(**kwargs):
         return {"success": True, "action": action, "file": "retrieval.md"}
 
@@ -885,7 +929,7 @@ def test_a_successful_write_that_changed_nothing_is_never_projected(
     store = _RecordingStore()
     response = _inject(
         monkeypatch,
-        _config(tmp_path, "graph_write"),
+        _config(tmp_path, "shadow", name="no-change"),
         store=store,
         **{server.SEMANTIC_WRITE_REQUEST_ARG: _request_payload()},
     )
@@ -902,8 +946,6 @@ def test_a_stores_rebuild_is_never_called_so_it_cannot_fail_or_leak(
     monkeypatch, tmp_path
 ):
     """The refused projection means even a hostile backend is never consulted."""
-    from layered_memory_mcp import server
-
     store = _RaisingRebuildStore()
     config = _config(tmp_path, "graph_write")
 
@@ -915,10 +957,9 @@ def test_a_stores_rebuild_is_never_called_so_it_cannot_fail_or_leak(
     )
 
     block = response["graph"]
-    assert response["success"] is True
-    assert _knowledge_files(config) == ["retrieval.md"]
-    assert block["legacy_write_ok"] is True
-    assert block["status"] == server.GRAPH_WRITE_SOURCE_EVENTS_REQUIRED
+    assert response["success"] is False
+    assert _knowledge_files(config) == []
+    assert block["status"] == GRAPH_COMMIT_NOT_CONFIGURED
     assert block["committed"] is False
     assert store.calls == []
 
@@ -933,60 +974,83 @@ def test_a_rebuild_that_would_report_errors_is_never_reached(monkeypatch, tmp_pa
     from layered_memory_mcp import server
 
     store = _ReportingErrorsStore()
+    config = _config(tmp_path, "graph_write")
     response = _inject(
         monkeypatch,
-        _config(tmp_path, "graph_write"),
+        config,
         store=store,
         **{server.SEMANTIC_WRITE_REQUEST_ARG: _request_payload()},
     )
 
     block = response["graph"]
-    assert block["status"] == server.GRAPH_WRITE_SOURCE_EVENTS_REQUIRED
+    assert block["status"] == GRAPH_COMMIT_NOT_CONFIGURED
     assert block["committed"] is False
-    assert block["rebuild_errors"] == 0
-    assert block["legacy_write_ok"] is True
     assert store.calls == []
+    assert _knowledge_files(config) == []
 
 
 def test_a_store_without_a_write_surface_is_refused_not_raised(
     monkeypatch, tmp_path
 ):
-    from layered_memory_mcp import server
+    """An injected handle that cannot answer the contract is named, not raised.
 
-    config = _config(tmp_path, "graph_write")
+    v3.6.1: with a journal declared the commit path really does reach the
+    store, so this is the case that proves an incomplete handle produces a
+    bounded refusal instead of an ``AttributeError`` escaping a write path.
+    """
+    config = _config(
+        tmp_path,
+        "graph_write",
+        name="no-surface",
+        graph_journal_path=str(tmp_path / "no-surface-journal.db"),
+    )
     response = _inject(
         monkeypatch,
         config,
         store=_NotAStore(),
+        # The node must *be* the published body for the binding to validate, so
+        # the refusal under test is the store's and not the binding's.
+        content=CLAIM_BODY,
         **{server.SEMANTIC_WRITE_REQUEST_ARG: _request_payload()},
     )
 
     block = response["graph"]
-    assert response["success"] is True
-    assert _knowledge_files(config) == ["retrieval.md"]
-    assert block["status"] == server.GRAPH_WRITE_SOURCE_EVENTS_REQUIRED
+    assert response["success"] is False
+    assert _knowledge_files(config) == []
+    assert block["status"] == GRAPH_COMMIT_NOT_CONFIGURED
     assert block["committed"] is False
+    assert any(
+        error.startswith("graph_store_incomplete:") for error in block["errors"]
+    )
 
 
 # ---------------------------------------------------------------------------
 # The block is additive, bounded and not a second ledger
 # ---------------------------------------------------------------------------
 
-def test_the_graph_block_is_additive_only(monkeypatch, tmp_path):
-    from layered_memory_mcp import server
+def test_the_graph_block_is_additive_only_in_the_observing_modes(
+    monkeypatch, tmp_path
+):
+    """``shadow`` still answers the legacy response plus a block, unchanged.
 
+    v3.6.1: ``graph_write``/``graph`` deliberately no longer do. That path is
+    the authority's own response — ``success``/``action``/``domain``/``section``
+    plus the bounded commit block — because the legacy write did not happen and
+    reporting its fields would describe a write nobody performed. The
+    write-mode shape is pinned by the next test.
+    """
     legacy = _inject(monkeypatch, _config(tmp_path, "legacy", name="additive"))
-    for mode in ("shadow", "graph_write", "graph"):
-        enabled = _inject(
-            monkeypatch,
-            _config(tmp_path, mode, name="additive"),
-            store=_RecordingStore(),
-            **{server.SEMANTIC_WRITE_REQUEST_ARG: _request_payload()},
-        )
-        assert [k for k in enabled if k != "graph"] == list(legacy)
-        assert enabled["action"] == legacy["action"]
-        assert enabled["success"] == legacy["success"]
-        assert enabled["section"] == legacy["section"]
+    enabled = _inject(
+        monkeypatch,
+        _config(tmp_path, "shadow", name="additive"),
+        store=_RecordingStore(),
+        **{server.SEMANTIC_WRITE_REQUEST_ARG: _request_payload()},
+    )
+
+    assert [k for k in enabled if k != "graph"] == list(legacy)
+    assert enabled["action"] == legacy["action"]
+    assert enabled["success"] == legacy["success"]
+    assert enabled["section"] == legacy["section"]
 
 
 def test_the_graph_block_carries_no_memory_body_markdown_or_host_path(
@@ -1012,24 +1076,44 @@ def test_the_graph_block_carries_no_memory_body_markdown_or_host_path(
 
 
 def test_the_graph_block_keys_are_the_bounded_payload_keys(monkeypatch, tmp_path):
-    from layered_memory_mcp import server
+    """Both blocks are the fixed, bounded key sets their own payload builders define."""
+    from layered_memory_mcp.graph_application import SemanticCommit
     from layered_memory_mcp.graph_runtime import GraphWriteOutcome, graph_write_payload
 
-    response = _inject(
+    shadow = _inject(
         monkeypatch,
-        _config(tmp_path, "graph_write"),
+        _config(tmp_path, "shadow", name="bounded"),
         store=_RecordingStore(),
         **{server.SEMANTIC_WRITE_REQUEST_ARG: _request_payload()},
     )
+    assert set(shadow["graph"]) == set(
+        graph_write_payload(GraphWriteOutcome(mode="shadow"))
+    )
 
-    expected = set(graph_write_payload(GraphWriteOutcome(mode="graph_write")))
-    assert set(response["graph"]) == expected
+    write = _inject(
+        monkeypatch,
+        _config(tmp_path, "graph_write", name="bounded"),
+        store=_RecordingStore(),
+        **{server.SEMANTIC_WRITE_REQUEST_ARG: _request_payload()},
+    )
+    assert set(write["graph"]) == set(
+        commit_payload(SemanticCommit(status=GRAPH_COMMIT_NOT_CONFIGURED))
+    )
 
 
-def test_the_write_path_adds_no_second_provenance_ledger(monkeypatch, tmp_path):
-    """MEMORY_CHANGELOG stays the one event stream; the graph adds none."""
-    from layered_memory_mcp import server
+def test_a_refused_write_mode_call_creates_no_artifact_at_all(monkeypatch, tmp_path):
+    """A refusal leaves the data directory exactly as it was.
 
+    v3.6.1 replaces the old "MEMORY_CHANGELOG stays the one event stream"
+    assertion with the honest statement of the new design, which this file's
+    unconfigured write mode can actually check: a refused write mode creates
+    nothing — no changelog entry, no vector database, no journal, no lock file.
+    The complementary half (a *committed* write writes its decision to the
+    journal and leaves MEMORY_CHANGELOG alone, because the two are different
+    streams — immutable file-write evidence vs. explicit semantic decisions) is
+    pinned in ``tests/test_v361_graph_application.py`` and
+    ``tests/test_v361_graph_entrances.py``.
+    """
     config = _config(tmp_path, "graph_write")
     before = sorted(p.name for p in (Path(config.home) / "data").glob("*"))
 
@@ -1040,13 +1124,34 @@ def test_the_write_path_adds_no_second_provenance_ledger(monkeypatch, tmp_path):
         **{server.SEMANTIC_WRITE_REQUEST_ARG: _request_payload()},
     )
 
-    assert response["graph"]["status"] == server.GRAPH_WRITE_SOURCE_EVENTS_REQUIRED
+    assert response["graph"]["status"] == GRAPH_COMMIT_NOT_CONFIGURED
+    assert _changelog_events(config) == []
+    after = sorted(p.name for p in (Path(config.home) / "data").glob("*"))
+    assert after == before
+
+
+def test_the_legacy_write_path_still_records_its_own_changelog_in_shadow(
+    monkeypatch, tmp_path
+):
+    """The retained half of the old assertion, in the mode that still writes.
+
+    MEMORY_CHANGELOG remains the immutable evidence stream for file writes, and
+    the graph adds nothing to it: in ``shadow`` the legacy write happens, it
+    records exactly one event, and the only artifacts are the legacy ones.
+    """
+    config = _config(tmp_path, "shadow", name="one-ledger")
+    before = sorted(p.name for p in (Path(config.home) / "data").glob("*"))
+
+    _inject(
+        monkeypatch,
+        config,
+        store=_RecordingStore(),
+        **{server.SEMANTIC_WRITE_REQUEST_ARG: _request_payload()},
+    )
+
     events = _changelog_events(config)
     assert len(events) == 1
     assert events[0]["tool"] == "inject_knowledge"
-    # The only artifacts the write created are the legacy ones: the one
-    # changelog stream and the derived vector index. No graph log, no second
-    # ledger, no database of its own.
     after = sorted(p.name for p in (Path(config.home) / "data").glob("*"))
     assert [name for name in after if name not in before] == [
         "memory_changelog.jsonl",
@@ -1055,10 +1160,14 @@ def test_the_write_path_adds_no_second_provenance_ledger(monkeypatch, tmp_path):
 
 
 def test_the_tool_constructs_no_graph_backend_of_its_own(monkeypatch, tmp_path):
-    """A graph-enabled write with no injected store opens no database (§3.1)."""
-    import sqlite3
+    """A graph-enabled write with no injected store opens no database (§3.1).
 
-    from layered_memory_mcp import server
+    v3.6.1: with the journal undeclared the refusal happens before anything is
+    opened, so the declared graph database is still never touched — the
+    authority is checked first and a graph file is never materialised by a
+    refused call.
+    """
+    import sqlite3
 
     real_connect = sqlite3.connect
     opened: list[str] = []
@@ -1077,6 +1186,6 @@ def test_the_tool_constructs_no_graph_backend_of_its_own(monkeypatch, tmp_path):
         **{server.SEMANTIC_WRITE_REQUEST_ARG: _request_payload()},
     )
 
-    assert response["graph"]["status"] == server.GRAPH_WRITE_SOURCE_EVENTS_REQUIRED
+    assert response["graph"]["status"] == GRAPH_COMMIT_NOT_CONFIGURED
     assert not [path for path in opened if "graph.db" in path]
     assert not (tmp_path / "graph.db").exists()

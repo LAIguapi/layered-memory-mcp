@@ -1234,8 +1234,7 @@ def test_rebuild_reports_a_duplicate_write_of_one_edge():
 
 
 def test_rebuild_reports_two_events_writing_one_node_id_differently():
-    """§10.2: ambiguity is reported, not quietly settled. The later event in
-    ledger order wins, so the outcome is still deterministic."""
+    """§10.2: ambiguity is reported and the candidate is rejected."""
     conflicting = _claim(content="The retrieval index rebuild runs hourly.")
     stream = _ledger() + [
         _event(MemoryEventKind.MIGRATE, "event_0010", T2, node=conflicting)
@@ -1244,9 +1243,27 @@ def test_rebuild_reports_two_events_writing_one_node_id_differently():
     report = store.rebuild(stream)
     assert report.errors == [f"conflicting_node:{NEW_CLAIM_ID}"]
     assert report.ok is False
-    assert store.get_node(NEW_CLAIM_ID).content == (
-        "The retrieval index rebuild runs hourly."
-    )
+    assert store.snapshot()["nodes"] == []
+    assert store.snapshot()["edges"] == []
+    assert store.health().healthy is True
+
+
+def test_an_invalid_rebuild_preserves_an_existing_nonempty_snapshot():
+    store = InMemoryGraphStore(nodes=[_claim(), _evidence()], edges=[_edge()])
+    before = store.snapshot()
+    conflicting = _claim(content="The retrieval index rebuild runs hourly.")
+    candidate = [
+        _event(MemoryEventKind.INJECT, "candidate_0001", T0, node=_claim()),
+        _event(MemoryEventKind.MIGRATE, "candidate_0002", T1, node=conflicting),
+    ]
+
+    report = store.rebuild(candidate)
+
+    assert report.ok is False
+    assert report.errors == [f"conflicting_node:{NEW_CLAIM_ID}"]
+    assert store.snapshot() == before
+    assert store.health().node_count == 2
+    assert store.health().edge_count == 1
 
 
 def test_rebuild_reports_two_events_asserting_one_edge_id_differently():
@@ -1271,8 +1288,8 @@ def test_rebuild_reports_two_events_asserting_one_edge_id_differently():
 
 
 def test_rebuild_never_raises_on_a_conflicting_stream():
-    """Unlike `append_edge`, a rebuild reports: it is handed a whole ledger it
-    did not author, and refusing the lot would lose the good events too."""
+    """Unlike `append_edge`, a rebuild reports a conflict without raising, but
+    refuses to install the malformed candidate."""
     stream = [
         _event(MemoryEventKind.INJECT, "event_0001", T0, node=_evidence()),
         _event(MemoryEventKind.INJECT, "event_0002", T0, node=_claim()),
@@ -1297,7 +1314,9 @@ def test_rebuild_never_raises_on_a_conflicting_stream():
     store = InMemoryGraphStore()
     report = store.rebuild(stream)
     assert report.ok is False
-    assert store.health().node_count == 2
+    assert store.health().node_count == 0
+    assert store.health().edge_count == 0
+    assert store.health().healthy is True
 
 
 def test_rebuild_reports_a_repeated_event_id():
@@ -1335,11 +1354,13 @@ def test_rebuild_reports_an_edge_whose_endpoint_was_never_projected():
         f"unresolved_edge_endpoint:{edge_id}:entity_not_projected"
     ]
     assert report.ok is False
-    # Kept, not dropped: dropping it would hide the broken reference.
+    # Candidate counts remain diagnostic; the broken candidate is not installed.
     assert report.edges_written == 4
     health = store.health()
-    assert health.healthy is False
-    assert f"dangling_edge:{edge_id}:entity_not_projected" in health.errors
+    assert health.healthy is True
+    assert health.node_count == 0
+    assert health.edge_count == 0
+    assert store.snapshot()["edges"] == []
 
 
 def test_rebuild_warns_about_a_source_reference_it_cannot_resolve():

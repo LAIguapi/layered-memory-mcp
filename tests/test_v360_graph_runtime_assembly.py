@@ -46,6 +46,7 @@ from layered_memory_mcp.graph_runtime_assembly import (
     GRAPH_FALLBACK_NONE,
     GRAPH_SEEDS_UNMAPPED,
     GRAPH_STORE_NOT_CONFIGURED,
+    GRAPH_STORE_NOT_PRESENT,
     GRAPH_STORE_NOT_REQUESTED,
     GRAPH_STORE_OPENED,
     GRAPH_STORE_OPEN_FAILED,
@@ -279,15 +280,29 @@ def test_diagnostics_name_the_fallback_reason(tmp_path):
         == GRAPH_STORE_NOT_REQUESTED
     )
 
+    # v3.6.1: the diagnostic observes through the read-only entrance, so a
+    # declared database that nothing has published yet is *reported* absent
+    # rather than created by the act of asking about it.
+    assert (
+        diagnose_graph_runtime(configured, _RESULTS, require=True)["fallback_reason"]
+        == GRAPH_STORE_NOT_PRESENT
+    )
+    assert not database.exists()
+
+    with SQLiteGraphStore(database) as store:
+        store.create_node(_node())
+
     healthy = diagnose_graph_runtime(configured, _RESULTS, require=True)
     assert healthy["fallback_reason"] == GRAPH_FALLBACK_NONE
     assert healthy["assembly"]["status"] == GRAPH_STORE_OPENED
 
 
 def test_a_healthy_graph_with_no_mapped_seed_is_its_own_fallback_reason(tmp_path):
-    config = _config(
-        tmp_path, graph_mode="graph", graph_db_path=str(_database(tmp_path))
-    )
+    database = _database(tmp_path)
+    config = _config(tmp_path, graph_mode="graph", graph_db_path=str(database))
+    # An *existing* graph: the diagnostic reads one, it never establishes one.
+    with SQLiteGraphStore(database) as store:
+        store.create_node(_node())
 
     report = diagnose_graph_runtime(config, _RESULTS[1:], require=True)
 

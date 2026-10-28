@@ -61,6 +61,18 @@ THE PROPERTIES IT GUARANTEES
 2. **Explicit transaction boundaries.** Every write runs inside
    ``BEGIN IMMEDIATE`` … ``COMMIT``, and any exception rolls back. There is no
    half-written edge and no half-replaced rebuild.
+2b. **A serialized publish with a durable compare-and-set.** A rebuild stages
+   its candidate outside the write lock — that is what keeps the window in
+   which the graph is being replaced as short as possible — so the staged
+   candidate describes the graph as it was at a *past* moment. Every committed
+   mutation bumps a durable ``graph_revision`` in ``graph_meta``, and
+   :meth:`SQLiteGraphStore.rebuild` re-reads it *inside* its own
+   ``BEGIN IMMEDIATE`` and refuses (:class:`StaleRebuildError`) if it moved.
+   Without that check a replacing rebuild whose candidate was staged before a
+   concurrent ``create_node`` committed would delete the newer node and publish
+   a graph nobody's ledger describes — a lost update, silently. The refusal
+   rolls back before deleting anything, so a rejected publish mutates no row
+   and does not move the revision.
 3. **Validated reads.** A stored payload is re-validated before it is returned.
    A corrupted or unparseable row raises :class:`CorruptPayloadError` rather
    than being handed back as a trusted object.
@@ -121,6 +133,7 @@ from .graph_store import (
 
 __all__ = [
     "META_BACKEND",
+    "META_GRAPH_REVISION",
     "META_GRAPH_SCHEMA_VERSION",
     "META_STORE_SCHEMA_VERSION",
     "SQLITE_GRAPH_BACKEND",
@@ -133,6 +146,7 @@ __all__ = [
     "InvalidPayloadError",
     "MissingEndpointError",
     "SQLiteGraphStore",
+    "StaleRebuildError",
     "StoreSchemaError",
     "StoreUnavailableError",
     "UnknownNodeError",
@@ -157,6 +171,14 @@ STORE_SCHEMA_VERSION = 1
 META_STORE_SCHEMA_VERSION = "store_schema_version"
 META_GRAPH_SCHEMA_VERSION = "graph_schema_version"
 META_BACKEND = "backend"
+
+#: The durable mutation counter every committed write bumps, and the thing a
+#: replacing rebuild compares against. Deliberately *not* part of
+#: :meth:`SQLiteGraphStore.schema_info`: a schema version describes a layout and
+#: moves when a release does, while this moves on every write, and reporting
+#: them through one accessor would invite a caller to treat a write as a
+#: migration. :meth:`SQLiteGraphStore.revision` is its own reader.
+META_GRAPH_REVISION = "graph_revision"
 
 #: What :meth:`SQLiteGraphStore.health` says about itself when nothing is wrong.
 _HEALTH_DETAIL = "embedded sqlite graph store"
@@ -272,6 +294,25 @@ class InvalidPayloadError(GraphStoreError):
     revalidate, so the write boundary revalidates instead of trusting the type
     annotation — normalizing what is merely unnormalized, and refusing what is
     genuinely illegal.
+    """
+
+
+class StaleRebuildError(GraphStoreError):
+    """A replacing rebuild's candidate is older than the graph it would replace.
+
+    :meth:`SQLiteGraphStore.rebuild` stages its candidate before it takes the
+    write lock, so between staging and publishing another connection may commit
+    a node or an edge the candidate does not contain. Publishing anyway would
+    *delete* that newer state — a lost update that no error, no health check and
+    no drift audit would attribute to the rebuild.
+
+    Raised instead, from inside the publish transaction and before a single row
+    is deleted, so the newer snapshot survives untouched and the graph revision
+    does not move. Retrying is safe but only after re-deriving the candidate:
+    replaying the same event stream would stage the same stale graph and be
+    refused again, which is the point. The caller that owns the ledger — the
+    application layer's publish/recovery path — re-reads it and rebuilds from
+    what is now committed.
     """
 
 
@@ -565,6 +606,10 @@ class SQLiteGraphStore:
                 (META_STORE_SCHEMA_VERSION, str(STORE_SCHEMA_VERSION)),
                 (META_GRAPH_SCHEMA_VERSION, str(GRAPH_SCHEMA_VERSION)),
                 (META_BACKEND, SQLITE_GRAPH_BACKEND),
+                # Seeded at 0 and only ever bumped by a committed write. An
+                # existing database that predates the counter gets it here, at
+                # 0, which is correct: no rebuild is mid-flight across an open.
+                (META_GRAPH_REVISION, "0"),
             ):
                 # INSERT OR IGNORE, not REPLACE: the recorded graph schema
                 # version describes what is *already stored*. Overwriting it on
@@ -599,6 +644,53 @@ class SQLiteGraphStore:
             ),
         }
 
+    # -- the durable revision: one counter, bumped by every committed write ---
+
+    @staticmethod
+    def _read_revision(connection: sqlite3.Connection) -> int:
+        row = connection.execute(
+            "SELECT value FROM graph_meta WHERE key = ?", (META_GRAPH_REVISION,)
+        ).fetchone()
+        if row is None:
+            return 0
+        try:
+            return int(row[0])
+        except (TypeError, ValueError):
+            # An unreadable counter must not read as "nothing has changed".
+            raise CorruptPayloadError(
+                f"graph revision {row[0]!r} is not an integer; refusing to "
+                "compare a rebuild against a counter this store cannot read."
+            ) from None
+
+    @staticmethod
+    def _bump_revision(connection: sqlite3.Connection) -> None:
+        """Advance the counter inside the caller's open write transaction.
+
+        One statement, run under the same ``BEGIN IMMEDIATE`` as the rows it
+        describes, so the counter and the graph move together or not at all. A
+        read-modify-write in Python would be two statements and a window.
+        """
+        connection.execute(
+            """
+            INSERT INTO graph_meta (key, value) VALUES (?, '1')
+            ON CONFLICT(key) DO UPDATE SET
+                value = CAST(CAST(graph_meta.value AS INTEGER) + 1 AS TEXT)
+            """,
+            (META_GRAPH_REVISION,),
+        )
+
+    def revision(self) -> int:
+        """How many writes this database has committed, as a comparable token.
+
+        The value a caller captures before deriving a replacement graph and
+        hands back to :meth:`rebuild` as ``expected_revision``. It is opaque and
+        monotonic: it counts committed mutations, not nodes, and an idempotent
+        re-append still moves it — a conservative counter refuses a few rebuilds
+        that would have been harmless, while a content-sensitive one would have
+        to be right about every way two graphs can differ.
+        """
+        return self._read_revision(self._require_connection())
+
     # -- writes --------------------------------------------------------------
 
     def create_node(self, node: GraphNode) -> GraphNode:
@@ -627,6 +719,7 @@ class SQLiteGraphStore:
                 """,
                 _node_row(stored),
             )
+            self._bump_revision(connection)
         return stored.model_copy(deep=True)
 
     def append_edge(self, edge: GraphEdge) -> GraphEdge:
@@ -682,6 +775,7 @@ class SQLiteGraphStore:
                 """,
                 _edge_row(stored),
             )
+            self._bump_revision(connection)
         return stored.model_copy(deep=True)
 
     # -- reads ---------------------------------------------------------------
@@ -856,33 +950,66 @@ class SQLiteGraphStore:
 
     # -- rebuild -------------------------------------------------------------
 
-    def rebuild(self, source_events: Sequence[MemoryEvent]) -> RebuildReport:
+    def rebuild(
+        self,
+        source_events: Sequence[MemoryEvent],
+        *,
+        expected_revision: int | None = None,
+    ) -> RebuildReport:
         """Project graph state from an append-only event stream, idempotently.
 
-        Two stages, and the split is the point:
+        Three stages, and both splits are the point:
 
         1. **Staging.** The projection is built in a throwaway in-memory
            reference store, which is also where the §10.2 reporting rules live
            (duplicate replay, conflicting payloads for one ID, unresolvable
            edge endpoints, inapplicable transitions). Nothing touches the
            database while the stream is being judged.
-        2. **Atomic replacement.** One ``BEGIN IMMEDIATE`` deletes the current
-           rows and writes the staged ones. Any failure rolls back, so a failed
-           rebuild leaves the *previous* graph exactly as it was — not an empty
-           graph, and never a half-replaced one.
+        2. **Compare-and-set.** Inside the publish transaction, before anything
+           is deleted, the stored :meth:`revision` is checked against the one
+           this candidate was derived from. A candidate staged before another
+           connection committed is *stale*, and publishing it would silently
+           delete that newer state; :class:`StaleRebuildError` is raised
+           instead and the transaction rolls back untouched.
+        3. **Atomic replacement.** The same ``BEGIN IMMEDIATE`` deletes the
+           current rows, writes the staged ones and bumps the revision. Any
+           failure rolls back, so a failed rebuild leaves the *previous* graph
+           exactly as it was — not an empty graph, and never a half-replaced
+           one.
 
         Idempotent in both directions: the same stream produces the same rows,
         the same byte-identical payloads and the same report, and the report's
         counts describe the resulting projection rather than the attempt.
 
-        A rebuild with ``errors`` still commits, matching the reference store:
-        a ledger that contains one unresolvable edge should not cost the caller
-        every good event in it. :attr:`RebuildReport.ok` is how the caller sees
-        the difference, and the dangling edge stays visible in
-        :meth:`health` afterwards.
+        A rebuild with ``errors`` is rejected before the transaction starts,
+        matching the reference store's fail-closed boundary: a malformed ledger
+        must not replace the last known-good projection. The candidate counts
+        and errors remain visible in :attr:`RebuildReport`; the persisted graph
+        and its health stay unchanged.
+
+        Args:
+            source_events: The complete stream to project. Anything omitted is
+                erased, which is why the caller must hand over the whole ledger.
+            expected_revision: The :meth:`revision` this candidate was derived
+                from. Omit it and the revision is captured at the top of this
+                call, which closes the staging window this method owns. Pass it
+                when the candidate was derived earlier — a caller that read a
+                journal, planned, and only then called ``rebuild`` owns a wider
+                window than this method can see, and naming the revision it read
+                at is how that window is closed too.
+
+        Raises:
+            StaleRebuildError: The graph moved after the candidate was derived.
+                Nothing was deleted, written or counted; re-derive from the
+                current ledger and call again.
         """
+        base_revision = (
+            self.revision() if expected_revision is None else int(expected_revision)
+        )
         staging = InMemoryGraphStore()
         report = staging.rebuild(source_events)
+        if not report.ok:
+            return report
         # The staged graph is handed over as its snapshot and revalidated, so
         # the replacement reads its input through the same contract any other
         # caller would — and a staged payload that would not survive a read is
@@ -898,6 +1025,19 @@ class SQLiteGraphStore:
         ]
 
         with self._transaction() as connection:
+            # The compare, under the write lock and before the first DELETE.
+            # ``BEGIN IMMEDIATE`` is what makes this a compare-and-*set* rather
+            # than a check: no other writer can commit between this read and
+            # the COMMIT below, so a candidate that passes here is published
+            # onto exactly the graph it was derived from.
+            current_revision = self._read_revision(connection)
+            if current_revision != base_revision:
+                raise StaleRebuildError(
+                    f"this rebuild was staged at graph revision {base_revision} "
+                    f"and the stored graph is now at {current_revision}; "
+                    "publishing it would delete state committed since. Nothing "
+                    "was changed — re-read the source ledger and rebuild from it."
+                )
             connection.execute("DELETE FROM graph_edges")
             connection.execute("DELETE FROM graph_nodes")
             connection.executemany(
@@ -917,6 +1057,7 @@ class SQLiteGraphStore:
                 """,
                 edge_rows,
             )
+            self._bump_revision(connection)
         return report
 
     # -- health and drift ----------------------------------------------------

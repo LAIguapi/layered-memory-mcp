@@ -59,13 +59,32 @@ def _maintenance_interval(config: Any) -> float:
         return DEFAULT_TICK_SECONDS
 
 
+def _suspension(config: Any, job: str) -> dict | None:
+    """Whether a graph write mode owns ``job``'s surface, as a report or None.
+
+    One shared policy (``graph_mutation_guard.MAINTENANCE_JOBS``) rather than a
+    mode string compared in three places: a timer must not perform unattended
+    the very mutation the matching tool refuses. ``None`` — i.e. run normally —
+    in ``legacy``, ``shadow`` and ``graph_recall``.
+    """
+    from .graph_mutation_guard import maintenance_job_suspension
+
+    return maintenance_job_suspension(config, job)
+
+
 def maintain_vectors(config: Any) -> dict:
     """Inspect and repair derived vectors, with persistent bounded retries.
 
     Uses the existing maintenance switch and interval. A separate file lock
     prevents overlapping periodic jobs across processes; publication itself
     validates source and database snapshots against concurrent normal writes.
+
+    In a graph write mode the vector rows are the authority's projection: this
+    returns a suspension report and touches nothing, including the retry state.
     """
+    suspension = _suspension(config, "vector_maintenance")
+    if suspension is not None:
+        return suspension
     if not getattr(config, "maintenance_enabled", True):
         return {"status": "disabled"}
     data = config.home / "data"
@@ -134,13 +153,20 @@ def maintenance_task(config: Any) -> dict:
 
     # 1. Agent-memory compaction + L1 line-level dedup. Both are gated inside on
     #    usage ratio / elapsed interval, so most ticks are a cheap read.
-    try:
-        from .memory_compactor import auto_maintain_after_write
+    #    Suspended in a graph write mode: this is ``compact_memory`` with no
+    #    caller, and the tick reports the suspension rather than pretending the
+    #    pass ran.
+    suspension = _suspension(config, "auto_maintain")
+    if suspension is not None:
+        report["auto_maintain"] = suspension
+    else:
+        try:
+            from .memory_compactor import auto_maintain_after_write
 
-        report["auto_maintain"] = auto_maintain_after_write(config)
-    except Exception as e:  # noqa: BLE001 — maintenance must never break the host
-        logger.warning("maintenance: auto-maintain failed: %s", e)
-        report["auto_maintain"] = {"error": str(e)}
+            report["auto_maintain"] = auto_maintain_after_write(config)
+        except Exception as e:  # noqa: BLE001 — maintenance must never break the host
+            logger.warning("maintenance: auto-maintain failed: %s", e)
+            report["auto_maintain"] = {"error": str(e)}
 
     # Inspect after compaction so this tick projects its final source files.
     # Preserve old committed rows on embedding/publication failure.
@@ -153,8 +179,12 @@ def maintenance_task(config: Any) -> dict:
     # 2. Deployed guard refresh. The host's guard is a copy of the payload
     #    bundled in this package, so it is a version behind after every upgrade.
     #    Files-only copy, auto policy only — a manual host keeps the human in
-    #    the loop (same rule as the get_l0_index ride-along).
-    if str(getattr(config, "write_guard", "manual")).strip().lower() == "auto":
+    #    the loop (same rule as the get_l0_index ride-along). Suspended in a
+    #    graph write mode: the agent's home is not ours to write unattended.
+    guard_suspension = _suspension(config, "write_guard_refresh")
+    if guard_suspension is not None:
+        report["write_guard"] = guard_suspension
+    elif str(getattr(config, "write_guard", "manual")).strip().lower() == "auto":
         try:
             from .agent_integrator import detect_agent_type
             from .write_guard import refresh_deployed_plugin

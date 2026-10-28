@@ -1364,9 +1364,18 @@ def test_a_graph_mode_adds_a_graph_block_without_touching_the_old_fields(
     assert enabled["results"] == legacy["results"]
     assert enabled["matched_files"] == legacy["matched_files"]
     assert enabled["graph"]["mode"] == "graph_recall"
-    # Today's L1 rows carry no graph ID yet: an honest, counted fallback.
-    assert enabled["graph"]["status"] == GRAPH_STATUS_UNUSED
-    assert enabled["graph"]["unmapped_results"] == len(legacy["results"])
+    # v3.6.1 intentional contract change. The keyword producer now carries the
+    # exact, occurrence-aware identity of the H2 sections it matched
+    # (``section_entries``), so an L1 row *is* mapped to the canonical node ID
+    # for that section — it is no longer a ``graph_unused`` "no identity at
+    # all" fallback. This fixture's graph does not contain those nodes, so the
+    # traversal reports them as unknown seeds and the status is ``partial``.
+    # The property this test exists for is unchanged and asserted above: the
+    # legacy results and counts are untouched, and a row whose node the graph
+    # has never stored keeps its place in the answer.
+    assert enabled["graph"]["status"] == GRAPH_STATUS_PARTIAL
+    assert enabled["graph"]["mapped_results"] == len(legacy["results"])
+    assert enabled["graph"]["excluded_results"] == 0
 
 
 def test_the_graph_block_reports_an_outage_when_no_store_is_injected(

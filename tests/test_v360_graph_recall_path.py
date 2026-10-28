@@ -62,7 +62,8 @@ from layered_memory_mcp.graph_recall import (
 from layered_memory_mcp.graph_runtime import GRAPH_SEED_ID_KEY
 from layered_memory_mcp.graph_runtime_assembly import (
     GRAPH_STORE_NOT_CONFIGURED,
-    GRAPH_STORE_OPEN_FAILED,
+    GRAPH_STORE_NOT_PRESENT,
+    ReadOnlyGraphStore,
 )
 from layered_memory_mcp.graph_sqlite_store import SQLiteGraphStore
 
@@ -177,20 +178,35 @@ class _OpenLedger:
 
 @pytest.fixture
 def ledger(monkeypatch) -> _OpenLedger:
-    """Instrument the assembly's own backend, not a replacement for it."""
+    """Instrument the assembly's own backend, not a replacement for it.
+
+    **Both** of its constructors. v3.6.1 moved the recall seam onto the
+    inspection entrance, whose ``ReadOnlyGraphStore`` deliberately does not call
+    ``SQLiteGraphStore.__init__`` — that constructor establishes the schema,
+    which is the one thing a read must not do. Counting only the writable
+    constructor would therefore have read "zero opens" for a request that opened
+    a connection, and the lifecycle assertions below would have passed by
+    measuring nothing.
+    """
     counter = _OpenLedger()
     real_init = SQLiteGraphStore.__init__
+    real_readonly_init = ReadOnlyGraphStore.__init__
     real_close = SQLiteGraphStore.close
 
     def counted_init(self, *args, **kwargs):
         counter.opened += 1
         return real_init(self, *args, **kwargs)
 
+    def counted_readonly_init(self, *args, **kwargs):
+        counter.opened += 1
+        return real_readonly_init(self, *args, **kwargs)
+
     def counted_close(self):
         counter.closed += 1
         return real_close(self)
 
     monkeypatch.setattr(SQLiteGraphStore, "__init__", counted_init)
+    monkeypatch.setattr(ReadOnlyGraphStore, "__init__", counted_readonly_init)
     monkeypatch.setattr(SQLiteGraphStore, "close", counted_close)
     return counter
 
@@ -222,6 +238,15 @@ def _refuse_any_assembly(monkeypatch) -> None:
 
     monkeypatch.setattr(graph_runtime_assembly, "graph_store_session", _refuse)
     monkeypatch.setattr(graph_runtime_assembly, "open_graph_store", _refuse)
+    # Both entrances, since v3.6.1: the recall seam reaches the store through
+    # the inspection one, so refusing only the writable pair would no longer
+    # guard the path these tests say is never taken.
+    monkeypatch.setattr(
+        graph_runtime_assembly, "graph_store_readonly_session", _refuse
+    )
+    monkeypatch.setattr(
+        graph_runtime_assembly, "open_graph_store_readonly", _refuse
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -443,6 +468,15 @@ def test_an_unconfigured_path_keeps_the_old_no_store_fallback(
 def test_a_missing_parent_directory_is_refused_and_never_created(
     monkeypatch, tmp_path, ledger
 ):
+    """v3.6.1: the same refusal, named one step earlier.
+
+    The recall seam now opens the store through the inspection entrance, which
+    refuses an absent *file* by name before SQLite is asked for anything — so a
+    missing parent directory reports ``graph_store_not_present`` rather than the
+    backend's ``graph_store_open_failed:StoreUnavailableError``. What this test
+    exists to pin is unchanged and now true of the absent file as well: the
+    legacy answer survives, the fallback is named, and nothing is created.
+    """
     absent = tmp_path / "absent-parent" / "graph.db"
     config = _config(tmp_path, "graph_recall", absent)
     ledger.opened = ledger.closed = 0
@@ -453,11 +487,10 @@ def test_a_missing_parent_directory_is_refused_and_never_created(
     assert response["success"] is True
     assert response["results"] == [_semantic_row()]
     assert block["status"] == GRAPH_STATUS_UNAVAILABLE
-    assert any(
-        warning.startswith(GRAPH_STORE_OPEN_FAILED) for warning in block["warnings"]
-    )
+    assert GRAPH_STORE_NOT_PRESENT in block["warnings"]
     assert not absent.parent.exists()
     assert not absent.exists()
+    assert (ledger.opened, ledger.closed) == (0, 0)
 
 
 def test_a_failed_open_leaks_neither_path_nor_exception_message(
@@ -522,12 +555,21 @@ def test_the_block_stays_additive_over_the_persistent_path(monkeypatch, tmp_path
 
 
 # ---------------------------------------------------------------------------
-# The write path is unchanged: still a refusal, still no graph mutation
+# The write path with no declared authority: still a refusal, still no mutation
 # ---------------------------------------------------------------------------
 
-def test_a_semantic_write_is_still_refused_and_leaves_the_graph_intact(
+def test_a_semantic_write_without_a_journal_is_refused_and_leaves_the_graph_intact(
     monkeypatch, tmp_path, ledger
 ):
+    """v3.6.1 intentional contract change, same guarantee.
+
+    The refusal reason moved from "this seam holds no complete event stream" to
+    "this deployment declared no ``graph_journal_path``" — ``_config`` here
+    declares only the graph database. What the test exists to pin is unchanged:
+    a refused semantic write reaches no graph operation, opens nothing, and
+    leaves a prepopulated graph byte-identical.
+    """
+    from layered_memory_mcp.graph_application import GRAPH_COMMIT_NOT_CONFIGURED
     from layered_memory_mcp.graph_write import SemanticWriteRequest
 
     database = _populated_database(tmp_path)
@@ -548,12 +590,15 @@ def test_a_semantic_write_is_still_refused_and_leaves_the_graph_intact(
         ),
         occurred_at=T0,
     )
-    block = server._graph_write_block(
-        config, request, {"success": True, "action": "appended"}
+    commit = server._graph_authority_write(
+        config, request, "retrieval", "Index maintenance",
+        "The retrieval index rebuild cadence is hourly.",
     )
+    block = commit["graph"]
 
-    assert block["status"] == server.GRAPH_WRITE_SOURCE_EVENTS_REQUIRED
-    assert block["legacy_write_ok"] is True
+    assert commit["success"] is False
+    assert block["status"] == GRAPH_COMMIT_NOT_CONFIGURED
+    assert block["committed"] is False
     # No assembly, no open, and the prepopulated graph is untouched.
     assert (ledger.opened, ledger.closed) == (0, 0)
     reader = SQLiteGraphStore(database)

@@ -766,9 +766,10 @@ class InMemoryGraphStore:
         identity produces the same ID on every run.
 
         It **reports instead of raising**, unlike :meth:`append_edge`: a
-        rebuild is handed a whole ledger it did not author, and refusing the
-        batch would lose the good events with the bad. Every input problem is
-        named (§10.2):
+        rebuild is handed a whole ledger it did not author, so every input
+        problem is named (§10.2) in the returned report. An invalid candidate
+        is fail-closed: the candidate is never installed, and the previous
+        projection remains byte-for-byte unchanged.
 
         * ``errors`` (which clear :attr:`RebuildReport.ok`) —
           ``conflicting_node|edge:<id>`` for one ID written two different ways,
@@ -782,9 +783,10 @@ class InMemoryGraphStore:
           points outside this stream, ``ignored_transition:...`` and
           ``nothing_to_project:...`` for events that changed nothing.
 
-        A dangling edge is *kept* and reported: dropping it would make a
-        broken reference indistinguishable from one that never existed, and
-        :meth:`health` keeps saying so afterwards.
+        A dangling edge is reported and rejected. Persisting it would make a
+        broken reference part of the authoritative projection; callers that
+        need to inspect the malformed candidate can use the report without
+        replacing the last known-good graph.
 
         ``nodes_written``/``edges_written`` are the size of the resulting
         projection, and ``skipped`` counts the events that changed nothing —
@@ -836,9 +838,7 @@ class InMemoryGraphStore:
                         warnings.add(f"unresolved_source_ref:{node_id}:{ref_id}")
         errors.update(_schema_mismatches(nodes, edges))
 
-        self._nodes = nodes
-        self._edges = edges
-        return RebuildReport(
+        report = RebuildReport(
             events_read=len(source_events),
             nodes_written=len(nodes),
             edges_written=len(edges),
@@ -846,6 +846,10 @@ class InMemoryGraphStore:
             errors=sorted(errors),
             warnings=sorted(warnings),
         )
+        if report.ok:
+            self._nodes = nodes
+            self._edges = edges
+        return report
 
     @staticmethod
     def _project_node(

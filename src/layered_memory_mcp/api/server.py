@@ -1,11 +1,11 @@
 """FastAPI server for Layered Memory v2.0 REST API.
 
-Endpoints:
+Endpoints (declaration order is load-bearing — see ``create_app``):
   POST /knowledge          — Create knowledge entry
+  GET  /knowledge/search   — Semantic search
   GET  /knowledge/{id}     — Get entry by ID
   PUT  /knowledge/{id}     — Update entry
   DELETE /knowledge/{id}   — Delete entry
-  GET  /knowledge/search   — Semantic search
   GET  /domains            — List all domains
   GET  /review/queue       — List pending review items
   POST /review/{id}/approve — Approve review item
@@ -121,6 +121,40 @@ def _sync_knowledge_vectors(entry: KnowledgeEntry) -> None:
         })
 
 
+def api_config() -> "MemoryConfig":
+    """The configuration this HTTP server runs under.
+
+    Resolved once into ``stores["config"]`` by the lifespan, so a request does
+    not re-read the config file; a caller that injected its own ``stores`` (a
+    test, an embedding host) supplies it there. Falling back to a fresh
+    ``MemoryConfig()`` keeps an injected store dict without one working exactly
+    as it did before the graph modes existed.
+    """
+    from ..config import MemoryConfig
+
+    config = stores.get("config")
+    if config is None:
+        config = MemoryConfig()
+        stores["config"] = config
+    return config
+
+
+def _graph_refusal(operation: str) -> None:
+    """Refuse a mutating REST entrance in a graph write mode, before any effect.
+
+    v3.6.1. In ``graph_write``/``graph`` the semantic journal owns the write
+    path and L1/vector/L0 are its projections, so a REST mutation here would
+    publish state no decision produced — and the next replay would erase it.
+    ``409 Conflict`` carries the same bounded refusal body every other transport
+    returns, naming the supported alternative. Every other mode is untouched.
+    """
+    from ..graph_mutation_guard import graph_mutation_refusal
+
+    refusal = graph_mutation_refusal(api_config(), operation)
+    if refusal is not None:
+        raise HTTPException(status_code=409, detail=refusal)
+
+
 def store_dirs(config: "MemoryConfig | None" = None) -> tuple[Path, Path]:
     """``(knowledge_dir, data_dir)`` for this HTTP server's stores.
 
@@ -145,8 +179,12 @@ def store_dirs(config: "MemoryConfig | None" = None) -> tuple[Path, Path]:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize stores on startup."""
-    knowledge_dir, data_dir = store_dirs()
+    from ..config import MemoryConfig
 
+    config = MemoryConfig()
+    knowledge_dir, data_dir = store_dirs(config)
+
+    stores["config"] = config
     stores["l1"] = L1Store(knowledge_dir)
     stores["vector"] = VectorStore(data_dir / "vectors.db")
     stores["review"] = ReviewQueue(data_dir / "review_queue.db")
@@ -191,6 +229,7 @@ def create_app() -> FastAPI:
     @app.post("/knowledge", response_model=KnowledgeResponse)
     async def create_knowledge(req: CreateKnowledgeRequest) -> dict:
         """Create a new knowledge entry."""
+        _graph_refusal("rest_create_knowledge")
         entry = KnowledgeEntry(
             domain=req.domain,
             section=req.section,
@@ -219,6 +258,50 @@ def create_app() -> FastAPI:
 
         return _entry_to_response(entry)
 
+    # NOTE: ``/knowledge/search`` is declared BEFORE ``/knowledge/{entry_id}``
+    # and must stay there. FastAPI matches routes in declaration order, so with
+    # the parameterized route first a request for ``/knowledge/search`` is an ID
+    # lookup for an entry called "search": it enters ``get_knowledge``, finds no
+    # such entry and answers 404, and this search implementation — graph policy
+    # included — is never reached. A literal path segment cannot be expressed as
+    # a constraint on ``entry_id``, so order is the whole mechanism here.
+    @app.get("/knowledge/search", response_model=list[SearchResult])
+    async def search_knowledge(
+        q: str = Query(..., min_length=1),
+        top_n: int = Query(5, ge=1, le=20),
+        domain: str | None = None,
+    ) -> list[dict]:
+        """Semantic search for knowledge entries.
+
+        v3.6.1: the SAME graph recall policy the two MCP read entrances use is
+        applied here, to these primary results — not through a separate
+        endpoint and not as an optional sidecar. In a graph-enabled mode a row
+        the graph reports as superseded, retracted, expired, outside its
+        validity window at the current instant, or outside the configured
+        namespace is removed from this list, and a row whose write is accepted
+        but not yet published is removed as known-stale. In ``legacy`` mode, and
+        on any safe graph outage, the list is exactly what it always was.
+
+        The per-row field names are unchanged and identical to the MCP ones
+        (``id``/``domain``/``text``/``score``/``metadata``). The bounded graph
+        diagnostics are deliberately NOT aliased into this response shape; read
+        them from ``graph_memory_status`` instead.
+        """
+        from ..graph_search import apply_graph_recall
+
+        results = stores["vector"].search(q, top_n=top_n, domain=domain)
+        outcome = apply_graph_recall(api_config(), results, identity_key="id")
+        return [
+            SearchResult(
+                id=r["id"],
+                domain=r["domain"],
+                text=r["text"],
+                score=r["score"],
+                metadata=r["metadata"],
+            ).model_dump()
+            for r in outcome.results
+        ]
+
     @app.get("/knowledge/{entry_id}", response_model=KnowledgeResponse)
     async def get_knowledge(entry_id: str) -> dict:
         """Get a knowledge entry by ID."""
@@ -237,6 +320,7 @@ def create_app() -> FastAPI:
     @app.put("/knowledge/{entry_id}", response_model=KnowledgeResponse)
     async def update_knowledge(entry_id: str, req: UpdateKnowledgeRequest) -> dict:
         """Update a knowledge entry."""
+        _graph_refusal("rest_update_knowledge")
         # Find entry
         entry = None
         entry_domain = None
@@ -280,6 +364,7 @@ def create_app() -> FastAPI:
     @app.delete("/knowledge/{entry_id}")
     async def delete_knowledge(entry_id: str) -> dict:
         """Delete a knowledge entry."""
+        _graph_refusal("rest_delete_knowledge")
         # Find and delete
         for domain in stores["l1"].list_domains():
             meta, content = stores["l1"].read(domain)
@@ -289,25 +374,6 @@ def create_app() -> FastAPI:
                 return {"success": True, "id": entry_id}
 
         raise HTTPException(status_code=404, detail="Entry not found")
-
-    @app.get("/knowledge/search", response_model=list[SearchResult])
-    async def search_knowledge(
-        q: str = Query(..., min_length=1),
-        top_n: int = Query(5, ge=1, le=20),
-        domain: str | None = None,
-    ) -> list[dict]:
-        """Semantic search for knowledge entries."""
-        results = stores["vector"].search(q, top_n=top_n, domain=domain)
-        return [
-            SearchResult(
-                id=r["id"],
-                domain=r["domain"],
-                text=r["text"],
-                score=r["score"],
-                metadata=r["metadata"],
-            ).model_dump()
-            for r in results
-        ]
 
     # -----------------------------------------------------------------------
     # Domains
@@ -345,6 +411,7 @@ def create_app() -> FastAPI:
     @app.post("/review/{item_id}/approve")
     async def approve_review(item_id: str, req: ReviewActionRequest) -> dict:
         """Approve a pending review item."""
+        _graph_refusal("rest_approve_review")
         result = stores["review"].approve(item_id, reviewer=req.reviewer, note=req.note)
         if not result.get("success"):
             raise HTTPException(status_code=404, detail=result.get("error"))
@@ -369,6 +436,7 @@ def create_app() -> FastAPI:
     @app.post("/review/{item_id}/reject")
     async def reject_review(item_id: str, req: ReviewActionRequest) -> dict:
         """Reject a pending review item."""
+        _graph_refusal("rest_reject_review")
         result = stores["review"].reject(item_id, reviewer=req.reviewer, note=req.note)
         if not result.get("success"):
             raise HTTPException(status_code=404, detail=result.get("error"))

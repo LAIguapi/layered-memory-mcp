@@ -66,6 +66,7 @@ from layered_memory_mcp.graph_sqlite_store import (
     InvalidPayloadError,
     MissingEndpointError,
     SQLiteGraphStore,
+    StaleRebuildError,
     StoreSchemaError,
     StoreUnavailableError,
     UnknownNodeError,
@@ -1107,9 +1108,7 @@ def test_rebuild_from_an_empty_stream_empties_the_graph():
 
 
 def test_rebuild_keeps_and_reports_a_dangling_edge_instead_of_dropping_it():
-    """§10.2: dropping it would make a broken reference indistinguishable from
-    one that never existed — so the rebuild reports it and health keeps saying
-    so. This is the one path that may persist what `append_edge` refuses."""
+    """§10.2: a dangling reference is reported and the rebuild is fail-closed."""
     dangling = _typed_edge(RelationType.ABOUT, NEW_CLAIM_ID, "entity_not_in_stream")
     stream = [_event("ev_0001", node=_claim()), _event("ev_0002", edge=dangling)]
     with SQLiteGraphStore(":memory:") as store:
@@ -1121,10 +1120,10 @@ def test_rebuild_keeps_and_reports_a_dangling_edge_instead_of_dropping_it():
         assert report.edges_written == 1
 
         health = store.health()
-        assert health.healthy is False
-        assert health.errors == [
-            f"dangling_edge:{dangling.id}:entity_not_in_stream"
-        ]
+        assert health.healthy is True
+        assert health.node_count == 0
+        assert health.edge_count == 0
+        assert store.snapshot()["edges"] == []
 
 
 def test_rebuild_reports_a_replayed_duplicate_without_writing_it_twice():
@@ -1147,8 +1146,9 @@ def test_rebuild_reports_one_id_written_two_different_ways():
         report = store.rebuild(stream)
         assert report.errors == [f"conflicting_node:{NEW_CLAIM_ID}"]
         assert report.ok is False
-        # Ledger order decides, and it is deterministic: last write wins.
-        assert store.get_node(NEW_CLAIM_ID).content == "The rebuild runs hourly."
+        assert store.snapshot()["nodes"] == []
+        assert store.snapshot()["edges"] == []
+        assert store.health().healthy is True
 
 
 class _FlakyConnection(sqlite3.Connection):
@@ -1211,6 +1211,168 @@ def test_a_rebuild_that_fails_before_the_write_touches_nothing(monkeypatch, tmp_
 
         monkeypatch.undo()
         assert store.snapshot() == before
+
+
+# --- D2. the publish boundary: a stale rebuild must not lose a newer commit --
+#
+# The window the staging/replace split necessarily opens: the candidate is
+# built from a stream *before* the write lock is taken, so between staging and
+# publishing another connection can commit a node the candidate does not
+# contain. Publishing anyway would delete it — a lost update that no error, no
+# health check and no drift audit would attribute to the rebuild.
+
+
+class _PublishBarrierConnection(sqlite3.Connection):
+    """A connection that runs a one-shot hook at the publish boundary.
+
+    ``rebuild`` stages its candidate and *then* opens the write transaction, so
+    the single ``BEGIN IMMEDIATE`` statement is exactly the line between "this
+    candidate describes the graph" and "this candidate replaces the graph". The
+    hook fires once, immediately before that statement is sent, which puts a
+    concurrent commit in that window deterministically: no threads, no sleeps
+    and nothing that depends on interpreter scheduling. Subclassing is the same
+    technique ``_FlakyConnection`` uses, and for the same reason — the store
+    accepts a borrowed connection by contract.
+    """
+
+    at_publish = None
+
+    def execute(self, sql, *parameters):  # type: ignore[override]
+        if sql == "BEGIN IMMEDIATE" and self.at_publish is not None:
+            hook, self.at_publish = self.at_publish, None
+            hook()
+        return super().execute(sql, *parameters)
+
+
+def test_a_stale_rebuild_refuses_rather_than_deleting_a_newer_commit(tmp_path):
+    """The whole point: the newer commit is still there afterwards."""
+    database = tmp_path / "graph.sqlite3"
+    publisher = sqlite3.connect(database, factory=_PublishBarrierConnection)
+    store = SQLiteGraphStore(publisher)
+    store.rebuild(_event_stream())
+    projected = store.snapshot()
+
+    # A different writer entirely, on its own connection to the same file.
+    other = SQLiteGraphStore(database)
+    newer = _policy()
+    landed: dict[str, int] = {}
+
+    def _another_writer_commits():
+        other.create_node(newer)
+        landed["revision"] = other.revision()
+
+    publisher.at_publish = _another_writer_commits
+    with pytest.raises(StaleRebuildError) as excinfo:
+        store.rebuild(_event_stream())
+
+    # The barrier really did fire inside the staging window, and the refusal
+    # names both revisions rather than failing anonymously.
+    assert landed["revision"] > 0
+    assert str(landed["revision"]) in str(excinfo.value)
+
+    # 1. The newer node survived — on the rebuilding handle, on the writer's
+    #    handle, and on the file after both are gone.
+    assert store.get_node(POLICY_ID) == newer
+    assert other.get_node(POLICY_ID) == newer
+
+    # 2. Nothing was partially replaced: the rejected candidate deleted none of
+    #    the rows it was about to rewrite.
+    after = store.snapshot()
+    assert after["edges"] == projected["edges"]
+    assert after["nodes"] == sorted(
+        [*projected["nodes"], newer.to_dict()], key=lambda payload: payload["id"]
+    )
+
+    # 3. And the rejected publish moved no checkpoint of its own either.
+    assert store.revision() == landed["revision"]
+    assert store.health().healthy is True
+
+    store.close()
+    other.close()
+    publisher.close()
+    with SQLiteGraphStore(database) as reopened:
+        assert reopened.snapshot() == after
+        assert reopened.health().healthy is True
+
+
+def test_a_rebuild_re_derived_after_the_refusal_publishes_cleanly(tmp_path):
+    """Refusing is only half of it: the retry has to be able to succeed.
+
+    The safe retry is the one that re-derives the candidate from a ledger that
+    now describes the newer commit — not a replay of the same stale stream.
+    """
+    database = tmp_path / "graph.sqlite3"
+    publisher = sqlite3.connect(database, factory=_PublishBarrierConnection)
+    with SQLiteGraphStore(publisher) as store:
+        store.rebuild(_event_stream())
+        with SQLiteGraphStore(database) as other:
+            publisher.at_publish = lambda: other.create_node(_policy())
+            with pytest.raises(StaleRebuildError):
+                store.rebuild(_event_stream())
+
+        # Replaying the same stale stream is refused again, deliberately: the
+        # candidate is unchanged, so it is still the one that loses the node.
+        publisher.at_publish = None
+        extended = [*_event_stream(), _event("ev_0009", at=T2, node=_policy())]
+        report = store.rebuild(extended)
+
+        assert report.ok is True
+        assert report.nodes_written == 6
+        assert store.get_node(POLICY_ID) == _policy()
+        assert store.health().healthy is True
+
+
+def test_an_explicit_expected_revision_closes_the_callers_own_window(tmp_path):
+    """A caller that read its ledger earlier owns a wider window than the one
+    ``rebuild`` can see, and ``expected_revision`` is how it names it."""
+    database = tmp_path / "graph.sqlite3"
+    with SQLiteGraphStore(database) as store:
+        store.rebuild(_event_stream())
+        read_at = store.revision()
+
+        # ... the caller plans. Meanwhile somebody commits.
+        with SQLiteGraphStore(database) as other:
+            other.create_node(_policy())
+
+        with pytest.raises(StaleRebuildError):
+            store.rebuild(_event_stream(), expected_revision=read_at)
+
+        # Refused with nothing touched, exactly as the implicit window is.
+        assert store.get_node(POLICY_ID) == _policy()
+        assert store.revision() == read_at + 1
+
+        # And the unchanged-window case still publishes.
+        assert store.rebuild(_event_stream(), expected_revision=read_at + 1).ok
+
+
+def test_a_refused_rebuild_moves_the_revision_only_when_it_published(tmp_path):
+    """Fail-closed on an invalid candidate is unchanged — and still inert.
+
+    The malformed-ledger refusal stays a *report*, not an exception, because a
+    caller distinguishes "your ledger does not project" from "the graph moved
+    under you"; neither may leave the counter or the rows disturbed.
+    """
+    database = tmp_path / "graph.sqlite3"
+    with SQLiteGraphStore(database) as store:
+        store.rebuild(_event_stream())
+        published_at = store.revision()
+        before = store.snapshot()
+
+        dangling = _typed_edge(RelationType.ABOUT, NEW_CLAIM_ID, "entity_not_in_stream")
+        report = store.rebuild(
+            [_event("ev_0001", node=_claim()), _event("ev_0002", edge=dangling)]
+        )
+
+        assert report.ok is False
+        assert report.errors == [
+            f"unresolved_edge_endpoint:{dangling.id}:entity_not_in_stream"
+        ]
+        assert store.snapshot() == before
+        assert store.revision() == published_at
+
+        # A write that does commit moves it, which is what the compare reads.
+        store.create_node(_policy())
+        assert store.revision() == published_at + 1
 
 
 # --- E. drift: the projection vs. the source it claims to project ------------

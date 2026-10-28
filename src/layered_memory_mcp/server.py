@@ -295,205 +295,36 @@ def set_graph_store(store) -> None:
     _graph_store = store
 
 
-def _graph_recall_report(legacy_results, store, mode):
-    """Run the existing recall seam over ``store``, or report an outage.
-
-    Never raises: recall is the hot read path, so a caller-contract error in the
-    graph seam (a malformed injected store, a duplicated result identity) is
-    reported as an outage instead of failing the tool. Only the exception
-    *class* is carried — a store diagnostic may name a database file (§15).
-    """
-    from .graph_recall import GRAPH_STATUS_UNAVAILABLE
-    from .graph_runtime import GraphRecallRuntimeReport, run_graph_assisted_recall
-
-    try:
-        return run_graph_assisted_recall(legacy_results, store, mode=mode)
-    except Exception as exc:
-        logger.debug("graph-assisted recall unavailable: %s", type(exc).__name__)
-        return GraphRecallRuntimeReport(
-            mode=mode.mode,
-            status=GRAPH_STATUS_UNAVAILABLE,
-            warnings=[f"graph_runtime_failed:{type(exc).__name__}"],
-        )
-
-
-def _request_scoped_graph_recall_report(config: MemoryConfig, legacy_results, mode):
-    """The same seam, over the configured database, for exactly this request.
-
-    Batch L-B: the open/use/close lifecycle is the assembly's own
-    ``graph_store_session``, reused rather than restated, so this path cannot
-    disagree with the diagnostics about when a store may be opened. The session
-    closes the store it opened in its ``finally``, on success and on error
-    alike, and an unconfigured or unopenable database yields ``store=None`` —
-    which the recall seam already reports as a bounded fallback.
-
-    The assembly's own status and error labels are added to the report's
-    warnings so "the graph could not assist" and "the graph was never there"
-    stay distinguishable. They are bounded tokens (a status, an exception class
-    name): never a path, a body or a backend message.
-    """
-    from .graph_runtime_assembly import GRAPH_STORE_OPENED, graph_store_session
-
-    with graph_store_session(config, require=True, mode=mode) as assembly:
-        report = _graph_recall_report(legacy_results, assembly.store, mode)
-        assembly_report = assembly.report
-
-    if assembly_report.status == GRAPH_STORE_OPENED:
-        return report
-    return report.model_copy(
-        update={
-            "warnings": sorted(
-                {
-                    *report.warnings,
-                    assembly_report.status,
-                    *assembly_report.errors,
-                }
-            )
-        }
-    )
-
-
-def _graph_recall_block(config: MemoryConfig, result: dict) -> dict | None:
-    """The additive graph block for a recall response, or None in legacy mode.
-
-    Returning ``None`` is what keeps the legacy response byte-identical: in
-    ``legacy`` mode this function touches nothing, adds no key, opens no
-    database and reaches no graph operation.
-
-    In a graph-enabled mode the block is purely additive — the existing
-    ``results`` / ``matched_files`` / ``search_mode`` fields are never rewritten,
-    reordered or re-scored. Shadow mode additionally carries the deterministic
-    comparison record, which is the whole point of shadowing.
-
-    The store comes from one of two places, in this order: the caller-injected
-    override (used as-is, never closed), or — only without an override — the
-    explicitly configured database, opened and closed within this call.
-    """
-    from .graph_runtime import (
-        GraphModeDecision,
-        compare_recall_results,
-        graph_recall_payload,
-    )
-
-    mode = GraphModeDecision.from_config(config)
-    if not mode.observes_recall:
-        return None
-
-    legacy_results = result.get("results") or []
-    if _graph_store is not None:
-        # The caller owns this store's lifecycle: used, reported, left open.
-        report = _graph_recall_report(legacy_results, _graph_store, mode)
-    else:
-        report = _request_scoped_graph_recall_report(config, legacy_results, mode)
-
-    block = graph_recall_payload(report)
-    if mode.shadow_enabled:
-        # The shadow evidence itself: identities, order, counts and status —
-        # never a memory body, so the block stays safe to log and sample.
-        block["comparison"] = compare_recall_results(legacy_results, report).to_dict()
-    return block
-
-
-# v3.6.0 Batch I-B: the semantic-search result key that already *is* a stable
-# row identity — the vector row's ``id``, which is the L1 entry id Batch I-A
-# derives the ``graph_node_id`` metadata from. A ``text`` snippet, a ``domain``
-# or a ``section`` is deliberately not usable here: none of them is unique, and
-# a non-unique key would silently merge two rows into one graph seed.
+# v3.6.1: one shared graph recall policy for every read entrance. The identity
+# key is the only thing that differs between them:
+#
+#   * a vector row's identity is its own ``id`` — which, for ordinary Markdown,
+#     *is* the versioned projection entry ID the published section carries;
+#   * a keyword result's identity is its ``file``, and it carries the exact
+#     occurrence-aware ``section_entries`` its matched H2 sections produced.
+#
+# Everything else — the seed-identity rules, the store lifecycle, the
+# lifecycle/temporal/scope filtering of the primary results, the pending-
+# projection exclusion, the fallbacks and the response field names — lives in
+# ``graph_search``, so MCP and HTTP cannot drift apart on any of it.
 SEMANTIC_RESULT_IDENTITY_KEY = "id"
+KEYWORD_RESULT_IDENTITY_KEY = "file"
 
 
-def _semantic_graph_seeds(results) -> tuple[list[dict], int]:
-    """Project vector rows onto the identity shape the graph seam requires.
+def _graph_search_outcome(config: MemoryConfig, results, *, identity_key: str):
+    """Apply the shared graph recall policy to one producer's results.
 
-    ``VectorStore.search`` emits ``{id, domain, text, metadata, score}``, while
-    the recall seam keys its mapping by ``file`` (the identity the L1 recall
-    path emits). This is the whole translation: ``id`` → the seam's identity
-    key, the numeric ``score``, and the row's ``metadata`` *verbatim* — the
-    graph IDs are read from it by ``build_seed_mapping``, never from the text,
-    the domain or the id itself.
-
-    The rows are a separate, minimal projection rather than the payloads
-    themselves: nothing the graph seam returns can then reach the semantic
-    results, and a row's body never travels into a report that may be logged.
-
-    A row with no usable identity is *dropped from the seeds and counted*,
-    rather than raising: one unusable row must not cost the other rows their
-    graph material, and a fabricated identity would attach a row to a node it
-    never named. The identity rule is ``clean_identifier`` itself — the same
-    one :class:`~layered_memory_mcp.graph_recall.RecallSeed` applies — so the
-    two cannot drift apart.
-
-    Returns:
-        ``(seed_rows, rows_without_identity)``.
+    In ``legacy`` mode this reaches no graph operation and returns the results
+    unchanged with no block, so the response stays byte-identical. The store is
+    the caller-injected override when there is one — used as-is and never closed
+    here — otherwise the explicitly configured database, opened and closed
+    within this call.
     """
-    from .graph_models import clean_identifier
-    from .graph_runtime import GRAPH_METADATA_KEY, GRAPH_RESULT_IDENTITY_KEY
+    from .graph_search import apply_graph_recall
 
-    seeds: list[dict] = []
-    without_identity = 0
-    for row in results or []:
-        raw_identity = (
-            row.get(SEMANTIC_RESULT_IDENTITY_KEY) if isinstance(row, dict) else None
-        )
-        if not isinstance(raw_identity, str):
-            without_identity += 1
-            continue
-        try:
-            identity = clean_identifier(raw_identity, GRAPH_RESULT_IDENTITY_KEY)
-        except ValueError:
-            without_identity += 1
-            continue
-
-        score = row.get("score", 0.0)
-        seed = {
-            GRAPH_RESULT_IDENTITY_KEY: identity,
-            "score": (
-                float(score)
-                if isinstance(score, (int, float)) and not isinstance(score, bool)
-                else 0.0
-            ),
-        }
-        if GRAPH_METADATA_KEY in row:
-            # Verbatim, including a malformed value: ``build_seed_mapping``
-            # already counts "not a mapping" / "no graph key" as named
-            # fallbacks, and that report is more honest than a silent drop.
-            seed[GRAPH_METADATA_KEY] = row[GRAPH_METADATA_KEY]
-        seeds.append(seed)
-
-    return seeds, without_identity
-
-
-def _semantic_graph_block(config: MemoryConfig, results) -> dict | None:
-    """The additive graph block for a semantic-search response, or None.
-
-    ``search_semantic`` is the first entry point where a graph mapping actually
-    exists: unlike the L1 file scan behind ``recall_knowledge``, a vector row
-    carries the explicit ``graph_node_id`` metadata Batch I-A writes.
-
-    The mode is checked here first so ``legacy`` does no work at all — not the
-    projection below, and (through ``_graph_recall_block``) not one graph
-    operation — leaving the response exactly what it was. In a graph-enabled
-    mode the block is purely additive: ``success`` / ``query`` / ``results``
-    are never rewritten, reordered or re-scored, and the orchestration is the
-    existing ``_graph_recall_block`` rather than a second runtime.
-    """
-    from .graph_runtime import GraphModeDecision
-
-    mode = GraphModeDecision.from_config(config)
-    if not mode.observes_recall:
-        return None
-
-    seeds, without_identity = _semantic_graph_seeds(results)
-    block = _graph_recall_block(config, {"results": seeds})
-    if block is None:  # pragma: no cover - the mode above already said yes
-        return None
-    if without_identity:
-        # Counted, not hidden: these rows are in the answer but have no graph
-        # identity to expand from.
-        block["warnings"] = sorted(
-            {*block.get("warnings", ()), f"results_without_identity:{without_identity}"}
-        )
-    return block
+    return apply_graph_recall(
+        config, results, identity_key=identity_key, store=_graph_store
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -511,14 +342,19 @@ def _semantic_graph_block(config: MemoryConfig, results) -> dict | None:
 # it happened: the graph block sits beside it, never rewrites it, and a graph
 # failure is never a rollback (there is no transaction spanning both stores).
 #
-# And this seam does not COMMIT a graph write. A commit means
-# ``GraphStore.rebuild``, which replaces graph state with the projection of the
-# stream it is handed; this tool holds no complete MemoryEvent stream, so a
-# commit from here would silently drop whatever an earlier write had projected.
-# A write-enabled mode therefore validates the decision and refuses it
-# (GRAPH_WRITE_SOURCE_EVENTS_REQUIRED) instead of rebuilding from a partial
-# stream. Committing belongs where the stream is explicit: a caller holding one
-# calls ``run_semantic_graph_write`` with it directly.
+# v3.6.1 CHANGES THE WRITE-ENABLED HALF OF THAT. The complete MemoryEvent
+# stream now exists — the persistent journal in ``graph_journal`` — so a
+# ``graph_write``/``graph`` mode no longer has to refuse for want of one. It
+# commits through ``graph_application.commit_semantic_write`` BEFORE any legacy
+# write, and the legacy injector is not called at all on that path: the explicit
+# decision is the write, and running it through the legacy dedup/fusion
+# handshake as well would merge two different contracts.
+#
+# What is unchanged: ``legacy`` reaches no graph operation; ``shadow`` plans and
+# commits nothing; ``graph_recall`` writes through the legacy path. A write mode
+# with no journal/graph configured returns a bounded refusal and mutates
+# nothing. ``GRAPH_WRITE_SOURCE_EVENTS_REQUIRED`` below is retained for a caller
+# that reaches ``run_semantic_graph_write`` with its own partial stream.
 
 #: The ``inject_knowledge_tool`` argument carrying that explicit decision. Named
 #: once, here, because the refusal payload derives its own field name from it —
@@ -670,23 +506,14 @@ def _graph_write_block(config: MemoryConfig, request, result: dict) -> dict | No
     untouched legacy fields. Never raises, and never reinterprets the legacy
     outcome — ``legacy_write_ok`` is carried through as the write reported it.
 
-    The order is the one the batch requires: the legacy write first and
-    authoritative, no projection at all beside a failed, refused or deferred
-    one, and ``run_semantic_graph_write`` only where it is safe to call.
-
-    "Safe" is the narrow part, and it is what
-    :data:`GRAPH_WRITE_SOURCE_EVENTS_REQUIRED` exists for. A projection goes
-    through ``GraphStore.rebuild``, which *replaces* graph state with the
-    projection of the event stream it is given. This tool has no such stream —
-    its one ledger is MEMORY_CHANGELOG, which is not a ``MemoryEvent`` stream —
-    so a projection from here would carry this decision's events alone and drop
-    everything a previous write had projected. So a write-enabled mode with an
-    explicit request is refused here, before the runtime seam and before any
-    store operation, rather than committing a destructive rebuild.
-
-    ``shadow`` still plans: planning reads only the supplied material, asks the
-    store for nothing and changes nothing, so it keeps its value as the
-    observation mode. ``legacy`` and the read-only modes are unchanged.
+    v3.6.1: this function is now only reached by the *non-write* modes. A
+    ``graph_write``/``graph`` mode never gets here, because that path commits
+    through the authority before any legacy write (see
+    :func:`_graph_authority_write`) and returns its own response. What remains
+    here is ``shadow`` — which still plans, because planning reads only the
+    supplied material, asks the store for nothing and changes nothing — and the
+    two "the legacy write did not actually write" reports. ``legacy`` and the
+    read-only modes add no key at all.
     """
     from .graph_runtime import (
         GRAPH_WRITE_FAILED,
@@ -716,16 +543,6 @@ def _graph_write_block(config: MemoryConfig, request, result: dict) -> dict | No
     if not _legacy_write_committed(result):
         return _bounded(GRAPH_WRITE_LEGACY_NOT_COMMITTED, True)
 
-    if mode.write_enabled and request is not None:
-        # The refusal above: no runtime call, no store call, no rebuild — and
-        # therefore no chance of replacing an existing graph with this one
-        # decision. Reported as itself rather than as a failure or a commit.
-        return _bounded(
-            GRAPH_WRITE_SOURCE_EVENTS_REQUIRED,
-            legacy_write_ok,
-            warnings=[GRAPH_WRITE_SOURCE_EVENTS_WARNING],
-        )
-
     try:
         outcome = run_semantic_graph_write(
             mode=mode,
@@ -745,6 +562,243 @@ def _graph_write_block(config: MemoryConfig, request, result: dict) -> dict | No
     # Whatever this is, it is not a projection: the only paths that reach the
     # runtime from here are "no decision to project" and shadow's planning.
     return graph_write_payload(outcome)
+
+
+# ---------------------------------------------------------------------------
+# v3.6.1: the authority write path, and the entrance guards around it
+# ---------------------------------------------------------------------------
+# In a graph write mode exactly two entrances mutate memory —
+# ``inject_knowledge_tool`` and ``batch_inject_knowledge_tool`` — and both of
+# them do it by committing an explicit decision to the journal first. Every
+# other mutating entrance refuses before any effect, naming the supported
+# alternative (``graph_mutation_guard``). Read-only and dry-run calls are never
+# refused, and nothing changes in ``legacy``/``shadow``/``graph_recall``.
+
+#: Arguments that only mean something in the legacy dedup/fusion contract. In a
+#: write mode the decision is explicit, so these are refused rather than
+#: silently ignored: ignoring ``fuse=True`` would answer a request for the
+#: legacy optimistic-lock replacement with something else entirely.
+GRAPH_WRITE_UNSUPPORTED_ARGUMENTS = "graph_write_unsupported_arguments"
+
+#: The write-mode action name. Deliberately not one of the legacy ``action``
+#: values: a consumer branching on ``action`` must not read an authority commit
+#: as an ``appended``/``merged`` legacy write.
+GRAPH_WRITE_ACTION = "graph_committed"
+
+
+def _graph_mutation_refusal(operation: str, config: MemoryConfig | None = None):
+    """The bounded refusal for ``operation``, or ``None`` to proceed.
+
+    ``None`` in every mode but ``graph_write``/``graph``, so the legacy,
+    shadow and read-only-graph rollout stages behave exactly as before.
+    """
+    from .graph_mutation_guard import graph_mutation_refusal
+
+    return graph_mutation_refusal(config if config is not None else _get_config(), operation)
+
+
+def _maintenance_job_suspension(config: MemoryConfig, job: str):
+    """The suspension decision for a background job, or ``None`` to run it.
+
+    Same table as the entrance guard: a ride-along that performs a refused
+    mutation is suspended in exactly the modes where the tool is refused.
+    """
+    from .graph_mutation_guard import maintenance_job_suspension
+
+    return maintenance_job_suspension(config, job)
+
+
+def _graph_unsupported_arguments(
+    mode: str, *, write_mode: str, fuse: bool, expected_hash, routing_override: str
+) -> dict | None:
+    """Refuse legacy-only write arguments in a write mode, before any effect."""
+    offending = sorted(
+        name
+        for name, present in (
+            ("mode", write_mode != "upsert"),
+            ("fuse", bool(fuse)),
+            ("expected_hash", expected_hash is not None),
+            ("routing_override", routing_override != "none"),
+        )
+        if present
+    )
+    if not offending:
+        return None
+    return {
+        "success": False,
+        "error": GRAPH_WRITE_UNSUPPORTED_ARGUMENTS,
+        "graph_mode": mode,
+        "unsupported_arguments": offending,
+        "supported_alternative": (
+            "omit them: in a graph write mode the semantic_write_request is the "
+            "decision — a replacement is a SUPERSEDES assertion, not a fuse, and "
+            "deduplication is the caller's judgement, not a write mode"
+        ),
+    }
+
+
+def _graph_decision_required(mode: str, domain: str, section: str) -> dict:
+    """The refusal for a write-mode inject that carried no semantic decision."""
+    from .graph_application import GRAPH_COMMIT_DECISION_REQUIRED
+
+    return {
+        "success": False,
+        "error": GRAPH_COMMIT_DECISION_REQUIRED,
+        "graph_mode": mode,
+        "domain": domain,
+        "section": section,
+        "supported_alternative": (
+            "pass semantic_write_request={node, occurred_at, …} describing the "
+            "decision: in a graph write mode the framework never derives a node, "
+            "an entity, a claim, a supersession or a target from the content, and "
+            "it does not fall back to the legacy write path"
+        ),
+    }
+
+
+def _graph_authority_write(
+    config: MemoryConfig, request, domain: str, section: str, content: str
+) -> dict:
+    """Commit one explicit decision through the authority and report it.
+
+    The whole write, in a write mode: validate and commit to the journal, then
+    publish the graph, the readable L1 section, the vector rows and L0 as its
+    projections. The legacy injector is deliberately not called — a refusal here
+    means nothing was written anywhere, and a commit here means the decision is
+    durable even if a projection still has to be recovered.
+    """
+    from .graph_application import (
+        GRAPH_COMMIT_COMMITTED,
+        ProjectionBinding,
+        commit_payload,
+        commit_semantic_write,
+    )
+
+    binding = ProjectionBinding(
+        domain=_domain_from_file(domain), section=section, body=content
+    )
+    commit = commit_semantic_write(config, request, binding, store=_graph_store)
+    payload = {
+        "success": commit.committed,
+        "action": GRAPH_WRITE_ACTION if commit.committed else commit.status,
+        "domain": binding.domain,
+        "section": section,
+        "graph": commit_payload(commit),
+    }
+    if not commit.committed:
+        payload["error"] = commit.status
+        payload["supported_alternative"] = (
+            "fix the refused part of the decision and retry with the same "
+            "request key; nothing was written to the journal, the graph, L1, "
+            "the vector rows or L0"
+        )
+    elif commit.status != GRAPH_COMMIT_COMMITTED:
+        payload["warning"] = (
+            "the decision is committed and durable; one or more managed "
+            "projections are still pending — call recover_graph_projections()"
+        )
+    return payload
+
+
+def _batch_item(item) -> dict | None:
+    """One batch entry as a mapping, or ``None`` when it is not one."""
+    if isinstance(item, str):
+        try:
+            item = json.loads(item)
+        except Exception:
+            return None
+    return item if isinstance(item, dict) else None
+
+
+def _graph_batch_refusal(
+    config: MemoryConfig, items, write_mode: str, routing_override: str
+) -> dict | None:
+    """Judge a whole batch before any of it is applied, or answer ``None``.
+
+    Every item must name a domain, a section, content and an explicit semantic
+    decision that validates. The first unsupported shape refuses the *call*:
+    committing the valid prefix and reporting the rest would leave the caller
+    with a half-applied batch whose remainder cannot be retried as one unit.
+    """
+    from .graph_application import GRAPH_COMMIT_DECISION_REQUIRED
+
+    argument_refusal = _graph_unsupported_arguments(
+        config.graph_mode,
+        write_mode=write_mode,
+        fuse=False,
+        expected_hash=None,
+        routing_override=routing_override,
+    )
+    if argument_refusal is not None:
+        return argument_refusal
+
+    refused: list[int] = []
+    reasons: list[str] = []
+    for index, raw in enumerate(items):
+        item = _batch_item(raw)
+        if item is None:
+            refused.append(index)
+            reasons.append(f"{index}:item_is_not_an_object")
+            continue
+        if not item.get("domain") or not item.get("section") or not item.get("content"):
+            refused.append(index)
+            reasons.append(f"{index}:missing_domain_section_or_content")
+            continue
+        payload = item.get(SEMANTIC_WRITE_REQUEST_ARG)
+        if payload is None:
+            refused.append(index)
+            reasons.append(f"{index}:missing_{SEMANTIC_WRITE_REQUEST_ARG}")
+            continue
+        _request, refusal = _parse_semantic_write_request(payload)
+        if refusal is not None:
+            refused.append(index)
+            reasons.append(f"{index}:{SEMANTIC_WRITE_REQUEST_ERROR}")
+    if not refused:
+        return None
+    return {
+        "success": False,
+        "error": GRAPH_COMMIT_DECISION_REQUIRED,
+        "graph_mode": config.graph_mode,
+        "total": len(items),
+        "refused_items": refused,
+        "refused_reasons": reasons,
+        "supported_alternative": (
+            "give every item its own semantic_write_request; the batch is "
+            "refused as a whole and nothing was written"
+        ),
+    }
+
+
+def _graph_batch_commit(config: MemoryConfig, items, agent_id) -> dict:
+    """Commit an already-validated batch, one authority commit per item.
+
+    Sequential and separately reported: each commit is its own journal request,
+    so a later item's refusal cannot undo an earlier item's durable decision,
+    and the response says exactly which ones landed.
+    """
+    results: list[dict] = []
+    success_count = 0
+    for index, raw in enumerate(items):
+        item = _batch_item(raw) or {}
+        request, _refusal = _parse_semantic_write_request(
+            item.get(SEMANTIC_WRITE_REQUEST_ARG)
+        )
+        outcome = _graph_authority_write(
+            config,
+            request,
+            item.get("domain", ""),
+            item.get("section", ""),
+            item.get("content", ""),
+        )
+        results.append({"index": index, **outcome})
+        success_count += int(bool(outcome.get("success")))
+    return {
+        "success": success_count == len(items),
+        "total": len(items),
+        "success_count": success_count,
+        "error_count": len(items) - success_count,
+        "results": results,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -973,12 +1027,22 @@ async def recall_knowledge(
     if staleness:
         result["l0_staleness_warning"] = staleness
 
-    # v3.6.0: graph-assisted recall, additive and mode-gated. In the default
+    # v3.6.1: graph-assisted recall through the shared policy. In the default
     # `legacy` mode this adds no key and reaches no graph operation, so the
-    # response is exactly what it always was.
-    graph_block = await asyncio.to_thread(_graph_recall_block, config, result)
-    if graph_block is not None:
-        result["graph"] = graph_block
+    # response is exactly what it always was. In a graph-enabled mode the
+    # graph's lifecycle/temporal/scope filters govern the PRIMARY results — a
+    # row the graph says is superseded, retracted or out of scope is removed
+    # rather than annotated — and `matched_files` is recounted to match.
+    outcome = await asyncio.to_thread(
+        _graph_search_outcome,
+        config,
+        result.get("results") or [],
+        identity_key=KEYWORD_RESULT_IDENTITY_KEY,
+    )
+    if outcome.block is not None:
+        result["results"] = outcome.results
+        result["matched_files"] = len(outcome.results)
+        result["graph"] = outcome.block
 
     return json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -1247,6 +1311,10 @@ async def create_knowledge_file(filename: str, content: str) -> str:
     Returns:
         JSON with success status and file path.
     """
+    refusal = _graph_mutation_refusal("create_knowledge_file")
+    if refusal is not None:
+        return json.dumps(refusal, ensure_ascii=False, indent=2)
+
     config = _get_config()
 
     filepath, err = _validate_knowledge_path(config, filename)
@@ -1343,6 +1411,10 @@ async def update_knowledge_file(filename: str, content: str) -> str:
     Returns:
         JSON with success status.
     """
+    refusal = _graph_mutation_refusal("update_knowledge_file")
+    if refusal is not None:
+        return json.dumps(refusal, ensure_ascii=False, indent=2)
+
     config = _get_config()
     filepath, err = _validate_knowledge_path(config, filename)
     if filepath is None:
@@ -1458,6 +1530,10 @@ async def delete_knowledge_file(filename: str) -> str:
     Returns:
         JSON with success status.
     """
+    refusal = _graph_mutation_refusal("delete_knowledge_file")
+    if refusal is not None:
+        return json.dumps(refusal, ensure_ascii=False, indent=2)
+
     config = _get_config()
     filepath, err = _validate_knowledge_path(config, filename)
     if filepath is None:
@@ -1621,14 +1697,16 @@ async def inject_knowledge_tool(
               judgement is yours, and passing it here is what makes it
               reviewable. An invalid payload is refused before anything is
               written (error="invalid_semantic_write_request") rather than
-              repaired. NOTE: this entry point does not COMMIT it. A graph
-              commit replaces graph state from a complete MemoryEvent stream,
-              and this tool holds no such stream, so under `graph_write`/`graph`
-              the decision is validated and then refused with
-              `graph.status="graph_write_source_events_required"` and
-              `graph.committed=false` — never a partial rebuild that would drop
-              earlier graph state. `shadow` reports the validated plan. The L1
-              write below is authoritative and unaffected either way.
+              repaired. v3.6.1: under `graph_write`/`graph` this argument is
+              REQUIRED and this tool COMMITS it — to the persistent semantic
+              journal first, and then to the graph, this section in L1, the
+              vector rows for the domain and L0 as that journal's managed
+              projections. The legacy dedup/fusion write path is not run on
+              that route, `mode`/`fuse`/`expected_hash`/`routing_override` are
+              refused there as legacy-only arguments, and a decision with no
+              request is refused before anything is written. `shadow` still only
+              reports the validated plan beside an ordinary legacy write, and
+              `legacy`/`graph_recall` are unchanged.
 
     Returns:
         JSON with action taken, dedup info, L0 sync status, and warnings.
@@ -1668,6 +1746,31 @@ async def inject_knowledge_tool(
     )
     if semantic_refusal is not None:
         return json.dumps(semantic_refusal, ensure_ascii=False)
+
+    # v3.6.1: in a graph write mode the authority runs FIRST and the legacy
+    # injector does not run at all. A missing decision, an unsupported legacy
+    # argument and every validation refusal are answered before anything is
+    # written to L1, the changelog, the vector store or L0.
+    if config.graph_write_enabled:
+        argument_refusal = _graph_unsupported_arguments(
+            config.graph_mode,
+            write_mode=mode,
+            fuse=fuse,
+            expected_hash=expected_hash,
+            routing_override=routing_override,
+        )
+        if argument_refusal is not None:
+            return json.dumps(argument_refusal, ensure_ascii=False, indent=2)
+        if semantic_request is None:
+            return json.dumps(
+                _graph_decision_required(config.graph_mode, domain, section),
+                ensure_ascii=False,
+                indent=2,
+            )
+        committed = await asyncio.to_thread(
+            _graph_authority_write, config, semantic_request, domain, section, content
+        )
+        return json.dumps(committed, ensure_ascii=False, indent=2)
 
     result = await asyncio.to_thread(
         inject_knowledge,
@@ -1714,6 +1817,10 @@ async def reindex_vector_store_tool(drop_existing: bool = True) -> str:
     Returns:
         JSON: {success, domains, sections, files, errors}.
     """
+    refusal = _graph_mutation_refusal("reindex_vector_store_tool")
+    if refusal is not None:
+        return json.dumps(refusal, ensure_ascii=False, indent=2)
+
     config = _get_config()
     result = await asyncio.to_thread(
         reindex_vector_store, config=config, drop_existing=drop_existing
@@ -1776,6 +1883,19 @@ async def reconcile_knowledge_tool(
     domain_list = (
         [d.strip() for d in domains.split(",") if d.strip()] if domains else None
     )
+
+    # v3.6.1: three of the four checks are pure reads and stay available. The
+    # fourth, `calibrate`, persists sem_thresholds.json, so in a graph write
+    # mode it is refused before it runs rather than writing derived tuning data
+    # the authority did not produce. Ask for the other checks by name.
+    refusal = (
+        _graph_mutation_refusal("reconcile_knowledge_tool", config)
+        if "calibrate" in requested
+        else None
+    )
+    if refusal is not None:
+        refusal["read_only_checks"] = ["cross_dup", "split", "vector_health"]
+        return json.dumps(refusal, ensure_ascii=False, indent=2)
 
     def _run() -> dict:
         out: dict = {"ran": sorted(requested)}
@@ -1852,6 +1972,11 @@ async def apply_safe_knowledge_cleanup_tool(actions: list, dry_run: bool = True)
     Returns:
         JSON: {dry_run, applied, would_apply, skipped, rejected, errors, summary}.
     """
+    # Read-only/dry-run is never refused; only the mutating form is.
+    refusal = _graph_mutation_refusal("apply_safe_knowledge_cleanup_tool") if not dry_run else None
+    if refusal is not None:
+        return json.dumps(refusal, ensure_ascii=False, indent=2)
+
     config = _get_config()
     result = await asyncio.to_thread(
         apply_safe_knowledge_cleanup, config, actions, dry_run, _get_todo_store
@@ -1916,6 +2041,22 @@ async def batch_inject_knowledge_tool(
                 "Must be 'none' or 'force_l1'."
             ),
         })
+
+    # v3.6.1: in a graph write mode the whole batch is judged before any of it
+    # is applied. A batch is a convenience, never a way for one unsupported
+    # item to land half a write: an item with no semantic decision, or a
+    # legacy-only argument on the batch, refuses the call before the first
+    # commit.
+    if config.graph_write_enabled:
+        batch_refusal = await asyncio.to_thread(
+            _graph_batch_refusal, config, items, mode, routing_override
+        )
+        if batch_refusal is not None:
+            return json.dumps(batch_refusal, ensure_ascii=False, indent=2)
+        committed = await asyncio.to_thread(
+            _graph_batch_commit, config, items, agent_id
+        )
+        return json.dumps(committed, ensure_ascii=False, indent=2)
 
     results = []
     success_count = 0
@@ -2212,6 +2353,11 @@ async def apply_agent_action(
         `invalid_action`, `error`; `applied` is true only for `applied`.
         `blockers` carries stable reason codes for anything else.
     """
+    # Read-only/dry-run is never refused; only the mutating form is.
+    refusal = _graph_mutation_refusal("apply_agent_action") if not dry_run else None
+    if refusal is not None:
+        return json.dumps(refusal, ensure_ascii=False, indent=2)
+
     if action:
         try:
             payload = json.loads(action)
@@ -2354,6 +2500,11 @@ async def sync_l0_index_tool(
     Returns:
         JSON with sync report including entries added/removed/unchanged.
     """
+    # Read-only/dry-run is never refused; only the mutating form is.
+    refusal = _graph_mutation_refusal("sync_l0_index_tool") if not dry_run else None
+    if refusal is not None:
+        return json.dumps(refusal, ensure_ascii=False, indent=2)
+
     config = _get_config()
 
     # Pass format as parameter — avoids mutating shared config (no race condition)
@@ -2471,6 +2622,10 @@ async def manage_l0_entry_tool(
     Returns:
         JSON with success status and entry count.
     """
+    refusal = _graph_mutation_refusal("manage_l0_entry_tool")
+    if refusal is not None:
+        return json.dumps(refusal, ensure_ascii=False, indent=2)
+
     config = _get_config()
 
     if action not in ("add", "remove", "replace"):
@@ -2633,15 +2788,19 @@ async def search_semantic(
         "results": results,
     }
 
-    # v3.6.0 Batch I-B: graph-assisted semantic recall, additive and mode-gated.
-    # In the default `legacy` mode this adds no key and reaches no graph
-    # operation, so the response is exactly what it always was. The graph work
-    # is blocking, so it goes to a thread like every other blocking call here.
-    graph_block = await asyncio.to_thread(
-        _semantic_graph_block, _get_config(), results
+    # v3.6.1: the same shared graph recall policy the keyword path uses, over
+    # the vector rows' own identities. In the default `legacy` mode this adds
+    # no key and reaches no graph operation. The graph work is blocking, so it
+    # goes to a thread like every other blocking call here.
+    outcome = await asyncio.to_thread(
+        _graph_search_outcome,
+        _get_config(),
+        results,
+        identity_key=SEMANTIC_RESULT_IDENTITY_KEY,
     )
-    if graph_block is not None:
-        payload["graph"] = graph_block
+    if outcome.block is not None:
+        payload["results"] = outcome.results
+        payload["graph"] = outcome.block
 
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
@@ -2701,6 +2860,10 @@ async def approve_knowledge(
     Returns:
         JSON with approval result.
     """
+    refusal = _graph_mutation_refusal("approve_knowledge")
+    if refusal is not None:
+        return json.dumps(refusal, ensure_ascii=False, indent=2)
+
     stores = _get_v2_stores()
     result = stores["review"].approve(entry_id, reviewer=reviewer, note=note)
 
@@ -2740,6 +2903,10 @@ async def reject_knowledge(
     Returns:
         JSON with rejection result.
     """
+    refusal = _graph_mutation_refusal("reject_knowledge")
+    if refusal is not None:
+        return json.dumps(refusal, ensure_ascii=False, indent=2)
+
     stores = _get_v2_stores()
     result = stores["review"].reject(entry_id, reviewer=reviewer, note=note)
     return json.dumps(result, ensure_ascii=False, indent=2)
@@ -2819,13 +2986,25 @@ async def get_l0_index() -> str:
     """
     config = _get_config()
 
+    # v3.6.1: in a graph write mode both ride-alongs below are suspended. They
+    # are the only writes a *read* tool performs, and each one is a refused
+    # entrance running unattended — compaction rewriting agent memory and L1,
+    # the guard refresh writing into the agent's own home. See
+    # ``graph_mutation_guard.MAINTENANCE_JOBS``. The index read itself is
+    # unchanged, and every other mode keeps both ride-alongs exactly as before.
+    compaction_suspended = _maintenance_job_suspension(config, "auto_maintain")
+    guard_suspended = _maintenance_job_suspension(config, "write_guard_refresh")
+    for suspension in (compaction_suspended, guard_suspended):
+        if suspension is not None:
+            logger.debug("get_l0_index ride-along suspended: %s", suspension["job"])
+
     # v2.7.0: ride-along self-maintenance. get_l0_index is the highest-frequency
     # tool in the stdio lifecycle — Hermes (and most agents) call it at the
     # start of every session. Piggybacking a memory-health check here gives the
     # framework a real chance to self-maintain even when the agent only ever
     # writes to native memory and never calls inject_knowledge. Best-effort:
     # any failure is swallowed so it can never break index retrieval.
-    if getattr(config, "auto_maintain", True):
+    if compaction_suspended is None and getattr(config, "auto_maintain", True):
         try:
             from .memory_compactor import auto_maintain_after_write
 
@@ -2840,7 +3019,10 @@ async def get_l0_index() -> str:
     # unless forced). Refreshing is a files-only copy, so doing it on this read
     # path keeps the host in step without any approval step. Auto policy only:
     # a manual host keeps the human in the loop.
-    if str(getattr(config, "write_guard", "manual")).strip().lower() == "auto":
+    if (
+        guard_suspended is None
+        and str(getattr(config, "write_guard", "manual")).strip().lower() == "auto"
+    ):
         try:
             from .write_guard import refresh_deployed_plugin
 
@@ -3022,6 +3204,11 @@ async def compact_memory(
         this pass could not place (`fingerprint: null` when nothing was
         blocked).
     """
+    # Read-only/dry-run is never refused; only the mutating form is.
+    refusal = _graph_mutation_refusal("compact_memory") if not dry_run else None
+    if refusal is not None:
+        return json.dumps(refusal, ensure_ascii=False, indent=2)
+
     config = _get_config()
     from .memory_compactor import compact_memory as _compact
     result = await asyncio.to_thread(
@@ -3047,6 +3234,10 @@ async def init_framework() -> str:
         JSON with initialization status, memory management rules,
         and agent integration recommendations.
     """
+    refusal = _graph_mutation_refusal("init_framework")
+    if refusal is not None:
+        return json.dumps(refusal, ensure_ascii=False, indent=2)
+
     config = _get_config()
 
     def _init():
@@ -3195,6 +3386,11 @@ async def integrate_agent(action: str = "status") -> str:
     Returns:
         JSON with the result of the action.
     """
+    # Read-only/dry-run is never refused; only the mutating form is.
+    refusal = _graph_mutation_refusal("integrate_agent") if action != "status" else None
+    if refusal is not None:
+        return json.dumps(refusal, ensure_ascii=False, indent=2)
+
     config = _get_config()
 
     def _integrate():
@@ -3309,6 +3505,10 @@ async def integrate_agent(action: str = "status") -> str:
 @mcp.tool()
 async def add_todo(domain: str, content: str, title: str = "", blocked_by: str = "[]", priority: str = "medium", notes: str = "", source_session_id: str = "") -> str:
     """Add a new TODO item."""
+    refusal = _graph_mutation_refusal("add_todo")
+    if refusal is not None:
+        return json.dumps(refusal, ensure_ascii=False, indent=2)
+
     import json as _json
     from datetime import datetime, timezone
     store = _get_todo_store()
@@ -3342,6 +3542,10 @@ async def list_todos(status: str = "", domain: str = "", priority: str = "", lim
 @mcp.tool()
 async def update_todo(todo_id: str, status: str = "", priority: str = "", title: str = "", content: str = "", blocked_by: str = "", notes: str = "") -> str:
     """Update a TODO item's status, priority, content, or notes."""
+    refusal = _graph_mutation_refusal("update_todo")
+    if refusal is not None:
+        return json.dumps(refusal, ensure_ascii=False, indent=2)
+
     import json as _json
     store = _get_todo_store()
     kwargs = {}
@@ -3364,6 +3568,10 @@ async def update_todo(todo_id: str, status: str = "", priority: str = "", title:
 @mcp.tool()
 async def delete_todo(todo_id: str) -> str:
     """Delete a TODO item by ID."""
+    refusal = _graph_mutation_refusal("delete_todo")
+    if refusal is not None:
+        return json.dumps(refusal, ensure_ascii=False, indent=2)
+
     store = _get_todo_store()
     result = store.delete(todo_id)
     return json.dumps(result, ensure_ascii=False, indent=2)
@@ -3547,6 +3755,72 @@ async def prune_access_log() -> str:
 
     result = await asyncio.to_thread(_prune)
     return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# MCP Tools — v3.6.1: semantic authority health and recovery
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def graph_memory_status() -> str:
+    """Report the semantic journal and its managed projections. Read-only.
+
+    The operator view of the write authority: how many decisions it holds, how
+    far each managed projection (graph / L1 / vector rows / L0) has published,
+    which ones are behind, how many readable surfaces it owns, and whether the
+    graph database is openable and healthy.
+
+    Strictly read-only — it opens the two databases, reads their own health and
+    closes them again. It publishes nothing, repairs nothing and advances no
+    checkpoint. Available in every mode; with nothing configured it reports
+    exactly that rather than inventing a location.
+
+    Returns:
+        JSON: {mode, recall_enabled, write_enabled, journal, surfaces?, graph}.
+        Counts, statuses, positions and bounded labels only — never a database
+        path, a memory body or a backend message.
+    """
+    from .graph_application import runtime_status
+
+    result = await asyncio.to_thread(runtime_status, _get_config(), store=_graph_store)
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def recover_graph_projections(force: bool = False) -> str:
+    """Finish every managed projection the semantic journal says is behind.
+
+    The explicit recovery entry point. A committed decision is durable in the
+    journal even when one of its projections failed — a vector store that was
+    briefly unavailable, an L1 file that could not be written — and this
+    republishes exactly the ones whose checkpoint is behind the committed head,
+    from the journal, advancing each checkpoint only where its projection
+    actually succeeded.
+
+    Idempotent: with nothing pending it changes nothing and says so. It never
+    rebuilds a projection from the files that projection produced, and it never
+    overwrites a readable surface somebody else edited — a drifted surface is
+    refused and reported, and stays pending until the conflict is resolved.
+
+    Args:
+        force: Republish EVERY managed projection from the journal, regardless
+            of its checkpoint. For a projection that was *lost* rather than left
+            behind — a deleted graph database, a restored backup, a wiped vector
+            store — which a checkpoint cannot detect on its own; see
+            `graph_memory_status().projection_drift`. Still a republication and
+            never an adoption: an externally edited readable surface is refused
+            and reported rather than overwritten.
+
+    Returns:
+        JSON: {status, head_position, recovered, checkpoints,
+        projections_pending, errors}.
+    """
+    from .graph_application import recover_projections
+
+    result = await asyncio.to_thread(
+        recover_projections, _get_config(), store=_graph_store, force=force
+    )
+    return json.dumps(result.to_dict(), ensure_ascii=False, indent=2)
 
 
 # ---------------------------------------------------------------------------
