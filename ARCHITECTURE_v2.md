@@ -917,11 +917,60 @@ benchmark is treated as repository evidence.
 
 ### Batch K — controlled default transition (planned)
 
-- Enable graph-aware recall only after Batch J passes its acceptance gates.
-- Migrate write ownership only after one semantic write path can reproduce the
-  existing L1/changelog/vector behavior and its rollback has been exercised.
-- Remove obsolete paths only after an explicit equivalence or intentional
-  behavior-change record.
+Batch K is split into evidence collection and a later governance decision. It
+must not turn a mixed corpus of healthy and degraded cases into one misleading
+quality number, and it must not treat an in-memory seam as evidence that the
+persistent runtime is ready.
+
+#### K-A: separated shadow evaluation
+
+The evaluation corpus is partitioned into two explicit classes:
+
+1. **Normal-path cases** — a healthy graph, valid seed metadata, current and
+   in-scope nodes, and resolvable provenance. These cases measure graph-assisted
+   material, stale exposure, provenance coverage, legacy identity/order/payload
+   preservation, and latency.
+2. **Failure/fallback cases** — absent, unhealthy, raising, unmapped, or
+   no-material graph conditions. These cases measure that the legacy answer is
+   preserved, the fallback reason is specific and bounded, no graph write is
+   reached, and no diagnostic/path/body leaks into the report.
+
+The two classes are reported separately. A fallback rate is an operational
+reliability input, not a retrieval-quality score; provenance coverage is
+meaningful only over normal-path cases whose provenance denominator is supplied.
+The corpus must contain positive and negative controls for stale exposure and
+provenance gaps, rather than relying on an all-clean fixture.
+
+#### K-B: persistent-runtime shadow verification
+
+The same explicit neutral cases are rerun against a temporary
+``SQLiteGraphStore`` database, closed and reopened before recall. This verifies
+the actual persistent adapter together with the graph-recall seam without
+opening a production path. The verification must compare the SQLite result to
+the in-memory reference for node IDs, edge IDs, statuses, provenance,
+fallback behavior, and bounded output. It must also verify that the runtime
+assembly reaches the persistent store only in an explicit graph mode; default
+``MemoryConfig()`` remains ``legacy`` and performs zero graph calls.
+
+#### K-C: cutover gate and rollback record
+
+Only after K-A and K-B produce reproducible evidence may a separate review set
+the cutover gates. The gate must state, with denominators:
+
+- normal-path legacy identity/order/payload preservation;
+- normal-path stale exposure and provenance coverage;
+- failure-path legacy preservation and bounded fallback reason coverage;
+- persistent-vs-reference semantic parity;
+- p95 latency separately for in-memory and SQLite fixtures;
+- write-path readiness, including ownership of the complete ``MemoryEvent``
+  stream (currently **not met**).
+
+No threshold is invented from the current five-case fixture. A failed gate
+keeps the default at ``legacy``. If a future explicit opt-in is enabled, the
+rollback record must name the configuration change, the previous mode, the
+graph-store snapshot/backup boundary, and the verification that legacy recall
+is restored after disabling the opt-in. Removing obsolete paths remains out of
+scope until an explicit equivalence or intentional behavior-change record.
 
 ## 13. Acceptance metrics
 
