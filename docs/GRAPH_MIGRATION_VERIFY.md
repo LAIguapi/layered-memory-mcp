@@ -1,7 +1,7 @@
 # Layered Memory Graph v1 迁移工具验收记录
 
 状态：隔离样本验收通过；不代表生产迁移或默认模式切换
-版本：3.6.1 迁移工具实现
+版本：3.6.0（迁移工具验收记录）
 范围：`python -m layered_memory_mcp.graph_migration`
 
 ## 1. 结论
@@ -20,6 +20,7 @@
 - 不兼容的 L1 分段语料在 plan/apply 前 fail closed，目标保持不存在，源保持不变。
 - frontmatter 显式 ID 保留为向量/图身份，但外部拥有的可读 surface 不被迁移框架接管。
 - 缺失的源记录时间使用固定哨兵，不把迁移时刻写入 bootstrap event payload；显式 authored `source.extracted_at` 保留。
+- manifest 的 `source_files` 会与 generation 内冻结的 `backup/` 逐项重算核对；篡改声明即 fail closed，即使同步重签 manifest digest 也不能绕过。
 
 未验证、也未声称完成：
 
@@ -55,11 +56,12 @@
 | 显式 ID 的 graph/vector 对齐 | 通过 | `vector_seed_matches: true` |
 | 源只读 | 通过 | apply 后 `source_unchanged_after_apply: true` |
 | bootstrap 确定性 | 通过 | 两次 report 和 event payload 均相等 |
-| verify | 通过 | `verify_status: migration_verified`、`verify_ok: true` |
+| verify | 通过 | `verify_status: migration_verified`、`verify_ok: true`、`source_files_ok: true` |
 | rollback | 通过 | current 消失、withdrawn path 存在、源仍未变化 |
 
 补充完整生命周期证据：本地 scratch 证据文件 `migration-parent-acceptance-probe.json`。
 该探针还覆盖了重复 apply、重复 rollback、源 tree state 前后相等和 frontmatter ownership 保留。
+当前 HEAD 的独立回归还确认：同一源快照的重复 `plan_migration()` bootstrap 报告稳定；重签后篡改 `source_files` 会被核验拒绝。
 
 ## 4. 不兼容语料的 fail-closed 证据
 
@@ -134,7 +136,18 @@ frontmatter 条目的 `created_at`/`updated_at` 继续保留其 authored 语义�
 - `recorded_at` 固定为上述哨兵。
 - authored source extraction time 的专门测试通过。
 
-### 5.5 源 SQLite 只读
+审查处置：早期只读审查曾指出 `plan_migration()` 可能把 wall-clock 传入 bootstrap；当前 HEAD 已由固定 `MISSING_RECORDED_AT` 哨兵覆盖，独立重复 plan 探针确认 bootstrap 报告稳定。迁移时间只在 generation manifest 的 `published_at` 中记录，不进入 bootstrap event payload。
+
+### 5.5 source_files provenance 核验
+
+`manifest.source_files` 不是只读声明：verify 会把它与 `backup/` 中的冻结源文件集合、大小和 SHA-256 逐项比较，并拒绝越界路径、缺失文件和多余文件。该检查独立于 manifest 自身 digest，因此“篡改 source_files 后同步重签 manifest”仍然得到 `source_file_hash_mismatch` / `source_file_size_mismatch`，不会报告 verified。
+
+依据：
+
+- `graph_migration_generation.py::_verify_source_files` 与 `VerificationReport.source_files_ok`。
+- `tests/test_v361_graph_migration.py::test_verify_detects_tampered_source_file_provenance`。
+
+### 5.6 源 SQLite 只读
 
 源 vector database 的盘点走 SQLite URI：`mode=ro&immutable=1`，不使用会在构造时 mkdir、建表或 checkpoint WAL 的 `VectorStore` 写入口。迁移只在 staged generation 的副本上通过受控 metadata-only backfill 更新 graph seed metadata；不会删除旧 vector row、重嵌入文本或原地改写源数据库。
 
