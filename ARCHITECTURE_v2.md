@@ -999,7 +999,9 @@ the cutover gates. The gate must state, with denominators:
 - persistent-vs-reference semantic parity;
 - p95 latency separately for in-memory and SQLite fixtures;
 - write-path readiness, including ownership of the complete ``MemoryEvent``
-  stream (currently **not met**).
+  stream (currently **not met**), as a separate gate for ``graph_write`` and
+  ``graph``. Read-only ``graph_recall`` does not require this event stream;
+  it requires an explicitly populated, compatible graph snapshot instead.
 
 No threshold is invented from the current six-case K-A fixture or the single
 K-B parity fixture. K-C remains open: the repository still needs a broader,
@@ -1012,6 +1014,90 @@ previous mode, the graph-store snapshot/backup boundary, and the verification
 that legacy recall is restored after disabling the opt-in. Removing obsolete
 paths remains out of scope until an explicit equivalence or intentional
 behavior-change record.
+
+### Batch L — stable projection identity and request-scoped graph assembly (planned)
+
+The post-K source audit found two runtime gaps, independently checked on neutral
+in-memory inputs: ``injector._vector_entries`` minted random IDs for ordinary
+Markdown sections on every projection, and ``server.py`` had no caller of the
+persistent-store assembly. Same-input projections changed both section IDs and
+their derived graph seed IDs; an explicit frontmatter ID was preserved as a
+control. These are runtime prerequisites, not grounds for a default cutover.
+
+#### L-A: deterministic ordinary-Markdown projection identity
+
+- Add one pure identity helper, consumed by ``_vector_entries`` only. Use a
+  versioned, unambiguous canonical serialization of the exact domain, exact H2
+  section label, and zero-based occurrence among identical labels. Hash that
+  serialization with SHA-256 under a dedicated projection-ID prefix. Do not
+  include body, summary, timestamps, or document-wide position.
+- Preserve case, punctuation, dates, versions, and Unicode distinctions. The
+  labels emitted by ``_bodyful_sections`` are the canonical parser input;
+  reject blank/multiline helper inputs rather than silently repairing them.
+  Do not use ``embedding_heading`` or ``heading_skeleton``: both deliberately
+  erase distinctions that identity must retain.
+- Preserve the authoritative ID of frontmatter-backed entries. Do not change
+  standalone ``sync_to_vector_store(replace_domain=False)`` behavior or the
+  canonical entry-ID-to-graph-node mapping.
+- Repeated projection, body edits, and insertion/reordering of differently named
+  sections preserve an existing section's ID. A heading or domain rename changes
+  identity. Duplicate identical headings use positional occurrence within that
+  label: insertion/deletion/reordering within this duplicate group cannot track
+  the authored object reliably. This is an explicit limitation, not semantic
+  entity resolution; do not infer identity from body similarity.
+- This changes future ordinary-Markdown vector row IDs in legacy mode too. No
+  existing database is rewritten in this batch. Any later production reindex
+  needs a separately approved coordinated vector/graph rebuild and backup. Old
+  row IDs and graph seed references are not silently aliased or backfilled.
+
+#### L-B: explicit opt-in, request-scoped persistent recall
+
+- Retain ``set_graph_store`` as a caller-owned injection seam. A non-None
+  injected store takes precedence and is never closed by the server. Clearing
+  it removes the override; graph-enabled requests may then use the explicit
+  configured path, while unconfigured requests retain the old no-store fallback.
+- Only after ``GraphModeDecision.observes_recall`` is true, and only without an
+  injected store, use existing ``graph_store_session(config, require=True)``
+  around the existing recall seam. Reuse its open/use/finally-close lifecycle;
+  add no pool, singleton connection, startup hook, auto-import, or inferred path.
+- Missing paths, failed opens, and query errors preserve legacy results and
+  return bounded graph fallback diagnostics without paths, bodies, or exception
+  messages. Missing parent directories are not created. SQLite initialization
+  at an explicitly configured path remains the existing adapter's behavior;
+  this is request-scoped use, not an OS-level read-only SQLite connection.
+- Legacy mode returns before assembly, seed projection, or graph operations.
+  ``graph_write``/``graph`` still refuse commits without complete source events;
+  this batch does not wire assembly into the semantic write seam.
+
+#### Scope, verification, and rollback
+
+Implementation allowlist: new ``src/layered_memory_mcp/graph_entry_identity.py``,
+``injector.py`` (ordinary-Markdown ``_vector_entries`` projection only),
+``server.py`` (recall-store selection/lifecycle and related comments only), new
+``tests/test_v360_graph_entry_identity.py``, and new
+``tests/test_v360_graph_recall_path.py``. Design/status updates stay in this
+document and ``CHANGELOG.md`` in separate documentation commits.
+
+Require tests for repeat/body-edit/section-insertion identity, exact-label
+collision controls, duplicate-heading boundaries, frontmatter preservation,
+temporary vector replacement and importer/seed/traversal identity agreement.
+Use deterministic fixture embeddings, never a model download. Exercise the
+existing MCP semantic-search entry point with a temporary populated SQLite
+graph, verify the session closes on success/error, injected stores remain
+caller-owned, legacy performs zero opens/calls, failed assembly preserves the
+legacy payload, and semantic write refusal leaves a prepopulated graph intact.
+Run focused tests, full regression, compile checks, diff and privacy review.
+
+No production/user-memory access, migration, event journal, dependency, new MCP
+tool, REST wiring, default switch, or automatic filling of the graph is allowed.
+The populated graph is an explicit fixture in this batch; production population
+remains a separate open target. Imported snapshots must not be combined with a
+partial event-stream ``rebuild``: that operation replaces the complete graph.
+
+Code rollback is a separate batch revert; no persistent production change is
+made to reverse here. A later production migration must restore vector and graph
+backups together, rather than claiming a reindex recovers old random row IDs.
+Disabling graph recall restores legacy responses without opening the graph.
 
 ## 13. Acceptance metrics
 
