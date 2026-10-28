@@ -1,6 +1,6 @@
 # Layered Memory MCP — Layered Memory Graph v1 Architecture
 
-> Status: IMPLEMENTATION BASELINE — Batch I-D complete; Batch J next
+> Status: IMPLEMENTATION BASELINE — Batch J complete; Batch K next
 > Branch: `refactor/memory-graph-v1`
 > Baseline commit: `668e402` (`chore: freeze pre-graph refactor baseline`)
 > Version: 3.6.0
@@ -881,15 +881,39 @@ I-D exit criteria:
 - the full existing test suite passes and default ``MemoryConfig()`` remains
   ``legacy``.
 
-### Batch J — measured shadow evaluation (planned)
+### Batch J — measured shadow evaluation (complete)
 
-- Run graph-assisted recall beside legacy recall on a fixed, isolated fixture
-  corpus and record result differences, stale-fact exposure, provenance
-  coverage, latency, and fallback rates.
-- Define acceptance thresholds from measured repository data, not vendor
-  benchmarks.
-- Keep the default mode `legacy` until the thresholds and rollback procedure
-  are accepted.
+Batch J adds an isolated, backend-neutral evaluation seam for running the
+existing graph-assisted recall beside the legacy answer on explicitly supplied
+fixture cases. It does not create a second recall path, read production
+configuration, discover real memory data, or write a graph store. The evaluator
+records:
+
+- identity, order, count, and legacy-payload-preservation comparisons;
+- returned graph result/node counts and fixture-grounded stale-node exposure;
+- provenance coverage with an explicit denominator and missing node IDs;
+- distinct graph-unavailable, graph-unused, and no-graph-material fallback
+  reasons with corpus-level rates;
+- per-case wall-clock latency and count/min/mean/p95/max summaries.
+
+Evaluation output is measurement input rather than an acceptance verdict: it
+does not embed thresholds, approval, or a cutover decision. Backend labels are
+bounded and provenance warning parsing is explicit, so paths, diagnostics,
+memory contents, and unknown warning fragments cannot enter the report.
+
+Accepted in commit ``564cce3`` (``feat: add measured graph shadow
+evaluation``):
+
+- focused Batch J tests: ``57 passed``;
+- full suite: ``1697 passed, 2 skipped``;
+- compile, diff, AST boundary, protected-path, and no-``uv.lock`` checks
+  passed;
+- security audit: ``0 CRITICAL / 0 HIGH / 0 MEDIUM`` (LOW results are existing
+  project-name/path matches).
+
+Batch J deliberately leaves the default mode as ``legacy``. Acceptance
+thresholds and any rollback decision remain a later governance step; no vendor
+benchmark is treated as repository evidence.
 
 ### Batch K — controlled default transition (planned)
 
