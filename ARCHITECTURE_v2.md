@@ -1125,6 +1125,101 @@ This is isolated runtime evidence, not production retrieval-quality evidence.
 Production population, a complete semantic event stream, broader measured
 acceptance, and an explicitly approved default cutover remain open targets.
 
+### Framework completion and migration delivery contract (authorized; pending)
+
+The next delivery is a working framework, followed by an executable migration
+tool, not another fixture-only seam. The user authorized repository changes on
+the existing branch. Production data access, installed-service changes, default
+cutover, and execution against real user memory remain explicitly excluded.
+
+#### Authority and write transaction
+
+Persist validated `MemoryEvent` records in an append-only SQLite journal with
+canonical payloads, stable request identity, ordered positions and explicit
+projection checkpoints. The journal records explicit caller semantic decisions;
+it is not a second independently editable knowledge database. The old changelog
+remains historical evidence, not a substitute semantic event stream. Existing
+import snapshots must be represented in the journal before a replacing rebuild.
+Preserve source evidence and do not manufacture historical events or certainty.
+
+Serialize concurrent commits; reject changed payloads under an existing request
+or event identity. Validate a proposed complete replay before accepting an
+invalid transition. Repeated identical requests must neither append duplicates
+nor lose previous graph material. Replaying from the journal after process
+restart must recover equivalent semantic state. Publish checkpoints only after
+their actual projection succeeds; report an accepted event with pending
+projections honestly instead of claiming an all-store transaction or discarding
+an accepted decision. Retry must converge and never overwrite a newer projection.
+
+Graph-write-enabled entry points must validate and commit through this authority
+before projection side effects. An entrance not supporting a semantic operation
+must refuse it before mutation, naming the supported alternative. Audit injection,
+batch injection, whole-file CRUD, review, cleanup/consolidation, REST CRUD,
+maintenance and task mutations for bypasses. Keep `legacy` the default and retain
+legacy/shadow compatibility; an explicit graph mode must work using configured
+persistent stores without injected test handles or a manually supplied event list.
+
+#### Projections and read paths
+
+Use one application layer to coordinate graph, readable L1, vector/BM25 and L0
+projections with stable identity, observable watermarks and recoverable failures.
+Do not silently merge legacy dedup/fusion decisions into explicit graph semantics.
+Caller Agent decides entity/claim relationships and lifecycle changes; the
+framework validates and applies them without text heuristics or model downloads.
+Document supported semantic node-to-surface mappings and refusal of unsupported
+mappings. External Skill files and externally owned tasks are not silently adopted
+or overwritten: expose explicit ownership and mutation boundaries. Framework-owned
+tasks must either follow the journal or reject incompatible writes before effects.
+
+Unify graph use for MCP `search_semantic`, MCP `recall_knowledge`, and REST
+`/knowledge/search`. Carry stable entry/seed identity from the actual producer,
+including ordinary Markdown, rather than guessing from text. A healthy graph's
+temporal/lifecycle/scope filters must affect the returned primary result, not just
+an optional sidecar. Preserve documented legacy results on safe unavailable-graph
+fallback; do not expose stale projections as current after accepted but unfinished
+writes. Request-owned handles close on success and error; caller-owned handles
+remain open. Keep policy in the shared layer instead of copying it into transports.
+
+#### Framework acceptance before migration implementation
+
+Exercise real MCP and HTTP entry points on temporary configured persistent stores
+with neutral evidence and deterministic fake embeddings. Verify two sequential
+commits retain earlier unrelated nodes, duplicate retry, conflicting retry,
+concurrent writers, restart/replay, supersession, contradiction, temporal/scope
+filtering, projection failure/recovery, and every mutating-entry bypass guard.
+Include negative controls and actual returned payload assertions. Run the complete
+existing regression suite, compilation, diff/scope checks and security review.
+Update obsolete assertions only where an intentional contract change explains
+the exact replacement behavior; never delete/skip or weaken meaningful tests.
+
+#### Migration tool (only after framework acceptance)
+
+Provide one operator CLI with explicit source and destination, read-only dry-run
+by default, explicit apply/verify/rollback, structured inventory and reports.
+Never auto-discover a user's store or switch their service/configuration. Inventory
+L1/frontmatter, vector rows and available historical evidence; account for every
+row as mapped, existing, missing, orphaned, conflicting or malformed. Reuse the
+versioned identity projector and legacy importer. Preserve explicit IDs, original
+source bytes and historical attribution; never infer old random identities using
+fuzzy text, file names or new UUIDs. Unresolvable identity is a blocking/quarantined
+finding, not a silent dropped row.
+
+Build a complete journal plus graph and aligned retrieval/readable projections in
+an isolated destination. Prefer a single staged generation and explicit publish
+boundary over pretending multiple SQLite files and Markdown share a transaction.
+Freeze source fingerprints, refuse drift before publication, validate every output
+and graph seed, retain backups/manifests, and make identical reruns no-ops. Refuse
+overlapping/symlink-escaped paths and unknown target contents. Recovery/rollback
+must not overwrite post-migration changes without explicit refusal. Dry-run must
+not write source or destination. Never physically delete old Markdown/vector rows.
+
+Independently execute dry-run, apply, verify, duplicate apply and rollback using a
+genuine old-format neutral fixture. Inject malformed inputs, conflicts, source
+drift, publication failures and changed-target rollback attempts. Report verified
+local capability separately from production migration and retrieval-quality gates.
+Maintain code/documentation commit separation; no production cutover or real-data
+migration is implied by framework or CLI acceptance.
+
 ## 13. Acceptance metrics
 
 No backend switch or default cutover is justified by architecture preference
