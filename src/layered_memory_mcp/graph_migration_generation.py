@@ -212,6 +212,12 @@ FINDING_ARTIFACT_MISSING = "artifact_missing"
 FINDING_ARTIFACT_UNEXPECTED = "artifact_unexpected"
 FINDING_ARTIFACT_HASH = "artifact_hash_mismatch"
 FINDING_ARTIFACT_SIZE = "artifact_size_mismatch"
+FINDING_SOURCE_FILES_UNREADABLE = "source_files_unreadable"
+FINDING_SOURCE_FILE_PATH = "source_file_path_rejected"
+FINDING_SOURCE_FILE_MISSING = "source_file_missing"
+FINDING_SOURCE_FILE_UNEXPECTED = "source_file_unexpected"
+FINDING_SOURCE_FILE_HASH = "source_file_hash_mismatch"
+FINDING_SOURCE_FILE_SIZE = "source_file_size_mismatch"
 FINDING_JOURNAL_UNREADABLE = "journal_unreadable"
 FINDING_JOURNAL_REQUEST = "journal_request_mismatch"
 FINDING_JOURNAL_COUNTS = "journal_count_mismatch"
@@ -464,14 +470,16 @@ def _walk_generation(root: Path) -> Iterator[tuple[str, str, Path]]:
 
 
 def generation_inventory(
-    root: Path,
+    root: Path, *, allow_sqlite_sidecars: bool = False
 ) -> tuple[dict[str, dict[str, Any]], list[str]]:
     """``({relative path: {size, sha256}}, findings)`` for a generation tree.
 
     The manifest's own two files are excluded, because they are what this
     inventory is compared *against*. A symlink, a special file or a leftover
     SQLite companion file is a finding: all three mean the tree is not the
-    closed, fully-hashed set of bytes a manifest claims.
+    closed, fully-hashed set of bytes a manifest claims. Source backups may
+    opt into sidecars because an empty sidecar can be a legitimate member of
+    the inventoried legacy source; published generation artifacts may not.
     """
     artifacts: dict[str, dict[str, Any]] = {}
     findings: list[str] = []
@@ -484,7 +492,9 @@ def generation_inventory(
             continue
         if relative in _MANIFEST_FILES:
             continue
-        if relative.endswith(_SQLITE_SIDECAR_SUFFIXES):
+        if relative.endswith(_SQLITE_SIDECAR_SUFFIXES) and not (
+            relative.startswith(f"{BACKUP_DIR}/") or allow_sqlite_sidecars
+        ):
             findings.append(f"{FINDING_GENERATION_SIDECAR}:{relative}")
             continue
         artifacts[relative] = {
@@ -588,6 +598,11 @@ def build_generation(
     if changelog.is_file():
         _copy_file(changelog, staging / CHANGELOG_RELATIVE)
         _copy_file(changelog, staging / BACKUP_DIR / SOURCE_CHANGELOG)
+    # The manifest records the complete source file inventory, including
+    # harmless empty SQLite sidecars. Preserve that exact set under backup so
+    # source_files verification has independent evidence for every declaration.
+    for item in snapshot.inventory.files:
+        _copy_file(snapshot.source / item.path, staging / BACKUP_DIR / item.path)
     invalidate_scan_cache(str(config.knowledge_dir))
 
     counts: dict[str, Any] = {}
@@ -863,6 +878,7 @@ class VerificationReport(GraphModel):
     graph_ok: bool = False
     replay_equal: bool = False
     surfaces_ok: bool = False
+    source_files_ok: bool = False
     vector_ok: bool = False
     counts_ok: bool = False
     generation_intact: bool = False
@@ -884,6 +900,58 @@ class VerificationReport(GraphModel):
 
 def _read_rows(path: Path) -> list[tuple]:
     return read_vector_rows(path)
+
+
+def _verify_source_files(
+    generation: Path, declared: Any
+) -> tuple[bool, list[str]]:
+    """Compare manifest source claims with the frozen source backup.
+
+    ``source_files`` is provenance, not a generation artifact: changing it does
+    not change any file under ``current/`` and therefore cannot be caught by the
+    ordinary artifact hash loop. The backup is the independent evidence used to
+    recompute this claim. Its paths are checked with the same containment rule
+    as artifact paths so a forged manifest cannot make verification read outside
+    the generation.
+    """
+    if not isinstance(declared, dict):
+        return False, [f"{FINDING_SOURCE_FILES_UNREADABLE}:not_a_mapping"]
+
+    backup = generation / BACKUP_DIR
+    if not backup.is_dir() or backup.is_symlink():
+        return False, [f"{FINDING_SOURCE_FILES_UNREADABLE}:backup_absent"]
+
+    actual, inventory_findings = generation_inventory(
+        backup, allow_sqlite_sidecars=True
+    )
+    findings = [
+        f"{FINDING_SOURCE_FILES_UNREADABLE}:{finding}"
+        for finding in inventory_findings
+    ]
+    declared_paths = set(declared)
+
+    for relative in sorted(declared_paths, key=str):
+        member = _safe_member(backup, relative)
+        if member is None:
+            findings.append(f"{FINDING_SOURCE_FILE_PATH}:{relative}")
+            continue
+        expected = declared[relative]
+        if not isinstance(expected, dict):
+            findings.append(f"{FINDING_SOURCE_FILES_UNREADABLE}:{relative}")
+            continue
+        observed = actual.get(relative)
+        if observed is None:
+            findings.append(f"{FINDING_SOURCE_FILE_MISSING}:{relative}")
+            continue
+        if expected.get("sha256") != observed["sha256"]:
+            findings.append(f"{FINDING_SOURCE_FILE_HASH}:{relative}")
+        if expected.get("size") != observed["size"]:
+            findings.append(f"{FINDING_SOURCE_FILE_SIZE}:{relative}")
+
+    for relative in sorted(set(actual) - declared_paths):
+        findings.append(f"{FINDING_SOURCE_FILE_UNEXPECTED}:{relative}")
+
+    return not findings, findings
 
 
 def verify_generation(
@@ -968,6 +1036,11 @@ def verify_generation(
         if expected.get("size") != actual["size"]:
             findings.append(f"{FINDING_ARTIFACT_SIZE}:{relative}")
             hashes_ok = False
+
+    source_files_ok, source_file_findings = _verify_source_files(
+        generation, manifest.get("source_files")
+    )
+    findings.extend(source_file_findings)
 
     # -- the journal --------------------------------------------------------
     journal_ok = False
@@ -1148,6 +1221,7 @@ def verify_generation(
         graph_ok=graph_ok,
         replay_equal=replay_equal,
         surfaces_ok=surfaces_ok,
+        source_files_ok=source_files_ok,
         vector_ok=vector_ok,
         counts_ok=counts_ok,
         generation_intact=not structural,

@@ -348,6 +348,20 @@ def test_dry_run_echoes_the_resolved_explicit_inputs(source, destination):
     assert "batch loader" not in serialized
 
 
+def test_plan_bootstrap_is_stable_for_the_same_source_snapshot(source, tmp_path):
+    first = graph_migration.plan_migration(
+        source=source, destination=tmp_path / "first"
+    )
+    second = graph_migration.plan_migration(
+        source=source, destination=tmp_path / "second"
+    )
+
+    assert first["bootstrap"] == second["bootstrap"]
+    assert first["bootstrap"]["recorded_at"] == (
+        "1970-01-01T00:00:00+00:00"
+    )
+
+
 def test_dry_run_leaves_an_existing_destination_untouched(source, destination):
     graph_migration.apply_migration(source=source, destination=destination)
     before = tree_state(destination)
@@ -424,6 +438,7 @@ def test_apply_publishes_a_verified_generation(source, destination):
         "graph_ok",
         "replay_equal",
         "surfaces_ok",
+        "source_files_ok",
         "vector_ok",
         "counts_ok",
         "generation_intact",
@@ -626,8 +641,10 @@ def test_an_empty_write_ahead_log_is_reported_not_refused(source, destination):
 
     assert report["status"] == graph_migration.STATUS_APPLIED
     assert "vector_sidecar_present:data/vectors.db-wal" in report["warnings"]
-    # The sidecar is inventoried and fingerprinted, and never copied.
+    # The sidecar is inventoried and fingerprinted. It is retained only in the
+    # source backup, never in the published projection artifact tree.
     assert not (generation(destination) / "data" / "vectors.db-wal").exists()
+    assert (generation(destination) / "backup" / "data" / "vectors.db-wal").is_file()
 
 
 def test_apply_reports_an_externally_owned_frontmatter_surface(source, destination):
@@ -1355,6 +1372,28 @@ def test_verify_detects_a_forged_manifest(source, destination):
 
     assert report["status"] == graph_migration.STATUS_VERIFY_FAILED
     assert "manifest_digest_mismatch" in report["findings"]
+
+
+def test_verify_detects_tampered_source_file_provenance(source, destination):
+    from layered_memory_mcp.graph_migration_generation import write_manifest
+
+    graph_migration.apply_migration(source=source, destination=destination)
+    root = generation(destination)
+    path = root / "manifest.json"
+    body = json.loads(path.read_text(encoding="utf-8"))
+    source_path = next(iter(body["source_files"]))
+    body["source_files"][source_path] = {"size": 999999, "sha256": "f" * 64}
+    # Re-sign the manifest so this exercises source_files verification rather
+    # than merely the manifest digest check.
+    write_manifest(root, body)
+
+    report = graph_migration.verify_migration(destination=destination)
+
+    assert report["status"] == graph_migration.STATUS_VERIFY_FAILED
+    assert report["verification"]["source_files_ok"] is False
+    assert any(
+        finding.startswith("source_file_") for finding in report["findings"]
+    )
 
 
 def test_verify_refuses_a_manifest_artifact_path_escape(source, destination):
