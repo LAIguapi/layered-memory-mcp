@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.6.0] - 2026-10-28
+
+### Added
+
+- Introduce the Layered Memory Graph v1 domain contracts, deterministic fixture
+  store, embedded SQLite adapter, legacy identity backfill seam, graph-assisted
+  recall seam, guarded semantic write seam, and explicit runtime modes. The
+  default remains `legacy`.
+- Add isolated measured shadow evaluation for legacy/graph recall preservation,
+  stale exposure, provenance coverage, fallback reasons, and bounded latency.
+- Add separated normal-path/fallback-path evaluation and SQLite close/reopen
+  parity checks against the existing graph-recall seam. These helpers produce
+  evidence inputs only; they do not change production defaults or claim a
+  cutover decision.
+
 ## [3.5.1] - 2026-10-25
 
 - Require an explicit proxy configuration for embedding-model bootstrap. The

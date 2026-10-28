@@ -1,6 +1,6 @@
 # Layered Memory MCP — Layered Memory Graph v1 Architecture
 
-> Status: IMPLEMENTATION BASELINE — Batch J complete; Batch K next
+> Status: IMPLEMENTATION BASELINE — Batch K evidence complete; K-C governance next
 > Branch: `refactor/memory-graph-v1`
 > Baseline commit: `668e402` (`chore: freeze pre-graph refactor baseline`)
 > Version: 3.6.0
@@ -915,12 +915,27 @@ Batch J deliberately leaves the default mode as ``legacy``. Acceptance
 thresholds and any rollback decision remain a later governance step; no vendor
 benchmark is treated as repository evidence.
 
-### Batch K — controlled default transition (planned)
+### Batch K — separated evaluation and persistent parity (complete)
 
 Batch K is split into evidence collection and a later governance decision. It
 must not turn a mixed corpus of healthy and degraded cases into one misleading
 quality number, and it must not treat an in-memory seam as evidence that the
 persistent runtime is ready.
+
+Accepted in commit ``4ff4d34`` (``feat: add separated graph evaluation and
+sqlite parity``):
+
+- focused Batch K tests: ``77 passed``;
+- full suite: ``1774 passed, 2 skipped``;
+- compile, diff, AST boundary, protected-path, no-``uv.lock``, and explicit
+  default-mode checks passed;
+- security audit: ``0 CRITICAL / 0 HIGH / 0 MEDIUM`` for both new files (LOW
+  results are existing project-name/path matches).
+
+The implementation is an isolated measurement helper. It accepts only explicit
+classified fixture cases and explicit database targets; it does not read
+configuration, environment variables, MCP state, or real memory data. It
+produces observations and comparisons, not a verdict or a default-mode change.
 
 #### K-A: separated shadow evaluation
 
@@ -941,6 +956,16 @@ meaningful only over normal-path cases whose provenance denominator is supplied.
 The corpus must contain positive and negative controls for stale exposure and
 provenance gaps, rather than relying on an all-clean fixture.
 
+The delivered evaluator keeps the normal and fallback aggregates separate while
+preserving per-case measurements and declared-vs-measured disagreements. On the
+neutral fixture used for acceptance, the normal class contains 2 cases: 3
+graph-assisted results, 0 fallback rate, 0 stale exposure cases, and 4/4
+provenance coverage. The fallback class contains 4 cases: 4/4 fallback rate,
+with reasons ``graph_unavailable`` (2), ``graph_unused`` (1), and
+``no_graph_material`` (1). Legacy identity/order/payload preservation is
+measured independently in both classes; these fixture numbers are evidence
+inputs, not universal quality claims.
+
 #### K-B: persistent-runtime shadow verification
 
 The same explicit neutral cases are rerun against a temporary
@@ -952,9 +977,20 @@ fallback behavior, and bounded output. It must also verify that the runtime
 assembly reaches the persistent store only in an explicit graph mode; default
 ``MemoryConfig()`` remains ``legacy`` and performs zero graph calls.
 
+The delivered parity helper supports explicit nodes/edges or an explicit
+``MemoryEvent`` stream, writes a temporary SQLite fixture, closes the writer,
+reopens the same database, and invokes the existing graph-recall seam. On the
+acceptance fixture, the stores matched on every compared bounded field, both
+snapshots remained unchanged during recall, backend labels were bounded, and
+the writer-close/reopen evidence was true. Backend label and latency are
+recorded but deliberately excluded from equality because adapters and storage
+media differ. The helper refuses blank or ``:memory:`` targets, implicit modes,
+and ambiguous fixture sources.
+
 #### K-C: cutover gate and rollback record
 
-Only after K-A and K-B produce reproducible evidence may a separate review set
+K-A and K-B now produce reproducible fixture evidence. Only after this evidence
+has been independently expanded and reviewed may a separate review set
 the cutover gates. The gate must state, with denominators:
 
 - normal-path legacy identity/order/payload preservation;
@@ -965,12 +1001,17 @@ the cutover gates. The gate must state, with denominators:
 - write-path readiness, including ownership of the complete ``MemoryEvent``
   stream (currently **not met**).
 
-No threshold is invented from the current five-case fixture. A failed gate
-keeps the default at ``legacy``. If a future explicit opt-in is enabled, the
-rollback record must name the configuration change, the previous mode, the
-graph-store snapshot/backup boundary, and the verification that legacy recall
-is restored after disabling the opt-in. Removing obsolete paths remains out of
-scope until an explicit equivalence or intentional behavior-change record.
+No threshold is invented from the current six-case K-A fixture or the single
+K-B parity fixture. K-C remains open: the repository still needs a broader,
+reviewed corpus, explicit threshold decisions, a latency aggregate across
+repeated in-memory and SQLite runs, and ownership of the complete
+``MemoryEvent`` stream for graph writes. Until those are met, the default stays
+``legacy`` and no production configuration is changed. If a future explicit
+opt-in is enabled, the rollback record must name the configuration change, the
+previous mode, the graph-store snapshot/backup boundary, and the verification
+that legacy recall is restored after disabling the opt-in. Removing obsolete
+paths remains out of scope until an explicit equivalence or intentional
+behavior-change record.
 
 ## 13. Acceptance metrics
 
