@@ -6,6 +6,7 @@ import json
 import os
 import sqlite3
 import stat
+import unicodedata
 from uuid import uuid4
 
 import pytest
@@ -14,6 +15,7 @@ from layered_memory_mcp import graph_migration
 from layered_memory_mcp import graph_migration_generation as generation_module
 from layered_memory_mcp.graph_migration_inventory import read_source_snapshot, read_vector_rows
 from layered_memory_mcp.graph_seed_metadata import graph_node_id_for_entry_id
+from layered_memory_mcp.heading import embedding_heading
 
 from test_v361_graph_migration import (
     _changelog_line,
@@ -116,6 +118,165 @@ def test_exact_declared_section_maps_random_legacy_identity(tmp_path):
     assert metadata["section"] == entries[0].section
 
 
+@pytest.mark.parametrize("section", [
+    "Neutral section",
+    "Neutral section — 2026-10-01 v1.2 (neutral note)",
+    "2026-10-01",
+])
+def test_legacy_embedding_projection_maps_with_distinct_automatic_reason(tmp_path, section):
+    document = f"## {section}\n\nA neutral café sample.\n"
+    source, entries, legacy = legacy_source(
+        tmp_path, document=document, changes={"id": "legacy-projection"}
+    )
+    candidate = entries[0]
+    projected = f"{embedding_heading(candidate.section)}\n{candidate.content}"
+    write_legacy_rows(source, [legacy.model_copy(update={"content": projected})])
+    metadata = {"section": candidate.section, "unrelated": "kept"}
+    set_metadata(source, legacy.id, metadata)
+    before = tree_state(source)
+
+    snapshot = read_source_snapshot(source)
+
+    assert tree_state(source) == before
+    assert snapshot.inventory.counts_balance
+    verdict = snapshot.inventory.to_payload()["classifications"][0]
+    assert verdict["category"] == "mapped"
+    assert snapshot.publishable, snapshot.inventory.findings
+    assert snapshot.inventory.counts_by_category["mapped"] == 1
+    assert verdict["row_id"] == legacy.id
+    assert verdict["mapping_origin"] == "automatic"
+    assert verdict["candidate_count"] == 1
+    assert verdict["target_entry_id"] == candidate.id
+    assert verdict["reason"] != "mapped_by_exact_identity"
+    assert any(
+        label in verdict["reason"] for label in ("embedding", "projection", "compatibility")
+    )
+    expected = graph_node_id_for_entry_id(candidate.id)
+    assert verdict["expected_graph_node_id"] == expected
+    assert snapshot.identity_map == {}
+    assert snapshot.automatic_identity_map == {legacy.id: candidate.id}
+    assert snapshot.identity_map_updates == {
+        legacy.id: (expected, {**metadata, "graph_node_id": expected})
+    }
+
+
+@pytest.mark.parametrize("variant", [
+    "arbitrary_prefix",
+    "altered_body",
+    "trailing_byte",
+    "body_whitespace",
+    "heading_whitespace",
+    "unicode_normalized_body",
+    "wrong_section_prefix",
+])
+def test_legacy_embedding_projection_rejects_nonexact_text(tmp_path, variant):
+    source, entries, legacy = legacy_source(
+        tmp_path, changes={"id": "legacy-projection"}
+    )
+    candidate = entries[0]
+    prefix = embedding_heading(candidate.section)
+    body = candidate.content
+    projected = f"{prefix}\n{body}"
+    texts = {
+        "arbitrary_prefix": f"Arbitrary prefix\n{body}",
+        "altered_body": f"{prefix}\nAn altered neutral café sample.",
+        "trailing_byte": projected + "\n",
+        "body_whitespace": f"{prefix}\n {body}",
+        "heading_whitespace": f"{prefix} \n{body}",
+        "unicode_normalized_body": f"{prefix}\n{unicodedata.normalize('NFD', body)}",
+        "wrong_section_prefix": f"{embedding_heading('Wrong section')}\n{body}",
+    }
+    stored_text = texts[variant]
+    assert stored_text.encode("utf-8") != projected.encode("utf-8")
+    write_legacy_rows(source, [legacy.model_copy(update={"content": stored_text})])
+    before = tree_state(source)
+
+    snapshot = read_source_snapshot(source)
+
+    assert tree_state(source) == before
+    assert not snapshot.publishable
+    assert snapshot.inventory.counts_balance
+    assert snapshot.inventory.counts_by_category["mapped"] == 0
+    verdict = snapshot.inventory.classifications[0]
+    assert verdict.category == "orphaned"
+    assert verdict.reason == "identity_text_mismatch"
+    assert verdict.candidate_count == 1
+    assert verdict.mapping_origin == "automatic"
+    assert snapshot.identity_map == {}
+    assert snapshot.automatic_identity_map == {}
+    assert snapshot.identity_map_updates == {}
+
+
+@pytest.mark.parametrize("domain, metadata, duplicate, reason, count", [
+    ("elsewhere", {"section": "Neutral section"}, False, "identity_section_not_found", 0),
+    ("Neutral", {"section": "Neutral section"}, False, "identity_section_not_found", 0),
+    ("neutral", {}, False, "identity_section_missing", 0),
+    ("neutral", {"section": "Wrong section"}, False, "identity_section_not_found", 0),
+    ("neutral", {"section": "Neutral section"}, True, "identity_section_ambiguous", 2),
+])
+def test_legacy_embedding_projection_requires_unique_domain_and_declared_section(
+    tmp_path, domain, metadata, duplicate, reason, count
+):
+    document = DOCUMENT
+    if duplicate:
+        document += "\n## Neutral section\n\nA different neutral body.\n"
+    source, entries, legacy = legacy_source(
+        tmp_path, document=document, changes={"id": "legacy-projection", "domain": domain}
+    )
+    candidate = entries[0]
+    projected = f"{embedding_heading(candidate.section)}\n{candidate.content}"
+    write_legacy_rows(source, [legacy.model_copy(update={"content": projected})])
+    set_metadata(source, legacy.id, metadata)
+    before = tree_state(source)
+
+    snapshot = read_source_snapshot(source)
+
+    assert tree_state(source) == before
+    assert not snapshot.publishable
+    assert snapshot.inventory.counts_balance
+    assert snapshot.inventory.counts_by_category["mapped"] == 0
+    verdict = snapshot.inventory.classifications[0]
+    assert verdict.category == "orphaned"
+    assert verdict.reason == reason
+    assert verdict.candidate_count == count
+    assert verdict.mapping_origin == "automatic"
+    assert snapshot.identity_map == {}
+    assert snapshot.automatic_identity_map == {}
+    assert snapshot.identity_map_updates == {}
+
+
+@pytest.mark.parametrize("stored, category", [
+    ({"graph_node_id": None}, "malformed"),
+    ({"graph_node_id": "claim:other"}, None),
+    ({"graph_node_ids": ["claim:other"]}, None),
+])
+def test_legacy_embedding_projection_preserves_stored_graph_safeguards(
+    tmp_path, stored, category
+):
+    source, entries, legacy = legacy_source(
+        tmp_path, changes={"id": "legacy-projection"}
+    )
+    candidate = entries[0]
+    projected = f"{embedding_heading(candidate.section)}\n{candidate.content}"
+    write_legacy_rows(source, [legacy.model_copy(update={"content": projected})])
+    set_metadata(source, legacy.id, {"section": candidate.section, **stored})
+    before = tree_state(source)
+
+    snapshot = read_source_snapshot(source)
+
+    assert tree_state(source) == before
+    assert not snapshot.publishable
+    assert snapshot.inventory.counts_balance
+    assert snapshot.inventory.counts_by_category["mapped"] == 0
+    verdict = snapshot.inventory.classifications[0]
+    assert verdict.category != "mapped"
+    if category is not None:
+        assert verdict.category == category
+    assert snapshot.identity_map == {}
+    assert snapshot.automatic_identity_map == {}
+    assert snapshot.identity_map_updates == {}
+
+
 def test_duplicate_automatic_proposals_both_remain_unresolved(tmp_path):
     source, entries, legacy = legacy_source(tmp_path)
     other = legacy.model_copy(update={"id": str(uuid4())})
@@ -158,9 +319,16 @@ def test_explicit_map_never_overwrites_bad_stored_graph_fields(tmp_path, stored,
     assert snapshot.automatic_identity_map == {}
 
 
-def test_end_to_end_origins_preserved_payloads_noop_and_retained_rollback(tmp_path):
+@pytest.mark.parametrize("embedding_projection", [False, True])
+def test_end_to_end_origins_preserved_payloads_noop_and_retained_rollback(
+    tmp_path, embedding_projection
+):
     document = DOCUMENT + "\n## Second section\n\nAnother neutral sample.\n"
     source, entries, automatic = legacy_source(tmp_path, document=document)
+    if embedding_projection:
+        automatic = automatic.model_copy(update={
+            "content": f"{embedding_heading(automatic.section)}\n{automatic.content}"
+        })
     declared = entries[1].model_copy(update={
         "id": str(uuid4()), "content": "An operator-declared older sample."
     })
@@ -183,6 +351,14 @@ def test_end_to_end_origins_preserved_payloads_noop_and_retained_rollback(tmp_pa
     assert not destination.exists()
     assert planned["inventory"]["automatic_identity_map_entries"] == 1
     assert planned["inventory"]["identity_map_entries"] == 1
+    automatic_verdict = next(
+        row for row in planned["inventory"]["classifications"]
+        if row["row_id"] == automatic.id
+    )
+    assert automatic_verdict["reason"] == (
+        "mapped_by_exact_embedding_projection" if embedding_projection
+        else "mapped_by_exact_identity"
+    )
     applied = graph_migration.apply_migration(
         source=source, destination=destination, identity_map=mapping
     )
@@ -220,14 +396,21 @@ def test_end_to_end_origins_preserved_payloads_noop_and_retained_rollback(tmp_pa
     assert tree_state(source) == before_tree
 
 
+@pytest.mark.parametrize("embedding_projection", [False, True])
 @pytest.mark.parametrize("forgery", [
     "origin", "candidate_count", "automatic_target", "explicit_collision",
     "missing_provenance", "missing_automatic_map", "unrelated_metadata", "swapped_seeds",
-    "malformed_metadata", "category_counts", "malformed_seed",
+    "malformed_metadata", "category_counts", "malformed_seed", "mapping_reason",
 ])
-def test_verification_rederives_identity_evidence_after_manifest_rehash(tmp_path, forgery):
+def test_verification_rederives_identity_evidence_after_manifest_rehash(
+    tmp_path, forgery, embedding_projection
+):
     document = DOCUMENT + "\n## Second section\n\nAnother neutral sample.\n"
     source, entries, first = legacy_source(tmp_path, document=document)
+    if embedding_projection:
+        first = first.model_copy(update={
+            "content": f"{embedding_heading(first.section)}\n{first.content}"
+        })
     second = entries[1].model_copy(update={"id": str(uuid4())})
     write_legacy_rows(source, [first, second])
     destination = tmp_path / "destination"
@@ -238,6 +421,15 @@ def test_verification_rederives_identity_evidence_after_manifest_rehash(tmp_path
     assert not findings
     if forgery == "origin":
         manifest["provenance"]["identity_bridge"]["rows"][0]["mapping_origin"] = "explicit"
+    elif forgery == "mapping_reason":
+        verdict = next(
+            row for row in manifest["provenance"]["identity_bridge"]["rows"]
+            if row["row_id"] == first.id
+        )
+        verdict["reason"] = (
+            "mapped_by_exact_identity" if embedding_projection
+            else "mapped_by_exact_embedding_projection"
+        )
     elif forgery == "candidate_count":
         manifest["provenance"]["identity_bridge"]["rows"][0]["candidate_count"] = 2
     elif forgery == "automatic_target":
@@ -294,7 +486,7 @@ def test_verification_rederives_identity_evidence_after_manifest_rehash(tmp_path
     ({"content": " A neutral café sample."}, {"section": "Neutral section"}, "identity_text_mismatch", 1),
     ({"content": "A neutral café sample.\n"}, {"section": "Neutral section"}, "identity_text_mismatch", 1),
     ({"content": "A neutral cafe\u0301 sample."}, {"section": "Neutral section"}, "identity_text_mismatch", 1),
-    ({"content": "Neutral section\nA neutral café sample."}, {"section": "Neutral section"}, "identity_text_mismatch", 1),
+    ({"content": "Arbitrary prefix\nA neutral café sample."}, {"section": "Neutral section"}, "identity_text_mismatch", 1),
 ])
 def test_automatic_correspondence_is_exact_and_requires_declared_section(
     tmp_path, changes, metadata, reason, count

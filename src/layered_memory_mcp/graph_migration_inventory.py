@@ -96,6 +96,7 @@ from .graph_entry_identity import ProjectionIdentityError, markdown_section_entr
 from .graph_models import GraphModel
 from .graph_runtime import GRAPH_SEED_ID_KEY
 from .graph_seed_metadata import graph_node_id_for_entry_id
+from .heading import embedding_heading
 from .memory_changelog import MemoryChangelogEntry
 from .models import KnowledgeEntry
 
@@ -274,6 +275,7 @@ DETAIL_VECTOR_DIMENSION = "vector_dimension_unexpected"
 #: The reason token for a row an explicit mapping resolved.
 REASON_MAPPED_BY_IDENTITY_MAP = "mapped_by_identity_map"
 REASON_MAPPED_BY_EXACT_IDENTITY = "mapped_by_exact_identity"
+REASON_MAPPED_BY_EXACT_EMBEDDING_PROJECTION = "mapped_by_exact_embedding_projection"
 
 
 # ---------------------------------------------------------------------------
@@ -1023,7 +1025,7 @@ def _automatic_identities(
             or verdict.category in PUBLISHABLE_CATEGORIES
         )
     }
-    proposals: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+    proposals: dict[str, list[tuple[int, dict[str, Any], str]]] = {}
     resolved: dict[str, str] = {}
     for position, verdict in enumerate(classifications):
         if verdict.category != CATEGORY_ORPHANED:
@@ -1048,10 +1050,17 @@ def _automatic_identities(
             verdict.reason = "identity_section_ambiguous"
             continue
         candidate = candidates[0]
-        if (
-            not isinstance(row[2], str)
-            or row[2].encode("utf-8") != candidate.entry.content.encode("utf-8")
-        ):
+        if not isinstance(row[2], str):
+            verdict.reason = "identity_text_mismatch"
+            continue
+        text = row[2].encode("utf-8")
+        if text == candidate.entry.content.encode("utf-8"):
+            mapping_reason = REASON_MAPPED_BY_EXACT_IDENTITY
+        elif text == (
+            f"{embedding_heading(candidate.section)}\n{candidate.entry.content}"
+        ).encode("utf-8"):
+            mapping_reason = REASON_MAPPED_BY_EXACT_EMBEDDING_PROJECTION
+        else:
             verdict.reason = "identity_text_mismatch"
             continue
         target = candidate.entry_id
@@ -1065,10 +1074,10 @@ def _automatic_identities(
             verdict.reason = checked.reason
             verdict.details = list(checked.details)
             continue
-        proposals.setdefault(target, []).append((position, metadata))
+        proposals.setdefault(target, []).append((position, metadata, mapping_reason))
     for target, claims in sorted(proposals.items()):
         node_id = graph_node_id_for_entry_id(target)
-        for position, metadata in claims:
+        for position, metadata, mapping_reason in claims:
             verdict = classifications[position]
             if node_id in reserved or len(claims) != 1:
                 verdict.category = CATEGORY_CONFLICTING
@@ -1081,7 +1090,7 @@ def _automatic_identities(
             updates[verdict.row_id] = (node_id, {**metadata, GRAPH_SEED_ID_KEY: node_id})
             classifications[position] = verdict.model_copy(update={
                 "category": CATEGORY_MAPPED,
-                "reason": REASON_MAPPED_BY_EXACT_IDENTITY,
+                "reason": mapping_reason,
             })
     return resolved
 
