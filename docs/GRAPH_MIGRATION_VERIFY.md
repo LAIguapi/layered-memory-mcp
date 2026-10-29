@@ -268,3 +268,40 @@ backfill、entry-ID producer、metadata-only 原子更新机制保持不变。
 
 结论仅为身份桥接隔离验收通过。真实语料 reader 兼容性诊断、完整生产副本
 演练、默认切换、update 接入、服务激活与远端发版仍未完成。
+
+## 11. Batch 3：L0 evidence-only 边界与窄兼容回归
+
+本批把 `L0.md` 的迁移语义固定为 **evidence-only**：快照适配器可以把它
+复制到 `evidence/L0.md`，用于源文件 provenance、hash 和零写核验；它不是
+旧格式 L1 知识输入，不参与 section projection、graph node bootstrap、vector
+identity bridge 或可读 surface binding。因而在直接对旧格式源执行 migration
+inventory/plan 时，`source_unsupported_record:L0.md` 是预期的阻断 finding，
+不得通过删除 L0、把它伪装成 L1、关闭 `section_reader_findings()` 或放宽
+source allowlist 来消除。
+
+该边界的验收要求是：一个除此之外完整、结构合法的中性旧格式源，只加入
+`L0.md` 后，plan 仍然 fail closed；目标目录不创建，源成员、字节和 mtime
+不变，报告不包含 L0 正文。snapshot adapter 的正向 evidence 复制测试与
+migration planner 的负向阻断测试分别覆盖这两个不同语义，不能用其中一个
+替代另一个。
+
+本批窄兼容契约已先文档化并提交：
+
+- `139107d docs: specify legacy embedding projection compatibility`
+- 仅接受 `embedding_heading(section) + "\\n" + canonical body` 的精确 UTF-8
+  前缀；不接受任意前缀、空白/大小写/Unicode 归一化、尾随字节、子串或相似度。
+- `4a72bb4 feat: bridge exact legacy embedding projections` 只在 domain、声明
+  section 和 section 内唯一候选门禁通过后建立 derived map。
+
+父流程独立验收结果：
+
+- 身份桥接 focused：18 passed；身份测试文件：115 passed。
+- 迁移集合（migration、CLI、snapshot、identity）：314 passed。
+- 独立反向探针：`legacy-prefix-independent-probe.py`，`probe_exit=0`；
+  自建中性 Markdown 和手工旧 schema SQLite，不复用测试 fixture，覆盖 plan
+  零写、精确前缀映射、变体拒绝、apply、verify、重复 apply no-op 和 rollback。
+- 契约化快照重跑：590/590 vector rows 自动精确映射，`orphaned=0`；唯一
+  finding 为预期的 `source_unsupported_record:L0.md`。这证明 L0 evidence-only
+  阻断仍有效，同时证明窄兼容没有把 590 条旧向量行误留为 orphan。
+
+本批仍不代表生产迁移、默认 graph mode、服务激活、update 接入或远端发版已完成。
