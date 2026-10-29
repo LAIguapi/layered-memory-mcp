@@ -24,7 +24,7 @@
 
 未验证、也未声称完成：
 
-- 真实 `/root/.layered-memory` 或其他用户记忆目录迁移。
+- 任何真实生产用户记忆目录（operator 自有的真实 memory store 路径）的迁移。
 - 生产 graph population、默认 graph mode 切换、服务重启或 cutover。
 - 大规模真实语料的性能、p95、容量和检索质量门槛。
 - 跨文件系统 rename 的原子性；工具只依赖同一文件系统内的目录 rename 语义。
@@ -44,24 +44,30 @@
 
 ## 3. 隔离样本生命周期证据
 
-父流程独立探针：本地 scratch 证据文件 `migration-five-gates-final.json`
+父流程独立生产探针：本地 scratch 证据文件
+`migration-independent-production-probe.json`，运行日志为
+`migration-independent-production-probe-run.txt`。
+
+该探针不导入测试模块、fixture 或测试断言；它自建中性 Markdown、SQLite
+向量库和 changelog，只调用迁移生产模块与真实 `VectorStore` 写入路径。
 
 关键结果：
 
 | 门槛 | 结果 | 证据 |
 |---|---|---|
-| plan 前目标不存在 | 通过 | `pre_destination_absent: true` |
-| plan 零写 | 通过 | `destination_absent_after: true`、`source_unchanged: true` |
-| frontmatter 外部 ownership | 通过 | `external_surfaces: [entry-pipeline-0001]`、`surface_registered: false` |
-| 显式 ID 的 graph/vector 对齐 | 通过 | `vector_seed_matches: true` |
-| 源只读 | 通过 | apply 后 `source_unchanged_after_apply: true` |
-| bootstrap 确定性 | 通过 | 两次 report 和 event payload 均相等 |
-| verify | 通过 | `verify_status: migration_verified`、`verify_ok: true`、`source_files_ok: true` |
-| rollback | 通过 | current 消失、withdrawn path 存在、源仍未变化 |
+| plan 前目标不存在 | 通过 | `plan: migration_planned` |
+| plan 零写 | 通过 | `dry_run_zero_write: true` |
+| apply 验证与源只读 | 通过 | `apply_verified_and_source_unchanged: true` |
+| 重复 apply 幂等零写 | 通过 | `duplicate: migration_already_published`、`idempotent_zero_write: true` |
+| verify 只读 | 通过 | `verify: migration_verified`、`verify_read_only: true` |
+| rollback 保留产物 | 通过 | `rollback: migration_rolled_back`、`rollback_retains_artifacts: true` |
+| 重复 rollback 幂等零写 | 通过 | `repeat_rollback: migration_rollback_nothing_published` |
+| 篡改 generation 拒绝 | 通过 | `tamper_verify: migration_verify_failed` |
+| 源漂移拒绝 | 通过 | `source_drift_verify: migration_source_drift` |
+| 未知目标内容零写拒绝 | 通过 | `unknown_destination: migration_destination_refused`、`unknown_destination_rejected_without_write: true` |
 
-补充完整生命周期证据：本地 scratch 证据文件 `migration-parent-acceptance-probe.json`。
-该探针还覆盖了重复 apply、重复 rollback、源 tree state 前后相等和 frontmatter ownership 保留。
-当前 HEAD 的独立回归还确认：同一源快照的重复 `plan_migration()` bootstrap 报告稳定；重签后篡改 `source_files` 会被核验拒绝。
+旧的 `migration-parent-acceptance-probe.json` 复用了测试 fixture builder，
+不再作为独立验收证据；保留它仅作为历史审计材料。
 
 ## 4. 不兼容语料的 fail-closed 证据
 
@@ -172,34 +178,25 @@ frontmatter 条目的 `created_at`/`updated_at` 继续保留其 authored 语义�
 
 ### 聚焦迁移测试
 
-证据：本地 scratch 证据文件 `migration-focused-final-rerun.txt`
+证据：本地 scratch 证据文件 `migration-focused-parent.log`
 
 ```text
-86 passed in 11.13s
+107 passed
 exit=0
 ```
 
-### 系统解释器全量回归
+### 独立生产探针
 
-证据：本地 scratch 证据文件 `migration-full-usr-final-rerun.txt`
-
-```text
-2180 passed in 33.17s
-exit=0
-```
-
-该解释器包含 REST 测试依赖，因此没有用 skip 代替通过。
-
-### 默认解释器全量回归
-
-证据：本地 scratch 证据文件 `migration-full-default-final-rerun.txt`
+证据：本地 scratch 证据文件 `migration-independent-production-probe-run.txt`
+和 `migration-independent-production-probe.json`
 
 ```text
-2154 passed, 17 skipped in 35.89s
-exit=0
+status: PASS
+probe_exit=0
 ```
 
-17 个 skip 来自默认环境缺少可选依赖；系统解释器的 2180 passed / 0 skipped 才是本批完整回归结论。
+该探针在隔离 `HOME`、`XDG_CACHE_HOME` 和离线模型标志下运行；向量使用
+确定性本地 embedding seam，不下载模型，也不连接真实服务。
 
 ### 编译与空白检查
 
