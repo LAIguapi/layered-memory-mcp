@@ -220,8 +220,51 @@ PYTHONPATH=src python -m layered_memory_mcp.graph_migration \
 
 ## 9. 当前未处理项
 
-- 生产数据迁移仍冻结，真实目录未读取、未写入、未枚举。
+- 生产数据迁移仍冻结。本记录早期隔离验收未访问真实目录；后续获批的真实副本严格预演安全拒绝，未 apply。身份桥接实现与验收只使用中性样本，未访问或修改生产目录。
 - 默认 `graph_mode` 仍为 `legacy`。
 - `pyproject.toml` 尚未新增 graph migration console script；当前稳定入口是显式的 `python -m ...`。
 - 仓外 Agent 工作目录中的越界记忆文件不属于本批迁移产物，本批未删除或修改；需要单独授权和单独审计。
 - 本文档记录的是本地隔离能力验收，不是生产 cutover runbook，也不构成“已迁移真实记忆”的声明。
+
+## 10. Batch 2：旧向量身份桥接验收
+
+范围：仅迁移 inventory、generation 和新增身份桥接测试。已有 row-ID
+backfill、entry-ID producer、metadata-only 原子更新机制保持不变。
+
+- 无法由行自身 ID 解析的合法旧行，只有 domain、声明的 metadata section、
+  UTF-8 projection body 完全一致且 section 内候选唯一时才自动映射。
+- 不做空白、大小写或 Unicode 归一化，不使用相似度；重复 section、重复目标
+  claim、已占用目标、畸形或冲突 graph metadata 均阻断，不丢弃旧行。
+- 显式 operator map 与自动 map 分别记录来源；manifest 带逐行来源证据。
+  verify 从冻结 backup 重算盘点、映射、seed 和 metadata，拒绝伪造来源、
+  候选数、目标或碰撞声明，即使重新计算 manifest digest。
+- 只更新 staged generation 的 metadata，保留原 row ID/domain/text/vector，
+  保留无关 metadata，冻结 backup 与源内容一致。
+- I/O 继续使用原有普通文件读取、SQLite `mode=ro&immutable=1` 与 copyfile；
+  不引入 Linux noatime/memfd、SQLite deserialize 或整库内存镜像要求。
+  零写断言覆盖成员、内容、inode/mode/size/mtime/ctime，不把读产生的 atime
+  更新当作写入，也不主动恢复时间戳。
+
+父流程真实执行结果：
+
+- 六文件聚焦回归：383 passed，0 skipped；其中新增 identity 测试 83 项。
+- 独立中性探针：36 项检查 PASS。探针手写 SQLite 旧格式输入，不导入 tests
+  或 fixture；证明随机旧 ID 确实进入 automatic/explicit 两条分支。
+- 探针在 apply 前断言 plan 零写；执行 apply → verify → 重复 apply 无写 →
+  retained rollback，逐行比较 text/vector 载荷和完整 metadata，确认源不变。
+- 阴性对照：错 domain、缺 section、空白差异、重复 claim、畸形 graph 字段、
+  冲突 graph 字段、已占用目标均阻断，行计数平衡且源/目标零写。
+- 父 checkout 全量隔离离线回归：2569 passed、16 skipped、4 failed。
+  四项均依赖缺失的 embedding 模型；未安装模型、未用 fake 结果替代全量结果。
+  首轮另外一项 ephemeral-home 失败在未改代码的基线复现；将 basetemp 放进
+  TMPDIR 后通过，无产品代码或原测试变更。
+- compile 与 diff-check：exit 0。原有测试文件未修改。
+
+本地证据名：`identity-parent.CBN2Gc/pytest.log`、
+`identity-parent-final.jL1n8i/{pytest,probe}.log`、
+`identity-baseline-five.UBsT23/pytest.log`、`identity-independent-probe.py`。
+证据位于 operator scratch，不随公开仓库分发。测试仅实测 Linux/Python 3.12；
+未宣称原生 Python 3.10、Windows 或 macOS 已运行通过。
+
+结论仅为身份桥接隔离验收通过。真实语料 reader 兼容性诊断、完整生产副本
+演练、默认切换、update 接入、服务激活与远端发版仍未完成。

@@ -1414,7 +1414,10 @@ successful isolated migration.
 ### Production snapshot adaptation — approved staged implementation
 
 Status: Batch 1 implemented in `77ddcd7` and independently accepted (183 focused
-tests plus a separately authored zero-write/copy probe); Batch 2 pending. The strict
+tests plus a separately authored zero-write/copy probe); Batch 2 independently
+accepted (383 focused tests and a separately authored 36-check identity probe).
+The full isolated offline run retains four model-cache-dependent failures;
+neither batch establishes production cutover or release readiness. The strict
 migration source layout remains unchanged. A separate, explicit snapshot
 adapter prepares a bundle with `source/` (migration inputs), `evidence/`
 (original L0 if present), and a versioned manifest outside `source/`.
@@ -1444,8 +1447,8 @@ as production-cutover-ready. SQLite native backup and coordinated writer fencing
 remain separate work where necessary. Repeat creation refuses an existing target
 without writing rather than overwriting or silently recopying it.
 
-Batch 2 will bridge legacy vector identities using unique exact domain, declared
-section and projection-text correspondence, producing an auditable explicit map
+Batch 2 bridges legacy vector identities using unique exact domain, declared
+section and projection-text correspondence, producing an auditable derived map
 to existing canonical graph identities. It must preserve row IDs, text and
 embedding bytes, reject ambiguous/stale maps and retain unresolved rows. Missing
 graph metadata alone does not prove a row orphaned; identity resolution must
