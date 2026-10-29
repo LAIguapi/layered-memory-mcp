@@ -1411,6 +1411,57 @@ contract. Production execution, installed-service activation and remote release
 must each be reported with their own read-back evidence, never inferred from a
 successful isolated migration.
 
+### Production snapshot adaptation — approved staged implementation
+
+Status: approved contract; implementation and acceptance pending. The strict
+migration source layout remains unchanged. A separate, explicit snapshot
+adapter prepares a bundle with `source/` (migration inputs), `evidence/`
+(original L0 if present), and a versioned manifest outside `source/`.
+
+Batch 1 accepts only operator-supplied source and new snapshot roots. Its
+default plan inventories without creating directories. Explicit creation copies
+top-level L1 Markdown, the vector database, and optional changelog into a private
+staging bundle, compares deterministic per-file membership, size, mtime and
+SHA-256 before and after copying, verifies copied payloads, and publishes by a
+single same-filesystem rename. Source changes or copy faults never publish a
+ready snapshot; staging debris is reported and retained. Source files are never
+rewritten, checkpointed, locked or deleted by the adapter.
+
+Configuration, credentials, model caches, repository metadata, auxiliary stores,
+backups, locks and maintenance state are excluded through one centralized policy.
+Exclusions are recorded by relative path/category, without opening their contents
+or traversing excluded subtrees. Unexpected knowledge subtrees are explicit
+coverage blockers, not silently discarded memory. Symlinks, special files,
+overlapping roots, existing targets, missing required inputs and nonempty SQLite
+WAL/journal files fail closed before publication. No default-home discovery,
+configuration loading, service probing or automatic writer suspension is allowed.
+
+An unchanged-copy result is observational stability, not proof of cross-file
+transactional consistency. Reports must distinguish `observed_stable` from an
+externally established write barrier; this batch does not certify a live store
+as production-cutover-ready. SQLite native backup and coordinated writer fencing
+remain separate work where necessary. Repeat creation refuses an existing target
+without writing rather than overwriting or silently recopying it.
+
+Batch 2 will bridge legacy vector identities using unique exact domain, declared
+section and projection-text correspondence, producing an auditable explicit map
+to existing canonical graph identities. It must preserve row IDs, text and
+embedding bytes, reject ambiguous/stale maps and retain unresolved rows. Missing
+graph metadata alone does not prove a row orphaned; identity resolution must
+trace the row ID and current L1 producer. No fuzzy or embedding matching.
+
+Batch 3 diagnoses projection/canonical reader disagreements without printing
+memory bodies or headings. Parser defects are fixed generically with neutral
+fixtures; external ownership is never invented merely to bypass a failed gate.
+Production documents are not modified by this implementation batch.
+
+Acceptance proceeds snapshot → identity report → plan → staged apply → verify
+→ isolated normal read paths → retained rollback. Independently authored probes
+must cover dry-run zero writes before apply, source drift, tamper, WAL refusal,
+exclusion non-access, identity ambiguity, preserved payloads and no-op repeats.
+Default mode, installed services, update integration and remote release remain
+outside these batches until separately accepted.
+
 ## 13. Acceptance metrics
 
 No backend switch or default cutover is justified by architecture preference
