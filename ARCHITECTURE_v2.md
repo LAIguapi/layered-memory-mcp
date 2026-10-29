@@ -1276,8 +1276,35 @@ silently discarded or overwritten by a repeat migration.
 The first adapter batch leaves the normal `MemoryConfig` startup path unchanged.
 The parent independently ran the migration/adapter focused suite (201 passed)
 and complete regression (2295 passed, no skipped tests); compilation and tracked
-diff checks passed. These are isolated worktree results, not a committed release
-or evidence that a production service consumed the pointer.
+diff checks passed. That complete run used the normal launcher environment, not
+a fresh offline home. A subsequent fresh-HOME offline run returned 2275 passed,
+16 skipped and four failures in legacy vector tests requiring an uncached
+embedding model. The offline complete gate is NOT_PASSED. Neither run establishes
+that a production service consumed the pointer.
+
+Independent scratch-only probes subsequently blocked adapter acceptance:
+concurrent activate/restore can overwrite a newer pointer snapshot and discard
+its retained target; confirmation can report success while resolving a different
+generation; migration rollback can withdraw an unchanged but active target and
+leave a dangling pointer. No data loss was demonstrated; the withdrawal probe
+demonstrated an availability failure. Default cutover and publication remain
+frozen until these defects are independently rechecked after repair.
+
+Pointer-changing operations must serialize their complete read/validate/modify/
+write/confirm interval across processes, not merely make the final replacement
+atomic. Confirmation must match the requested target and manifest attestation,
+not just find some usable generation. Preview must remain zero-write, including
+lock and registration files. A durable, conservative activation ownership guard
+must prevent migration rollback from moving any generation admitted to runtime,
+even when a pointer is outside its destination or currently retains it only for
+restore. Activation and withdrawal must coordinate through a shared generation
+guard, so a preflight cannot race the rename. Runtime restore switches pointers;
+it does not withdraw or erase a served generation. A missing explicit pointer
+argument alone cannot prove that a generation is unreferenced. Retain the source,
+generation and prior pointer on refusal; do not discover arbitrary user paths to
+look for references. Any additional control-plane artifacts must have explicit
+ownership, containment and validation contracts in the existing destination
+inventory, without weakening unknown-file or symlink rejection.
 
 Before changing the rollout default, the subsequent integration batch must:
 
