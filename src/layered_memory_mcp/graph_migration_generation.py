@@ -130,7 +130,9 @@ from .graph_migration_inventory import (
     SOURCE_KNOWLEDGE_DIR,
     SOURCE_VECTOR_DB,
     SourceSnapshot,
+    _decode_row_metadata,
     file_sha256,
+    read_source_snapshot,
     read_vector_rows,
 )
 from .graph_projection import (
@@ -1096,9 +1098,9 @@ def _vector_updates(
 ) -> list[MetadataUpdate]:
     """The complete set of metadata updates this migration publishes.
 
-    Two sources, both explicit: the planner's own updates for rows whose *own*
-    identity resolves to one L1 entry, and the operator's validated identity
-    mapping for rows whose identity does not. A row ID is never rewritten by
+    Two sources: the planner's updates for rows whose *own* identity resolves,
+    and the inventory's validated explicit or exact automatic correspondences.
+    A row ID is never rewritten by
     either — only the ``metadata`` column moves — so an old identity keeps its
     row and a new projection remains a separately coordinated operation.
     """
@@ -1331,7 +1333,12 @@ def build_generation(
         "surfaces": surfaces,
         "external_surfaces": list(bootstrap.report.external_surfaces),
         "identity_map": dict(snapshot.identity_map),
+        "automatic_identity_map": dict(snapshot.automatic_identity_map),
         "provenance": {
+            "identity_bridge": {
+                "version": 1,
+                "rows": [row.to_dict() for row in snapshot.inventory.classifications],
+            },
             "recorded_at": bootstrap.report.recorded_at,
             "inferred_fields": list(bootstrap.report.inferred_fields),
             "unresolved_references": list(bootstrap.report.unresolved_references),
@@ -1517,6 +1524,68 @@ def _verify_source_files(
         findings.append(f"{FINDING_SOURCE_FILE_UNEXPECTED}:{relative}")
 
     return not findings, findings
+
+
+def _verify_identity_bridge(
+    generation: Path, manifest: Mapping[str, Any], published: Sequence[tuple]
+) -> list[str]:
+    """Recompute correspondence and metadata from the frozen source, not seeds."""
+    explicit = manifest.get("identity_map")
+    if not isinstance(explicit, dict):
+        return ["identity_bridge_explicit_invalid"]
+    try:
+        snapshot = read_source_snapshot(
+            generation / BACKUP_DIR, identity_map_declarations=explicit
+        )
+    except (OSError, ValueError, sqlite3.Error):
+        return ["identity_bridge_source_unreadable"]
+    if not snapshot.publishable:
+        return ["identity_bridge_source_unresolved"]
+    findings: list[str] = []
+    if snapshot.inventory.source_fingerprint != manifest.get("source_fingerprint"):
+        findings.append("identity_bridge_source_fingerprint")
+    if explicit != snapshot.identity_map:
+        findings.append("identity_bridge_explicit_mismatch")
+    automatic = manifest.get("automatic_identity_map")
+    provenance = manifest.get("provenance")
+    bridge = provenance.get("identity_bridge") if isinstance(provenance, dict) else None
+    legacy = automatic is None and bridge is None and not snapshot.automatic_identity_map
+    if not legacy:
+        if automatic != snapshot.automatic_identity_map:
+            findings.append("identity_bridge_automatic_mismatch")
+        expected = {
+            "version": 1,
+            "rows": [row.to_dict() for row in snapshot.inventory.classifications],
+        }
+        if json.dumps(bridge, sort_keys=True) != json.dumps(expected, sort_keys=True):
+            findings.append("identity_bridge_provenance_mismatch")
+    seeds = {
+        row.row_id: row.expected_graph_node_id
+        for row in snapshot.inventory.classifications
+    }
+    if manifest.get("seeds") != seeds:
+        findings.append("identity_bridge_seeds_mismatch")
+    if len(set(seeds.values())) != len(seeds):
+        findings.append("identity_bridge_target_collision")
+    counts = manifest.get("counts")
+    if (
+        not isinstance(counts, dict)
+        or counts.get("rows_by_category") != snapshot.inventory.counts_by_category
+    ):
+        findings.append("identity_bridge_counts_mismatch")
+    expected_metadata = {
+        row[0]: _decode_row_metadata(row[4]) for row in snapshot.vector_rows
+    }
+    if snapshot.backfill_plan is not None:
+        for update in _vector_updates(snapshot, snapshot.backfill_plan):
+            expected_metadata[update.row_id] = update.metadata
+    for row in published:
+        metadata = _decode_row_metadata(row[4])
+        if metadata is None or json.dumps(metadata, sort_keys=True) != json.dumps(
+            expected_metadata.get(row[0]), sort_keys=True
+        ):
+            findings.append("identity_bridge_metadata_mismatch")
+    return sorted(set(findings))
 
 
 def verify_generation(
@@ -1717,15 +1786,24 @@ def verify_generation(
     # -- the vector rows ----------------------------------------------------
     vector_ok = True
     declared_seeds = manifest.get("seeds") or {}
+    if not isinstance(declared_seeds, dict):
+        findings.append("identity_bridge_seeds_mismatch")
+        declared_seeds = {}
+        vector_ok = False
     try:
         published = _read_rows(generation / VECTOR_RELATIVE)
         frozen = _read_rows(generation / BACKUP_DIR / SOURCE_VECTOR_DB)
-    except sqlite3.Error as exc:
+    except (OSError, sqlite3.Error) as exc:
         findings.append(f"{FINDING_VECTOR_UNREADABLE}:{type(exc).__name__}")
         published, frozen = [], []
         vector_ok = False
 
     report_counts["vector_rows"] = len(published)
+    if source_files_ok and membership_ok and hashes_ok:
+        identity_findings = _verify_identity_bridge(generation, manifest, published)
+        findings.extend(identity_findings)
+        if identity_findings:
+            vector_ok = False
     frozen_by_id = {str(row[0]): row for row in frozen}
     for row in published:
         row_id = str(row[0])
@@ -1741,9 +1819,13 @@ def verify_generation(
             # where "we did not re-embed" stops being a promise.
             findings.append(f"{FINDING_VECTOR_EMBEDDING}:{row_id}")
             vector_ok = False
-        metadata = json.loads(row[4]) if row[4] else {}
+        metadata = _decode_row_metadata(row[4])
+        if metadata is None:
+            findings.append(f"{FINDING_VECTOR_SEED}:{row_id}")
+            vector_ok = False
+            continue
         expected_node = declared_seeds.get(row_id)
-        if expected_node is None:
+        if not isinstance(expected_node, str) or not expected_node:
             findings.append(f"{FINDING_VECTOR_ROW_UNEXPECTED}:{row_id}")
             vector_ok = False
             continue
@@ -1760,8 +1842,12 @@ def verify_generation(
         vector_ok = False
 
     # -- and only now, the counts the manifest claims -----------------------
-    counts_ok = True
+    counts_ok = "identity_bridge_counts_mismatch" not in findings
     declared_counts = manifest.get("counts") or {}
+    if not isinstance(declared_counts, dict):
+        findings.append(FINDING_COUNTS)
+        declared_counts = {}
+        counts_ok = False
     for name, value in sorted(report_counts.items()):
         if name in declared_counts and declared_counts[name] != value:
             findings.append(f"{FINDING_COUNTS}:{name}")

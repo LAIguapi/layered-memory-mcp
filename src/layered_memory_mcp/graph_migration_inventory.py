@@ -52,10 +52,9 @@ WHAT IT IS NOT
   :func:`~layered_memory_mcp.graph_seed_metadata.graph_node_id_for_entry_id`,
   and every row classification comes from
   :func:`~layered_memory_mcp.graph_backfill.plan_graph_seed_backfill`.
-- NOT a guesser. An unresolved legacy identity stays unresolved. The only way
-  to resolve one is an explicit operator-supplied mapping, every entry of which
-  is validated against this inventory before it counts (see
-  :func:`resolve_identity_map`).
+- NOT a guesser. Legacy correspondence requires an exact domain, declared
+  section and projection text, or a validated operator declaration. Ambiguous
+  and conflicting identities remain blockers.
 
 PRIVACY (§15)
 -------------
@@ -89,6 +88,8 @@ from .graph_backfill import (
     REASON_UNSUPPORTED_ROW,
     REASON_UNUSABLE_IDENTITY,
     BackfillPlan,
+    _decode_metadata,
+    _stored_graph_identity,
     plan_graph_seed_backfill,
 )
 from .graph_entry_identity import ProjectionIdentityError, markdown_section_entry_id
@@ -211,8 +212,7 @@ CATEGORY_MAPPED = "mapped"
 CATEGORY_MISSING = "missing"
 
 #: The row's identity is usable and the supplied L1 snapshot has no such entry.
-#: A legacy random identity lands here, and stays here unless an explicit
-#: validated mapping resolves it.
+#: Only a validated declaration or exact, unique correspondence can resolve it.
 CATEGORY_ORPHANED = "orphaned"
 
 #: Two rows claim one identity, the snapshot holds two records for it, or the
@@ -273,6 +273,7 @@ DETAIL_VECTOR_DIMENSION = "vector_dimension_unexpected"
 
 #: The reason token for a row an explicit mapping resolved.
 REASON_MAPPED_BY_IDENTITY_MAP = "mapped_by_identity_map"
+REASON_MAPPED_BY_EXACT_IDENTITY = "mapped_by_exact_identity"
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +303,9 @@ class RowClassification(GraphModel):
     category: str
     reason: str
     expected_graph_node_id: str = ""
+    mapping_origin: str = "none"
+    target_entry_id: str = ""
+    candidate_count: int = Field(default=0, ge=0)
     details: list[str] = Field(default_factory=list)
 
 
@@ -334,6 +338,7 @@ class SourceInventory(GraphModel):
     counts_by_category: dict[str, int] = Field(default_factory=dict)
     classifications: list[RowClassification] = Field(default_factory=list)
     identity_map_entries: int = Field(default=0, ge=0)
+    automatic_identity_map_entries: int = Field(default=0, ge=0)
     findings: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
 
@@ -401,8 +406,9 @@ class SourceSnapshot:
     vector_rows: list[tuple] = field(default_factory=list)
     changelog_events: list[MemoryChangelogEntry] = field(default_factory=list)
     identity_map: dict[str, str] = field(default_factory=dict)
+    automatic_identity_map: dict[str, str] = field(default_factory=dict)
     #: ``row_id -> (graph node ID, complete replacement metadata)`` for the rows
-    #: an explicit mapping resolved. The planner cannot produce these: it only
+    #: an explicit or automatic mapping resolved. The planner only
     #: ever derives an identity from the row's *own* ID.
     identity_map_updates: dict[str, tuple[str, dict[str, Any]]] = field(
         default_factory=dict
@@ -803,15 +809,16 @@ def resolve_identity_map(
     classifications: Sequence[RowClassification],
     known_entry_ids: Sequence[str],
     findings: set[str],
+    *,
+    rows: Sequence[tuple] | None = None,
 ) -> dict[str, str]:
     """Validate an operator-supplied ``row ID -> L1 entry ID`` mapping.
 
-    This is the *only* way an unresolved legacy identity becomes resolvable, and
-    it is a declaration rather than an inference: the operator states which
+    This is a declaration rather than an inference: the operator states which
     authored object an old random row stands for, and every statement is checked
     against the inventory before it counts.
 
-    Five refusals, each a bounded token:
+    Refusals are bounded tokens:
 
     * a key or value that is not a clean single-line identifier;
     * a row the snapshot does not contain;
@@ -820,7 +827,8 @@ def resolve_identity_map(
     * an entry ID the L1 snapshot does not hold;
     * an entry ID already claimed, by its own row or by another mapping — one
       claim stands for one authored object, and two rows claiming one node is a
-      conflict, not a convenience.
+      conflict, not a convenience;
+    * malformed or conflicting stored graph identities, when rows are supplied.
     """
     by_row = {row.row_id: row for row in classifications if row.row_id}
     entries = set(known_entry_ids)
@@ -842,7 +850,29 @@ def resolve_identity_map(
         if entry_id not in entries:
             findings.add(f"{FINDING_IDENTITY_MAP_ENTRY_UNKNOWN}:{row_id}")
             continue
+        verdict = by_row[row_id]
+        verdict.mapping_origin = "explicit"
+        verdict.target_entry_id = entry_id
+        verdict.expected_graph_node_id = graph_node_id_for_entry_id(entry_id)
+        verdict.candidate_count = known_entry_ids.count(entry_id)
+        if verdict.candidate_count != 1:
+            verdict.category = CATEGORY_CONFLICTING
+            verdict.reason = "identity_entry_ambiguous"
+            findings.add(f"{FINDING_IDENTITY_MAP_INVALID}:ambiguous:{row_id}")
+            continue
+        if rows is not None:
+            _, reason, details = _identity_metadata(
+                rows[verdict.row_index][4], verdict.expected_graph_node_id
+            )
+            if reason:
+                verdict.category = _CATEGORY_BY_REASON[reason]
+                verdict.reason = reason
+                verdict.details = details
+                findings.add(f"{FINDING_IDENTITY_MAP_INVALID}:metadata:{row_id}")
+                continue
         if entry_id in claimed:
+            verdict.category = CATEGORY_CONFLICTING
+            verdict.reason = "identity_target_reserved"
             findings.add(f"{FINDING_IDENTITY_MAP_ENTRY_TAKEN}:{row_id}")
             continue
         claimed.add(entry_id)
@@ -895,6 +925,24 @@ def _decode_row_metadata(raw: Any) -> dict[str, Any] | None:
     return None
 
 
+def _identity_metadata(
+    raw: Any, expected: str = ""
+) -> tuple[dict[str, Any] | None, str, list[str]]:
+    """Apply the backfill graph-field rules before any legacy adaptation."""
+    metadata, issues = _decode_metadata(raw)
+    if metadata is None:
+        return None, REASON_MALFORMED_METADATA, issues
+    issues, scalar, listed = _stored_graph_identity(metadata)
+    if issues:
+        return metadata, REASON_MALFORMED_METADATA, issues
+    identities = set(listed)
+    if scalar is not None:
+        identities.add(scalar)
+    if (expected and identities - {expected}) or len(identities) > 1:
+        return metadata, REASON_MISMATCHED_GRAPH_METADATA, ["graph_identity_conflict"]
+    return metadata, "", []
+
+
 def _classify_rows(
     rows: Sequence[tuple],
     entries: Sequence[KnowledgeEntry],
@@ -912,6 +960,17 @@ def _classify_rows(
         category = _CATEGORY_BY_REASON.get(verdict.reason, CATEGORY_MALFORMED)
         reason = verdict.reason
         details = list(verdict.details)
+        if reason == REASON_ORPHAN_VECTOR_ROW:
+            raw_row = rows[verdict.row_index]
+            _, metadata_reason, metadata_details = _identity_metadata(raw_row[4])
+            if metadata_reason:
+                reason = metadata_reason
+                category = _CATEGORY_BY_REASON[reason]
+                details.extend(metadata_details)
+            if not isinstance(raw_row[1], str) or not isinstance(raw_row[2], str):
+                category = CATEGORY_MALFORMED
+                reason = REASON_UNSUPPORTED_ROW
+                details.append("identity_payload_not_text")
         raw_vector = (
             rows[verdict.row_index][3]
             if verdict.row_index < len(rows)
@@ -932,6 +991,9 @@ def _classify_rows(
                 category=category,
                 reason=reason,
                 expected_graph_node_id=verdict.expected_graph_node_id,
+                mapping_origin="row_id" if verdict.expected_graph_node_id else "none",
+                target_entry_id=verdict.row_id if verdict.expected_graph_node_id else "",
+                candidate_count=1 if verdict.expected_graph_node_id else 0,
                 details=sorted(set(details)),
             )
         )
@@ -943,6 +1005,87 @@ def _precedes(candidate: str, current: str) -> bool:
     return CATEGORY_PRECEDENCE.index(candidate) < CATEGORY_PRECEDENCE.index(current)
 
 
+def _automatic_identities(
+    rows: Sequence[tuple],
+    entries: Sequence[L1Entry],
+    classifications: list[RowClassification],
+    updates: dict[str, tuple[str, dict[str, Any]]],
+) -> dict[str, str]:
+    """Propose exact correspondence without changing the row-ID producer."""
+    sections: dict[tuple[str, str], list[L1Entry]] = {}
+    for item in entries:
+        sections.setdefault((item.domain, item.section), []).append(item)
+    reserved = {
+        verdict.expected_graph_node_id
+        for verdict in classifications
+        if verdict.expected_graph_node_id and (
+            verdict.mapping_origin == "row_id"
+            or verdict.category in PUBLISHABLE_CATEGORIES
+        )
+    }
+    proposals: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+    resolved: dict[str, str] = {}
+    for position, verdict in enumerate(classifications):
+        if verdict.category != CATEGORY_ORPHANED:
+            continue
+        row = rows[verdict.row_index]
+        metadata = _decode_row_metadata(row[4])
+        section = None if metadata is None else metadata.get("section")
+        candidates = (
+            sections.get((row[1], section), [])
+            if isinstance(row[1], str) and isinstance(section, str)
+            else []
+        )
+        verdict.mapping_origin = "automatic"
+        verdict.candidate_count = len(candidates)
+        if not isinstance(section, str):
+            verdict.reason = "identity_section_missing"
+            continue
+        if not candidates:
+            verdict.reason = "identity_section_not_found"
+            continue
+        if len(candidates) != 1:
+            verdict.reason = "identity_section_ambiguous"
+            continue
+        candidate = candidates[0]
+        if (
+            not isinstance(row[2], str)
+            or row[2].encode("utf-8") != candidate.entry.content.encode("utf-8")
+        ):
+            verdict.reason = "identity_text_mismatch"
+            continue
+        target = candidate.entry_id
+        checked = plan_graph_seed_backfill(
+            [(target, *row[1:])], [candidate.entry], []
+        ).report.verdicts[0]
+        verdict.expected_graph_node_id = checked.expected_graph_node_id
+        verdict.target_entry_id = target if checked.expected_graph_node_id else ""
+        if checked.reason not in (REASON_ALREADY_MAPPED, REASON_MISSING_GRAPH_METADATA):
+            verdict.category = _CATEGORY_BY_REASON[checked.reason]
+            verdict.reason = checked.reason
+            verdict.details = list(checked.details)
+            continue
+        proposals.setdefault(target, []).append((position, metadata))
+    for target, claims in sorted(proposals.items()):
+        node_id = graph_node_id_for_entry_id(target)
+        for position, metadata in claims:
+            verdict = classifications[position]
+            if node_id in reserved or len(claims) != 1:
+                verdict.category = CATEGORY_CONFLICTING
+                verdict.reason = (
+                    "identity_target_reserved" if node_id in reserved
+                    else "identity_target_contested"
+                )
+                continue
+            resolved[verdict.row_id] = target
+            updates[verdict.row_id] = (node_id, {**metadata, GRAPH_SEED_ID_KEY: node_id})
+            classifications[position] = verdict.model_copy(update={
+                "category": CATEGORY_MAPPED,
+                "reason": REASON_MAPPED_BY_EXACT_IDENTITY,
+            })
+    return resolved
+
+
 # ---------------------------------------------------------------------------
 # The entry point
 # ---------------------------------------------------------------------------
@@ -952,6 +1095,7 @@ def read_source_snapshot(
     *,
     destination_prestate: str = "",
     identity_map_path: Path | None = None,
+    identity_map_declarations: Mapping[str, Any] | None = None,
 ) -> SourceSnapshot:
     """Read one explicitly supplied source snapshot. Writes nothing, anywhere.
 
@@ -961,6 +1105,8 @@ def read_source_snapshot(
             the destination looked like when the source was read.
         identity_map_path: An optional operator-supplied ``row ID -> L1 entry
             ID`` mapping (see :func:`resolve_identity_map`).
+        identity_map_declarations: Recorded explicit declarations for replay
+            against a frozen backup, mutually exclusive with a map path.
 
     Returns:
         A :class:`SourceSnapshot`. Every problem is a bounded finding on
@@ -1089,7 +1235,7 @@ def read_source_snapshot(
                 )
             else:
                 rows = read_vector_rows(vector_path)
-        except sqlite3.Error as exc:
+        except (OSError, sqlite3.Error) as exc:
             findings.add(f"{FINDING_VECTOR_DB_UNREADABLE}:{type(exc).__name__}")
 
     if rows:
@@ -1101,20 +1247,25 @@ def read_source_snapshot(
             findings,
         )
 
-    counts = {name: 0 for name in ROW_CATEGORIES}
-    for row in classifications:
-        counts[row.category] = counts.get(row.category, 0) + 1
-
     # -- the explicit identity mapping -------------------------------------
     identity_map: dict[str, str] = {}
     identity_updates: dict[str, tuple[str, dict[str, Any]]] = {}
-    if identity_map_path is not None:
-        raw_map = _load_identity_map(Path(identity_map_path), findings)
+    if identity_map_path is not None or identity_map_declarations is not None:
+        if identity_map_path is not None and identity_map_declarations is not None:
+            findings.add(f"{FINDING_IDENTITY_MAP_INVALID}:multiple_declarations")
+        raw_map = (
+            _load_identity_map(Path(identity_map_path), findings)
+            if identity_map_path is not None else identity_map_declarations
+        )
+        if not isinstance(raw_map, Mapping):
+            findings.add(f"{FINDING_IDENTITY_MAP_INVALID}:not_a_mapping")
+            raw_map = {}
         identity_map = resolve_identity_map(
             raw_map,
             classifications,
             [item.entry_id for item in entries],
             findings,
+            rows=rows,
         )
         # Positions, not values: the verdict being replaced is located by where
         # it sits in the list, so reclassification cannot land on a different
@@ -1139,16 +1290,23 @@ def read_source_snapshot(
             )
             index = positions[row_id]
             verdict = classifications[index]
-            counts[verdict.category] -= 1
-            counts[CATEGORY_MAPPED] += 1
             classifications[index] = RowClassification(
                 row_index=verdict.row_index,
                 row_id=verdict.row_id,
                 category=CATEGORY_MAPPED,
                 reason=REASON_MAPPED_BY_IDENTITY_MAP,
                 expected_graph_node_id=node_id,
-                details=[f"identity_map_entry:{entry_id}"],
+                mapping_origin="explicit",
+                target_entry_id=entry_id,
+                candidate_count=1,
             )
+
+    automatic_map = _automatic_identities(
+        rows, entries, classifications, identity_updates
+    )
+    counts = {name: 0 for name in ROW_CATEGORIES}
+    for verdict in classifications:
+        counts[verdict.category] += 1
 
     for name in ROW_CATEGORIES:
         if name not in PUBLISHABLE_CATEGORIES and counts.get(name):
@@ -1171,6 +1329,7 @@ def read_source_snapshot(
         counts_by_category=counts,
         classifications=classifications,
         identity_map_entries=len(identity_map),
+        automatic_identity_map_entries=len(automatic_map),
         findings=sorted(findings),
         warnings=sorted(warnings),
     )
@@ -1186,6 +1345,7 @@ def read_source_snapshot(
         vector_rows=rows,
         changelog_events=changelog_events,
         identity_map=identity_map,
+        automatic_identity_map=automatic_map,
         identity_map_updates=identity_updates,
         backfill_plan=plan,
     )
