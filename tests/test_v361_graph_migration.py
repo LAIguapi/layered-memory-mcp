@@ -941,6 +941,23 @@ def test_apply_refuses_an_unsupported_source_record(source, destination):
     )
 
 
+def test_l0_is_evidence_only_and_blocks_legacy_plan(source, destination):
+    """L0 provenance must not become a legacy knowledge input by accident."""
+    (source / "L0.md").write_text("## evidence-only\n\nnot an L1 entry\n", encoding="utf-8")
+    before = tree_state(source)
+
+    report = graph_migration.plan_migration(source=source, destination=destination)
+
+    assert report["status"] == graph_migration.STATUS_BLOCKED
+    assert report["exit_code"] == graph_migration.EXIT_BLOCKED
+    assert "source_unsupported_record:L0.md" in report["findings"]
+    assert report["inventory"]["l1_documents"] == 2
+    assert report["inventory"]["l1_entries"] == 3
+    assert not destination.exists()
+    assert tree_state(source) == before
+    assert "not an L1 entry" not in json.dumps(report)
+
+
 def test_apply_refuses_a_destination_inside_the_source(source):
     report = graph_migration.apply_migration(
         source=source, destination=source / "migrated"
