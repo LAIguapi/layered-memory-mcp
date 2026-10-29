@@ -1125,7 +1125,7 @@ This is isolated runtime evidence, not production retrieval-quality evidence.
 Production population, a complete semantic event stream, broader measured
 acceptance, and an explicitly approved default cutover remain open targets.
 
-### Framework completion and migration delivery contract (authorized; pending)
+### Framework completion and migration delivery contract (framework delivered; cutover pending)
 
 The next delivery is a working framework, followed by an executable migration
 tool, not another fixture-only seam. The user authorized repository changes on
@@ -1254,6 +1254,68 @@ The parent independently exercises the CLI and reviews scope/security before
 marking migration acceptance complete. Documentation and code remain separate
 commits. Real migration, publication and production cutover are separate actions.
 
+#### Runtime generation and update delivery contract (authorized; in progress)
+
+The isolated migration operator is implemented in `109aef5`, with source-backup
+provenance verification corrected in `5a6c0e5`. Its publication success does not
+mean a server is using the generation. The next boundary is serving, not another
+importer or a second identity implementation.
+
+The runtime adapter consumes one explicitly supplied generation root or active
+pointer. A never-served generation requires full publication verification before
+activation. An activated generation is writable: publication-time database and
+readable-file hashes are no longer a valid health test after an accepted write.
+The pointer therefore binds the manifest verified at activation; reopening checks
+that binding, path containment, read-only store health and journal/graph
+consistency. Reports must distinguish publication integrity from attested runtime
+health. Dry-run changes nothing; explicit activation atomically replaces only
+the pointer and retains the previous attested target. Restore changes the pointer,
+not the contents of either generation. Changed runtime generations must never be
+silently discarded or overwritten by a repeat migration.
+
+The first adapter batch leaves the normal `MemoryConfig` startup path unchanged.
+The parent independently ran the migration/adapter focused suite (201 passed)
+and complete regression (2295 passed, no skipped tests); compilation and tracked
+diff checks passed. These are isolated worktree results, not a committed release
+or evidence that a production service consumed the pointer.
+
+Before changing the rollout default, the subsequent integration batch must:
+
+1. Bind the explicitly configured active pointer through the normal configuration
+   path used by MCP and HTTP, without replacing the complete service config with
+   the adapter's narrower projection config. Resolve graph, journal, readable L1,
+   vector and L0 paths together; retain unrelated configuration and external
+   ownership boundaries. Invalid explicit pointers must not silently redirect
+   writes to a legacy store or create an empty replacement generation.
+2. Exercise real service entry points under an isolated home: migration, explicit
+   activation, normal configuration loading, semantic write, close/reopen, recall
+   and restore. Assert actual returned content and the locations of all changed
+   projections, plus unchanged source bytes. Keep explicit legacy and shadow
+   compatibility. Mode-enabled predicates must not depend on the rollout default.
+3. Supply a project-owned post-update entry point and operator documentation.
+   Do not modify an agent product's updater. The entry point runs after the
+   operator has obtained the release; source, destination and pointer are explicit,
+   dry-run is the default, and apply is opt-in. Reuse the existing migration and
+   activation implementations rather than duplicating their policy. A failed
+   migration or health preflight must leave the prior pointer and source intact.
+   Repeat update must preserve accepted post-activation writes.
+4. Change the default to the graph framework only after the normal startup/write/
+   reopen chain has passed. Document fresh-store bootstrap separately from legacy
+   migration: existing legacy data must not be treated as an empty graph merely
+   because the default changed. Explicit configuration can override a default;
+   repository tests alone do not establish the installed service's active mode.
+5. Synchronize release versions, entry-point documentation and changelog, then
+   rerun complete regression, independent negative probes, privacy review and
+   wheel/sdist checks before pushing or publishing. No CI or package publication
+   is implied merely by a git push or tag. Only after the release is verified may
+   the operator pull/install that release and run its migration/update entry point.
+
+The acceptance evidence and operator commands belong in
+`docs/GRAPH_MIGRATION_VERIFY.md`; this architecture section owns the integration
+contract. Production execution, installed-service activation and remote release
+must each be reported with their own read-back evidence, never inferred from a
+successful isolated migration.
+
 ## 13. Acceptance metrics
 
 No backend switch or default cutover is justified by architecture preference
@@ -1331,11 +1393,13 @@ Turning off graph-aware recall must leave vector/BM25 and L0/L1 fallback usable.
 
 ## 16. Open decisions
 
-The architecture is fixed enough to begin Batch B. These decisions are deferred
-until the relevant evidence exists:
+The framework and isolated migration operator are implemented. SQLite is the
+implemented embedded graph/journal backend; a different backend would be a
+separately justified adapter, not a prerequisite for the current delivery.
+These decisions remain deferred until the relevant evidence exists:
 
-1. Embedded backend implementation: Kuzu or another backend with equivalent
-   transactional/rebuild properties.
+1. Whether an additional embedded or server backend offers enough measured
+   benefit to justify its transaction, operational and rebuild costs.
 2. Whether the current vector store remains separate permanently or is later
    co-located with graph storage.
 3. Exact entity-resolution strategy and whether model-assisted extraction is
