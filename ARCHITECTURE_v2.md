@@ -1469,6 +1469,18 @@ allowed by the bridge. The graph target comes from the existing entry identity
 function. Validate metadata and stored graph identities before accepting any
 correspondence; malformed or conflicting identities cannot be overwritten.
 
+A narrowly defined compatibility exception covers the known legacy embedding
+projection wrapper: after the domain, declared section and unique-candidate gates
+pass, the stored UTF-8 projection may equal exactly
+`embedding_heading(section) + "\\n" + canonical_body`. The prefix must be generated
+from that candidate's current section by the existing `embedding_heading` function;
+no arbitrary prefix, suffix, trimming, case folding, Unicode normalization,
+substring containment, similarity score or semantic inference is permitted. The
+canonical body must occur at the exact end of the stored projection, and the
+compatibility verdict must remain auditable as a distinct derived mapping reason.
+L0 remains evidence-only and is not converted into a legacy knowledge input by this
+exception.
+
 Reserve targets already claimed by resolved rows or validated operator mappings.
 Compute automatic proposals as a group: multiple rows proposing one target are
 all unresolved, not first-row-wins. A duplicate-section candidate set is ambiguous
