@@ -1737,7 +1737,7 @@ def dedup_l1_knowledge(config: "MemoryConfig", min_dup_lines: int = 20) -> dict:
     try:
         import sqlite3
 
-        db_path = Path(config.home) / "data" / "vectors.db"
+        db_path = config.vector_db_path
         if db_path.exists():
             with sqlite3.connect(str(db_path)) as conn:
                 conn.execute("PRAGMA busy_timeout=10000")

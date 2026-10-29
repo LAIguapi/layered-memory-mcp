@@ -495,7 +495,7 @@ def calibrate_thresholds(config, persist: bool = True) -> dict:
         ),
     }
     try:
-        db_path = config.home / "data" / "vectors.db"
+        db_path = config.vector_db_path
         if not db_path.exists():
             report["reason"] = "no_vector_store"
             return report
@@ -1513,6 +1513,7 @@ def _inject_knowledge_core(
     # vector built from the possibly stale original request.
     vector_result = sync_to_vector_store(
         data_dir=data_dir,
+        vector_db_path=config.vector_db_path,
         domain=domain_clean,
         content=content,
         replace_domain=True,
@@ -1803,7 +1804,7 @@ def _section_body_from_hit(text: str) -> str:
     return text.strip()
 
 
-def _read_section_body(data_dir, domain: str, section: str) -> str | None:
+def _read_section_body(data_dir, domain: str, section: str, config=None) -> str | None:
     """Read the authoritative full body of a ## section from the L1 file.
 
     The vector store's 'text' is truncated to 200 chars for display; for the
@@ -1812,12 +1813,14 @@ def _read_section_body(data_dir, domain: str, section: str) -> str | None:
     """
     try:
         # data_dir is <home>/data; the knowledge dir is <home>/knowledge[/ns].
-        home = Path(data_dir).parent
-        # Try the common layouts: <home>/knowledge/<domain>.md and namespaced.
-        candidates = [home / "knowledge" / f"{domain}.md"]
-        kroot = home / "knowledge"
-        if kroot.exists():
-            candidates += list(kroot.glob(f"*/{domain}.md"))
+        if getattr(config, "graph_active_pointer", None) is not None:
+            candidates = [Path(directory) / f"{domain}.md" for directory in config.knowledge_dirs]
+        else:
+            home = Path(data_dir).parent
+            candidates = [home / "knowledge" / f"{domain}.md"]
+            kroot = home / "knowledge"
+            if kroot.exists():
+                candidates += list(kroot.glob(f"*/{domain}.md"))
         for fp in candidates:
             if not fp.exists():
                 continue
@@ -1876,7 +1879,11 @@ def _semantic_dedup(
     if len((content or "").strip()) < SEM_SHORT_TEXT_CHARS:
         return None
 
-    db_path = Path(data_dir) / "vectors.db"
+    db_path = (
+        config.vector_db_path
+        if getattr(config, "graph_active_pointer", None) is not None
+        else Path(data_dir) / "vectors.db"
+    )
     if not db_path.exists():
         return None
 
@@ -1908,7 +1915,7 @@ def _semantic_dedup(
 
     meta = best.get("metadata") or {}
     hit_section = meta.get("section") or ""
-    old_body = _read_section_body(data_dir, domain, hit_section)
+    old_body = _read_section_body(data_dir, domain, hit_section, config)
     if old_body is None:
         old_body = _section_body_from_hit(best.get("text", ""))
 
@@ -2494,6 +2501,8 @@ def sync_to_vector_store(
     summary: str = "",
     replace_domain: bool = False,
     source_path: Path | None = None,
+    *,
+    vector_db_path: str | Path | None = None,
 ) -> dict:
     """Sync a knowledge entry to the vector store for semantic search.
 
@@ -2511,7 +2520,8 @@ def sync_to_vector_store(
         leaving the previous section vectors behind as orphans.
 
     Args:
-        data_dir: Path to the data directory containing vectors.db
+        data_dir: Legacy data directory when no vector_db_path is supplied.
+        vector_db_path: Explicit database target from the service configuration.
         domain: Knowledge domain (e.g. "infra")
         content: Section body (default mode) or full file text (rebuild mode)
         summary: One-line summary for indexing
@@ -2529,7 +2539,7 @@ def sync_to_vector_store(
         from .models import KnowledgeEntry, SourceInfo, SourceType, ReviewStatus, KnowledgeType
         import uuid
 
-        db_path = Path(data_dir) / "vectors.db"
+        db_path = Path(vector_db_path) if vector_db_path is not None else Path(data_dir) / "vectors.db"
         vector_store = VectorStore(db_path)
 
         if replace_domain:
@@ -2574,6 +2584,8 @@ def sync_to_vector_store(
 def remove_from_vector_store(
     data_dir: str | Path,
     domain: str,
+    *,
+    vector_db_path: str | Path | None = None,
 ) -> dict:
     """Remove all entries for a domain from the vector store.
 
@@ -2581,7 +2593,7 @@ def remove_from_vector_store(
     """
     try:
         import sqlite3
-        db_path = Path(data_dir) / "vectors.db"
+        db_path = Path(vector_db_path) if vector_db_path is not None else Path(data_dir) / "vectors.db"
         if not db_path.exists():
             return {"success": True, "action": "none", "reason": "No vector store"}
 
@@ -2628,8 +2640,7 @@ def reindex_vector_store(
     Returns:
         dict: {success, domains, sections, files, errors, calibration}
     """
-    data_dir = config.home / "data"
-    db_path = data_dir / "vectors.db"
+    db_path = config.vector_db_path
 
     result = {
         "success": True,
@@ -2641,7 +2652,7 @@ def reindex_vector_store(
 
     store = None
     try:
-        data_dir.mkdir(parents=True, exist_ok=True)
+        db_path.parent.mkdir(parents=True, exist_ok=True)
         from .storage.vector_store import VectorStore
 
         store = VectorStore(db_path)
@@ -2706,7 +2717,7 @@ def vector_store_needs_reindex(config: "MemoryConfig") -> bool:
             (domain, entry.id if stable_id else None, entry.section, entry_embedding_text(entry))
             for entry in _vector_entries(domain, raw)
         )
-    db_path = config.home / "data" / "vectors.db"
+    db_path = config.vector_db_path
     if not db_path.exists():
         return bool(expected)
     with closing(sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)) as conn:

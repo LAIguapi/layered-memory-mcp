@@ -113,6 +113,7 @@ def _sync_knowledge_vectors(entry: KnowledgeEntry) -> None:
     result = sync_to_vector_store(
         stores["vector"].db_path.parent, entry.domain, entry.content,
         replace_domain=True, source_path=stores["l1"]._resolve_path(entry.domain),
+        vector_db_path=stores["vector"].db_path,
     )
     if not result.get("success"):
         raise HTTPException(status_code=503, detail={
@@ -186,7 +187,7 @@ async def lifespan(app: FastAPI):
 
     stores["config"] = config
     stores["l1"] = L1Store(knowledge_dir)
-    stores["vector"] = VectorStore(data_dir / "vectors.db")
+    stores["vector"] = VectorStore(config.vector_db_path)
     stores["review"] = ReviewQueue(data_dir / "review_queue.db")
 
     try:

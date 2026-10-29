@@ -20,6 +20,13 @@ Four verbs, one report shape, JSON on stdout and a bounded exit code. Omitting
 the verb runs ``plan``, so the *default* behaviour of this tool is to read and
 report: a forgotten argument cannot become a publication.
 
+Three further verbs — ``status``, ``activate`` and ``restore`` — belong to
+:mod:`.graph_generation_runtime`, which owns the *runtime* side of the same
+contract: pointing one explicit control-plane file at one proved generation.
+They are contributed by that module rather than implemented here, so an
+operator reaches one tool while publishing and serving stay separate
+implementations with separate success sets.
+
 WHAT IT IS NOT
 --------------
 - NOT the existing ``domain_keywords`` migration. :mod:`.migrate` is a separate
@@ -31,9 +38,12 @@ WHAT IT IS NOT
   see :class:`~layered_memory_mcp.graph_migration_generation.GenerationConfig`
   for the explicit, resolution-free object the framework's own projection
   routines are driven with.
-- NOT a cutover. It publishes a generation into a directory. It does not change
-  a running service, a configuration file, a default mode or a user's store, and
-  nothing here is wired into any startup path, MCP tool or REST route.
+- NOT a cutover. The four verbs below publish a generation into a directory.
+  They do not change a running service, a configuration file, a default mode or
+  a user's store, and nothing here is wired into any startup path, MCP tool or
+  REST route. A cutover is the separate, explicit act of pointing a control-plane
+  file at a proved generation, which is what the contributed ``activate`` verb
+  does and why it refuses to write anything without ``--apply``.
 - NOT a guesser. An old random vector identity is never inferred from a body, a
   summary, a heading or a file name. Unresolved identity is a blocking finding;
   the only resolution is an explicit ``--identity-map`` whose every entry is
@@ -51,7 +61,9 @@ THE THREE GUARANTEES
    transaction and this tool does not pretend they do.
 3. **Nothing is destroyed.** The source is never written. The source bytes are
    retained inside the generation. A rollback renames a generation aside and
-   keeps it. A failed publication leaves accounted-for debris, never a partial
+   keeps it — and refuses outright for one a runtime has been given, because
+   moving a generation an active pointer names is an outage rather than an undo.
+   A failed publication leaves accounted-for debris, never a partial
    destination.
 
 PRIVACY (§15)
@@ -72,15 +84,22 @@ from typing import Any, Callable, Mapping, Sequence
 
 from .graph_migration_bootstrap import BootstrapPlan, plan_bootstrap
 from .graph_migration_generation import (
+    FINDING_ADMISSION_UNPROVED,
+    FINDING_GENERATION_SERVED,
+    FINDING_LOCK_UNAVAILABLE,
     FINDING_SOURCE_DRIFT,
     GENERATION_DIR,
+    ControlLockError,
+    admission_findings,
     build_generation,
+    control_lock,
     destination_findings,
     destination_prestate,
     new_staging_path,
     publish_generation,
     quarantine_staging,
     read_manifest,
+    served_lock_path,
     verify_generation,
     withdraw_generation,
 )
@@ -93,9 +112,13 @@ __all__ = [
     "EXIT_FAILED",
     "EXIT_OK",
     "EXIT_USAGE",
+    "FINDING_ADMISSION_UNPROVED",
     "FINDING_DESTINATION_CHANGED",
     "FINDING_DESTINATION_SOURCE_MISMATCH",
+    "FINDING_GENERATION_SERVED",
+    "FINDING_LOCK_UNAVAILABLE",
     "FINDING_PATH_OVERLAP",
+    "MIGRATION_COMMANDS",
     "REPORT_VERSION",
     "STATUS_ALREADY_PUBLISHED",
     "STATUS_APPLIED",
@@ -180,7 +203,18 @@ FINDING_STAGED_BUILD_FAILED = "staged_build_failed"
 FINDING_STAGED_VERIFICATION_FAILED = "staged_verification_failed"
 FINDING_PUBLICATION_FAILED = "publication_failed"
 
-COMMANDS: tuple[str, ...] = ("plan", "apply", "verify", "rollback")
+#: This module's own verbs. The first is the default, which is why the default
+#: behaviour of the tool is to read and report.
+MIGRATION_COMMANDS: tuple[str, ...] = ("plan", "apply", "verify", "rollback")
+
+#: Every verb this CLI accepts. The last three belong to
+#: :mod:`.graph_generation_runtime` — the runtime side of the same contract —
+#: and are contributed by it rather than implemented here, so an operator has
+#: one tool and the cutover has one implementation. The import is function-local
+#: (see :func:`_parser` and :func:`main`) to keep the dependency one-way: the
+#: runtime adapter reads this module's exit codes, and this module must not
+#: import it at module scope in return.
+COMMANDS: tuple[str, ...] = (*MIGRATION_COMMANDS, "status", "activate", "restore")
 
 #: Test seam, called with ``(staging path, publication target)`` immediately
 #: before the frozen source fingerprint is revalidated and the generation is
@@ -616,13 +650,24 @@ def verify_migration(*, destination: Any, source: Any = None) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def rollback_migration(*, destination: Any) -> dict[str, Any]:
-    """Withdraw an unchanged migration-owned generation, retaining everything.
+    """Withdraw an unchanged, never-served migration-owned generation.
 
-    Three refusals before a single byte moves: an unknown destination entry, a
+    Four refusals before a single byte moves: an unknown destination entry, a
     generation that is not there (reported as nothing to do, not as a failure),
-    and a generation that no longer verifies — which means somebody changed it
-    after the migration, and withdrawing it would be discarding their work
-    rather than undoing ours.
+    a generation a runtime has been given, and one that no longer verifies —
+    which means somebody changed it after the migration, and withdrawing it
+    would be discarding their work rather than undoing ours.
+
+    **The admission check is why this verb has no ``--pointer``.** A withdrawal
+    is given one destination and nothing else; a missing pointer argument,
+    or a pointer that happens to be elsewhere, proves nothing about whether a
+    runtime is serving the target. What does is the destination's own admission
+    ledger, written by an activation *before* it published its pointer — and
+    this verb and that activation take the same generation guard, so a preflight
+    here cannot race a registration there. A generation that was ever admitted
+    is refused for good: not referenced by the current pointer, retained only
+    for a restore, and no longer referenced at all are three situations a legacy
+    withdrawal is not in a position to tell apart.
 
     The withdrawal itself is a rename into ``rollback/``. The journal, the
     graph, the readable files, the vector database, the frozen source backup and
@@ -654,6 +699,44 @@ def rollback_migration(*, destination: Any) -> dict[str, Any]:
             warnings=warnings,
         )
 
+    try:
+        with control_lock(served_lock_path(destination_path), directory=True):
+            return _withdraw(destination_path, target, report, warnings)
+    except ControlLockError as exc:
+        return report(
+            STATUS_ROLLBACK_REFUSED,
+            generation={"generation": str(target), "published": True},
+            findings=[f"{FINDING_LOCK_UNAVAILABLE}:{exc.label}"],
+            warnings=warnings,
+        )
+
+
+def _withdraw(
+    destination_path: Path,
+    target: Path,
+    report: Callable[..., dict[str, Any]],
+    warnings: Sequence[str],
+) -> dict[str, Any]:
+    """Check admission, verify, and rename — all under the generation guard.
+
+    The whole check-then-rename, not just the rename: an admission registered
+    between a preflight and a ``os.rename`` would be exactly the race the guard
+    exists to remove, and the activation holding this same lock is what makes
+    the two operations one serial sequence.
+    """
+    admission = admission_findings(destination_path, target)
+    if admission:
+        return report(
+            STATUS_ROLLBACK_REFUSED,
+            generation={
+                "generation": str(target),
+                "published": True,
+                "admitted": FINDING_GENERATION_SERVED in admission,
+            },
+            findings=admission,
+            warnings=warnings,
+        )
+
     verification = verify_generation(target)
     if not verification.generation_intact:
         return report(
@@ -675,6 +758,7 @@ def rollback_migration(*, destination: Any) -> dict[str, Any]:
             "withdrawn_to": str(withdrawn),
             "destination_prestate": prestate,
             "retained_artifacts": verification.artifacts_checked,
+            "admitted": False,
         },
         verification=verification.to_payload(),
         warnings=[*warnings, *manifest_findings],
@@ -729,10 +813,12 @@ def _parser() -> argparse.ArgumentParser:
     )
     rollback = verbs.add_parser(
         "rollback",
-        help="withdraw an unchanged generation, retaining its artifacts",
+        help="withdraw an unchanged, never-served generation, retaining it",
         description=(
             "Rename a verified, unchanged migration-owned generation into "
-            "rollback/. Refuses a changed or unknown target. Deletes nothing."
+            "rollback/. Refuses a changed or unknown target, and one a runtime "
+            "has been given: there is no --pointer, because a missing argument "
+            "cannot prove a generation is unreferenced. Deletes nothing."
         ),
     )
 
@@ -774,6 +860,13 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="report what apply would do and write nothing",
     )
+
+    # The runtime adapter contributes its own three verbs, with its own flags:
+    # one definition of ``status``/``activate``/``restore``, reachable here and
+    # from ``python -m layered_memory_mcp.graph_generation_runtime``.
+    from .graph_generation_runtime import add_cutover_verbs
+
+    add_cutover_verbs(verbs)
     return parser
 
 
@@ -818,8 +911,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             report = verify_migration(
                 destination=arguments.destination, source=arguments.source
             )
-        else:
+        elif command == "rollback":
             report = rollback_migration(destination=arguments.destination)
+        else:
+            # A runtime verb. Its report carries its own ``exit_code``, decided
+            # by its own success statuses: publishing a generation and serving
+            # one are different operations and do not share a success set.
+            from .graph_generation_runtime import cutover_command
+
+            report = cutover_command(command, arguments)
+            print(json.dumps(report, indent=2, sort_keys=True))
+            return int(report["exit_code"])
     except Exception as exc:  # noqa: BLE001 — named, never quoted (§15)
         print(f"graph_migration_failed:{type(exc).__name__}", file=sys.stderr)
         return EXIT_FAILED

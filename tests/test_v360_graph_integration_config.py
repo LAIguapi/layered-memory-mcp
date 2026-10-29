@@ -187,16 +187,30 @@ def test_an_invalid_mode_in_config_yaml_still_fails_loudly(tmp_path):
 # No backend assembly in the config (§3.1, §5 non-goal 2)
 # ---------------------------------------------------------------------------
 
-def test_enabling_a_mode_constructs_no_graph_backend(tmp_path):
+def test_enabling_a_mode_constructs_no_graph_backend(tmp_path, monkeypatch):
+    """Without a pointer, modes declare targets without resolving or opening them."""
+    import sqlite3
+
+    from layered_memory_mcp import graph_generation_runtime, graph_runtime_assembly
+
+    monkeypatch.delenv("LAYERED_MEMORY_GRAPH_ACTIVE_POINTER", raising=False)
+    monkeypatch.delenv("LAYERED_MEMORY_GRAPH_JOURNAL_PATH", raising=False)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("a config without an active pointer must not resolve or build a backend")
+
+    monkeypatch.setattr(sqlite3, "connect", forbidden)
+    monkeypatch.setattr(graph_generation_runtime, "resolve_generation_runtime", forbidden)
+    for backend in (
+        graph_runtime_assembly.SQLiteGraphStore,
+        graph_runtime_assembly.MemoryEventJournal,
+        graph_runtime_assembly.GraphRuntimeAssembly,
+        graph_runtime_assembly.JournalRuntimeAssembly,
+    ):
+        monkeypatch.setattr(backend, "__init__", forbidden)
+
     config = _config(tmp_path, graph_mode="graph")
 
-    # No store and no handle: the backend is injected by the runtime assembly,
-    # not derived from a config. ``graph_db_path`` is a *declared* target
-    # (§12 Batch I scope item 1) — a string the operator wrote, not a
-    # connection — and it is None unless they wrote one. v3.6.1 adds exactly one
-    # more declared target on the same terms, ``graph_journal_path``: a path the
-    # operator wrote for the semantic decision journal, never a connection and
-    # never derived from ``home``.
     assert not [
         name
         for name in dir(config)
@@ -208,10 +222,14 @@ def test_enabling_a_mode_constructs_no_graph_backend(tmp_path):
             "graph_shadow_enabled",
             "graph_db_path",
             "graph_journal_path",
+            "graph_active_pointer",
+            "_bind_graph_generation",
         }
     ]
     assert config.graph_db_path is None
     assert config.graph_journal_path is None
+    assert config.graph_active_pointer is None
+    assert not [path for path in config.home.rglob("*") if path.is_file()]
 
 
 # ---------------------------------------------------------------------------
@@ -314,9 +332,20 @@ def test_the_config_module_opens_no_graph_database(tmp_path, monkeypatch):
     assert _config(tmp_path, graph_mode="graph").graph_mode == "graph"
 
 
-def test_no_graph_module_is_imported_by_the_config(tmp_path):
-    """The config resolves a string; it does not reach into the graph layer."""
+def test_no_graph_module_is_imported_by_the_config(tmp_path, monkeypatch):
+    """Only explicit, read-only pointer resolution may cross the graph boundary."""
     import ast
+    import sqlite3
+    from unittest.mock import Mock
+
+    from layered_memory_mcp import (
+        graph_generation_runtime,
+        graph_migration,
+        graph_migration_generation,
+        graph_runtime_assembly,
+    )
+    from layered_memory_mcp.storage import vector_store
+    from test_v361_graph_migration import _fake_embed, build_source, tree_state
 
     config_source = Path(__file__).resolve().parents[1].joinpath(
         "src", "layered_memory_mcp", "config.py"
@@ -328,4 +357,79 @@ def test_no_graph_module_is_imported_by_the_config(tmp_path):
             imported.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
             imported.add("." * node.level + (node.module or ""))
-    assert not {name for name in imported if "graph" in name}
+            if node.module == "graph_generation_runtime":
+                assert {alias.name for alias in node.names} == {"resolve_generation_runtime"}
+    assert {name for name in imported if "graph" in name} == {".graph_generation_runtime"}
+
+    for variable in (
+        "LAYERED_MEMORY_GRAPH_ACTIVE_POINTER",
+        "LAYERED_MEMORY_GRAPH_JOURNAL_PATH",
+        "LAYERED_MEMORY_NAMESPACE",
+        "LAYERED_MEMORY_L0_FORMAT",
+        "LAYERED_MEMORY_L0_TAG",
+    ):
+        monkeypatch.delenv(variable, raising=False)
+    monkeypatch.setattr(vector_store, "_embed_texts", _fake_embed)
+    source = build_source(tmp_path / "old-store")
+    control = tmp_path / "control"
+    control.mkdir()
+    destination = control / "migration"
+    migration = graph_migration.apply_migration(source=source, destination=destination)
+    assert migration["status"] == graph_migration.STATUS_APPLIED, migration
+    generation = destination / "current"
+    pointer = control / "active.json"
+    activation = graph_generation_runtime.activate_generation(
+        pointer=pointer, generation=generation, apply=True
+    )
+    assert activation["status"] == graph_generation_runtime.STATUS_CUTOVER_APPLIED, activation
+    before = tree_state(control)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("config binding must not open a database or write generation state")
+
+    for operation in (
+        "activate_generation",
+        "restore_generation",
+        "register_admission",
+        "_write_pointer",
+    ):
+        monkeypatch.setattr(graph_generation_runtime, operation, forbidden)
+    monkeypatch.setattr(graph_migration_generation, "register_admission", forbidden)
+    monkeypatch.setattr(graph_migration, "apply_migration", forbidden)
+    monkeypatch.setattr(graph_migration, "rollback_migration", forbidden)
+    monkeypatch.setattr(Path, "write_text", forbidden)
+    monkeypatch.setattr(Path, "write_bytes", forbidden)
+
+    resolved = graph_generation_runtime.resolve_generation_runtime(
+        pointer=pointer, graph_mode="graph"
+    )
+    assert resolved.usable, resolved.report
+    assert tree_state(control) == before
+
+    resolver = Mock(return_value=resolved)
+    monkeypatch.setattr(graph_generation_runtime, "resolve_generation_runtime", resolver)
+    monkeypatch.setattr(sqlite3, "connect", forbidden)
+    for backend in (
+        graph_runtime_assembly.SQLiteGraphStore,
+        graph_runtime_assembly.MemoryEventJournal,
+        graph_runtime_assembly.GraphRuntimeAssembly,
+        graph_runtime_assembly.JournalRuntimeAssembly,
+    ):
+        monkeypatch.setattr(backend, "__init__", forbidden)
+
+    ordinary = _config(tmp_path, graph_mode="graph")
+    assert ordinary.graph_active_pointer is None
+    assert ordinary.graph_db_path is None
+    assert ordinary.graph_journal_path is None
+    resolver.assert_not_called()
+    assert tree_state(control) == before
+
+    config = _config(tmp_path, graph_mode="graph", graph_active_pointer=pointer)
+    resolver.assert_called_once_with(pointer=pointer, graph_mode="graph")
+    assert config.graph_active_pointer == pointer
+    assert config.graph_db_path == generation / "graph.db"
+    assert config.graph_journal_path == generation / "journal.db"
+    assert config.knowledge_dir == generation / "knowledge"
+    assert config.l0_index_file == generation / "L0.md"
+    assert config.vector_db_path == generation / "data" / "vectors.db"
+    assert tree_state(control) == before

@@ -63,7 +63,7 @@ def _get_v2_stores():
         data_dir = config.home / "data"
         data_dir.mkdir(parents=True, exist_ok=True)
         _v2_stores["l1"] = L1Store(knowledge_dir)
-        _v2_stores["vector"] = VectorStore(data_dir / "vectors.db")
+        _v2_stores["vector"] = VectorStore(config.vector_db_path)
         _v2_stores["review"] = ReviewQueue(data_dir / "review_queue.db")
     return _v2_stores
 
@@ -149,7 +149,7 @@ async def get_l0_index():
     """Return the L0 index as a structured tree."""
     _check_imports()
     config = _get_config()
-    l0_path = config.home / "L0.md"
+    l0_path = config.l0_index_file or config.home / "L0.md"
 
     if not l0_path.exists():
         return {"entries": [], "total": 0, "source": "L0.md not found"}
@@ -287,6 +287,7 @@ async def approve_knowledge(req: ReviewActionRequest):
         # Sync to vector store
         sync_to_vector_store(
             data_dir=_get_config().home / "data",
+            vector_db_path=_get_config().vector_db_path,
             domain=item.entry.domain,
             content=item.entry.content,
             summary=item.entry.summary,
@@ -430,11 +431,10 @@ async def get_health():
 
         # Audit rot
         from layered_memory_mcp.rot_auditor import audit_rot
-        from layered_memory_mcp.config import MemoryConfig as _MC
-        rot_result = audit_rot(_MC())
+        rot_result = audit_rot(config)
 
         # L0-L1 consistency
-        l0_path = config.home / "L0.md"
+        l0_path = config.l0_index_file or config.home / "L0.md"
         consistency = {"l0_exists": l0_path.exists(), "l0_size": l0_path.stat().st_size if l0_path.exists() else 0}
 
         # Vector store stats
@@ -576,7 +576,7 @@ async def get_token_economy():
 
     def _measure():
         config = _get_config()
-        l0_path = config.home / "L0.md"
+        l0_path = config.l0_index_file or config.home / "L0.md"
         knowledge_dir = config.knowledge_dir
 
         l0_chars = l0_path.stat().st_size if l0_path.exists() else 0
@@ -632,7 +632,7 @@ async def get_consistency():
     def _check():
         config = _get_config()
         knowledge_dir = config.knowledge_dir
-        l0_path = config.home / "L0.md"
+        l0_path = config.l0_index_file or config.home / "L0.md"
 
         # L1 domains on disk
         l1_domains = {p.stem for p in knowledge_dir.glob("*.md")}
@@ -661,7 +661,7 @@ async def get_consistency():
         v_domains: set[str] = set()
         try:
             import sqlite3
-            db_path = config.home / "data" / "vectors.db"
+            db_path = config.vector_db_path
             if db_path.exists():
                 conn = sqlite3.connect(str(db_path))
                 try:

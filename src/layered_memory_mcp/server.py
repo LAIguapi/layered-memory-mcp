@@ -84,7 +84,7 @@ def _get_v2_stores():
         data_dir = config.home / "data"
         data_dir.mkdir(parents=True, exist_ok=True)
         _v2_stores["l1"] = L1Store(knowledge_dir)
-        _v2_stores["vector"] = VectorStore(data_dir / "vectors.db")
+        _v2_stores["vector"] = VectorStore(config.vector_db_path)
         _v2_stores["review"] = ReviewQueue(data_dir / "review_queue.db")
         # Warm the embedding model in the background so the first semantic
         # search doesn't block on a cold load (or a one-time ~55MB download).
@@ -1350,6 +1350,7 @@ async def create_knowledge_file(filename: str, content: str) -> str:
         vector_result = await asyncio.to_thread(
             sync_to_vector_store,
             data_dir=config.home / "data",
+            vector_db_path=config.vector_db_path,
             domain=domain,
             content=content,
             replace_domain=True,
@@ -1464,6 +1465,7 @@ async def update_knowledge_file(filename: str, content: str) -> str:
         vector_result = await asyncio.to_thread(
             sync_to_vector_store,
             data_dir=config.home / "data",
+            vector_db_path=config.vector_db_path,
             domain=domain,
             content=content,
             replace_domain=True,
@@ -1582,6 +1584,7 @@ async def delete_knowledge_file(filename: str) -> str:
         await asyncio.to_thread(
             remove_from_vector_store,
             data_dir=config.home / "data",
+            vector_db_path=config.vector_db_path,
             domain=domain,
         )
 

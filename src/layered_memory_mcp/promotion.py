@@ -464,7 +464,7 @@ def scan_cross_domain_duplicates(
             except Exception:
                 threshold = 0.72
 
-        db_path = config.home / "data" / "vectors.db"
+        db_path = config.vector_db_path
         if not db_path.exists():
             return {"success": True, "duplicates": [], "total": 0,
                     "note": "No vector store yet — run reindex_vector_store first."}

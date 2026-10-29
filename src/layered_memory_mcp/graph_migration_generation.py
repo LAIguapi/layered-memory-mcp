@@ -27,9 +27,17 @@ THE GENERATION LAYOUT
         .staging-<token>/              a private generation under construction
         rollback/withdrawn-<stamp>/    a withdrawn generation, retained
         debris/staged-<stamp>/         a staged generation that never published
+        served/<manifest digest>.json  a generation a runtime was given
+        .served.lock                   the generation guard, while it is held
 
-Only those four top-level names are ever created, and any *other* top-level
-entry in a destination is unknown content this module refuses to work beside.
+Only those names are ever created, and any *other* top-level entry in a
+destination is unknown content this module refuses to work beside. The last two
+are the *control plane* rather than generation data: ``served/`` is the
+admission ledger a withdrawal consults (see "Admission" below) and
+``.served.lock`` is the guard an activation and a withdrawal share. Both are
+owned as strictly as everything else — the ledger's own contents are a closed
+set of this tool's records, the lock is tolerated only as a regular file, and
+neither is a licence for anything else to appear in a destination.
 
 WHY A DIRECTORY RENAME IS THE WHOLE TRANSACTION
 -----------------------------------------------
@@ -83,6 +91,9 @@ import json
 import os
 import shutil
 import sqlite3
+import stat
+import threading
+import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -135,24 +146,44 @@ __all__ = [
     "DEBRIS_DIR",
     "DESTINATION_ENTRIES",
     "GENERATION_DIR",
+    "LOCK_TIMEOUT_SECONDS",
     "MANIFEST_DIGEST_NAME",
     "MANIFEST_NAME",
     "MANIFEST_VERSION",
     "ROLLBACK_DIR",
+    "SERVED_DIR",
+    "SERVED_LOCK_NAME",
+    "SERVED_MARKER_SUFFIX",
+    "SERVED_VERSION",
     "STAGING_PREFIX",
+    "FINDING_ADMISSION_UNPROVED",
+    "FINDING_GENERATION_SERVED",
+    "FINDING_LOCK_PATH_REJECTED",
+    "FINDING_LOCK_UNAVAILABLE",
+    "FINDING_SERVED_REJECTED",
     "FINDING_SOURCE_DRIFT",
+    "ControlLockError",
     "GenerationBuild",
     "GenerationConfig",
     "VerificationReport",
+    "admission_findings",
+    "admitted_digests",
     "build_generation",
+    "control_lock",
+    "lock_path_findings",
     "destination_findings",
     "destination_prestate",
     "generation_inventory",
     "manifest_digest",
     "new_staging_path",
+    "owning_destination",
     "publish_generation",
     "quarantine_staging",
     "read_manifest",
+    "register_admission",
+    "served_findings",
+    "served_lock_path",
+    "served_marker_path",
     "verify_generation",
     "withdraw_generation",
     "write_manifest",
@@ -176,10 +207,31 @@ DATA_DIR = "data"
 VECTOR_RELATIVE = "data/vectors.db"
 CHANGELOG_RELATIVE = "data/memory_changelog.jsonl"
 
-#: The only top-level names this tool ever creates in a destination. Anything
-#: else there belongs to somebody else, and a migration that wrote beside it
-#: would be adopting a directory it was merely pointed at.
-DESTINATION_ENTRIES = frozenset({GENERATION_DIR, ROLLBACK_DIR, DEBRIS_DIR})
+#: The destination's admission ledger: one marker per generation a runtime has
+#: been given, named by the manifest digest its pointer attested. See
+#: "Admission" below for why the record lives here and never inside the
+#: generation it describes.
+SERVED_DIR = "served"
+
+#: The generation guard's lock file, a top-level sibling of ``served/``. At the
+#: top level rather than inside the ledger so that taking the guard does not
+#: touch the directory whose contents *are* the record.
+SERVED_LOCK_NAME = ".served.lock"
+
+#: The suffix of one admission record. The stem is its manifest digest.
+SERVED_MARKER_SUFFIX = ".json"
+
+#: The admission record layout version. Recorded, checked, never migrated: a
+#: record this process does not understand makes the destination refusable
+#: rather than being read past.
+SERVED_VERSION = 1
+
+#: The only top-level *directory* names this tool ever creates in a
+#: destination. Anything else there belongs to somebody else, and a migration
+#: that wrote beside it would be adopting a directory it was merely pointed at.
+#: ``served`` is the admission ledger below — a control-plane directory, whose
+#: own contents are owned and validated just as strictly.
+DESTINATION_ENTRIES = frozenset({GENERATION_DIR, ROLLBACK_DIR, DEBRIS_DIR, SERVED_DIR})
 
 #: The manifest layout version. Recorded and checked; never migrated.
 MANIFEST_VERSION = 1
@@ -341,9 +393,522 @@ def destination_findings(destination: Path) -> tuple[list[str], list[str]]:
         if name.startswith(STAGING_PREFIX):
             warnings.append(f"stale_staging_directory:{name}")
             continue
+        if name == SERVED_LOCK_NAME:
+            # The admission guard's lock file: owned by this tool, present only
+            # while an activation or a withdrawal is holding it. Tolerated by
+            # name and only as a regular file, never as a licence for other
+            # files or for a link standing in for one.
+            if child.is_symlink() or not child.is_file():
+                findings.append(f"{FINDING_DESTINATION_UNKNOWN}:{name}")
+            continue
         if name not in DESTINATION_ENTRIES or child.is_symlink() or not child.is_dir():
             findings.append(f"{FINDING_DESTINATION_UNKNOWN}:{name}")
+    # The admission ledger is a destination entry like any other: its *contents*
+    # are owned too, so a stray file or a forged record in there makes the
+    # destination refusable rather than quietly ignored.
+    findings.extend(served_findings(destination))
     return findings, warnings
+
+
+# ---------------------------------------------------------------------------
+# Admission — which generations a runtime has been given
+#
+# The record a legacy withdrawal consults before it moves anything. It lives
+# here, beside the destination's own shape, for two reasons: the withdrawal is
+# given nothing but a destination, so this is the only place it can look; and a
+# served generation is *writable* and its manifest is the attestation a pointer
+# binds, so a marker written inside it would be editing the evidence.
+#
+# Conservative on purpose. An admission is never retracted: "no pointer argument
+# was supplied" and "the pointer no longer mentions it" are not proofs that
+# nothing is using a generation, and a withdrawal that acted on either of them
+# is the availability failure this ledger exists to prevent. Re-publishing is
+# unaffected — a fresh generation has a fresh manifest digest and therefore no
+# record.
+# ---------------------------------------------------------------------------
+
+#: A generation a runtime was given, and which therefore may not be moved by a
+#: legacy withdrawal. Durable, and deliberately not conditional on the
+#: generation still being referenced.
+FINDING_GENERATION_SERVED = "generation_admitted_to_runtime"
+
+#: The ledger holds something this tool did not write, or wrote in a version it
+#: does not speak. Suffixed with the entry and the reason. Fail-closed: every
+#: caller refuses, because an unreadable ledger cannot establish that a
+#: generation was *not* admitted.
+FINDING_SERVED_REJECTED = "served_record_rejected"
+
+#: Whether this generation was ever admitted could not be established — its
+#: manifest is missing, unreadable or does not match its own digest, so there is
+#: no identity to look up. A refusal, for the same reason.
+FINDING_ADMISSION_UNPROVED = "generation_admission_unproved"
+
+_HEX_DIGITS = frozenset("0123456789abcdef")
+
+
+def _is_digest(value: Any) -> bool:
+    """Whether ``value`` is a lowercase 64-character hexadecimal digest."""
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and frozenset(value) <= _HEX_DIGITS
+    )
+
+
+def owning_destination(generation: Path) -> Path | None:
+    """The destination whose ``rollback`` verb could move ``generation``.
+
+    Derived from the two positions this module ever puts a generation in — the
+    publication target and a retained withdrawal — rather than from a search:
+    ``<destination>/current`` and ``<destination>/rollback/withdrawn-…`` are the
+    only trees a withdrawal can reach, so a generation anywhere else needs no
+    admission record to be safe from one. ``None`` says exactly that.
+    """
+    parent = generation.parent
+    if generation.name == GENERATION_DIR:
+        return parent
+    if parent.name == ROLLBACK_DIR:
+        return parent.parent
+    return None
+
+
+def served_lock_path(destination: Path) -> Path:
+    """The validated reserved name for the destination's directory-inode guard."""
+    return destination / SERVED_LOCK_NAME
+
+
+def served_marker_path(destination: Path, digest: str) -> Path:
+    """The admission record for the generation attesting ``digest``."""
+    return destination / SERVED_DIR / f"{digest}{SERVED_MARKER_SUFFIX}"
+
+
+def _read_admission(marker: Path) -> tuple[dict[str, Any] | None, str]:
+    """``(record, refusal label)`` for one admission marker. Reads only."""
+    try:
+        body = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return None, type(exc).__name__
+    if not isinstance(body, dict):
+        return None, "not_a_mapping"
+    if body.get("served_version") != SERVED_VERSION:
+        return None, "version_unsupported"
+    digest = body.get("manifest_sha256")
+    if not _is_digest(digest) or f"{digest}{SERVED_MARKER_SUFFIX}" != marker.name:
+        return None, "digest_mismatch"
+    declared = body.get("generation")
+    destination = marker.parent.parent
+    if not isinstance(declared, str) or _safe_member(destination, declared) is None:
+        return None, "generation_rejected"
+    return body, ""
+
+
+def served_findings(destination: Path) -> list[str]:
+    """Why a destination's admission ledger may not be believed, if it may not.
+
+    Reads only, creates nothing, and names every entry it refuses. The ledger is
+    a closed set of names — one ``<64 hex digits>.json`` record per admitted
+    generation, each a regular file this tool wrote — so a planted file, a
+    symlink, a forged record or an unknown version is a refusal rather than an
+    entry to skip. Skipping one would be answering "never admitted" from a
+    ledger that could not be read.
+    """
+    served = destination / SERVED_DIR
+    if served.is_symlink():
+        return [f"{FINDING_SERVED_REJECTED}:{SERVED_DIR}:symlink"]
+    if not served.exists():
+        return []
+    if not served.is_dir():
+        return [f"{FINDING_SERVED_REJECTED}:{SERVED_DIR}:not_a_directory"]
+
+    findings: list[str] = []
+    for child in sorted(served.iterdir(), key=lambda path: path.name):
+        name = child.name
+        if child.is_symlink():
+            findings.append(f"{FINDING_SERVED_REJECTED}:{name}:symlink")
+            continue
+        if not child.is_file():
+            findings.append(f"{FINDING_SERVED_REJECTED}:{name}:not_a_file")
+            continue
+        stem = name[: -len(SERVED_MARKER_SUFFIX)]
+        if not name.endswith(SERVED_MARKER_SUFFIX) or not _is_digest(stem):
+            findings.append(f"{FINDING_SERVED_REJECTED}:{name}:unknown")
+            continue
+        _record, rejection = _read_admission(child)
+        if rejection:
+            findings.append(f"{FINDING_SERVED_REJECTED}:{name}:{rejection}")
+    return findings
+
+
+def admitted_digests(destination: Path) -> tuple[frozenset[str], list[str]]:
+    """``(admitted manifest digests, findings)`` for one destination.
+
+    Reads only: an absent ledger is an empty set and not a fault — that is the
+    ordinary state of a destination nothing has served. Any finding makes the
+    set meaningless and every caller refuses on it.
+    """
+    findings = served_findings(destination)
+    if findings:
+        return frozenset(), findings
+    served = destination / SERVED_DIR
+    if not served.is_dir():
+        return frozenset(), []
+    return (
+        frozenset(
+            path.name[: -len(SERVED_MARKER_SUFFIX)]
+            for path in served.iterdir()
+            if path.name.endswith(SERVED_MARKER_SUFFIX)
+        ),
+        [],
+    )
+
+
+def register_admission(
+    destination: Path, generation: Path, digest: str, *, tool: str
+) -> Path:
+    """Record that ``generation`` was admitted to a runtime. Idempotent.
+
+    Written before the pointer that publishes it, under the generation guard, so
+    a withdrawal either sees the record and refuses or has already moved the
+    generation and makes the activation refuse. The record is one small JSON
+    object, written to a private temporary file and moved into place, and an
+    existing record for the same digest is left exactly as it is: a repeated
+    activation of a generation already admitted writes nothing at all.
+
+    Raises:
+        ValueError: ``digest`` is not a manifest digest, so there is no identity
+            to record. The caller has proved the generation by this point, so
+            this is a programming fault rather than an operator one.
+    """
+    if not _is_digest(digest):
+        raise ValueError(FINDING_ADMISSION_UNPROVED)
+    marker = served_marker_path(destination, digest)
+    if marker.is_file():
+        return marker
+    served = marker.parent
+    served.mkdir(parents=True, exist_ok=True)
+    body = json.dumps(
+        {
+            "served_version": SERVED_VERSION,
+            "tool": tool,
+            "generation": generation.relative_to(destination).as_posix(),
+            "manifest_sha256": digest,
+            "admitted_at": datetime.now(timezone.utc).isoformat(),
+        },
+        sort_keys=True,
+        indent=2,
+    ) + "\n"
+    temporary = served / f".{digest[:12]}.{uuid.uuid4().hex[:12]}.tmp"
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(body)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, marker)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    handle = os.open(served, os.O_RDONLY)
+    try:
+        os.fsync(handle)
+    except OSError:  # pragma: no cover - a filesystem that cannot sync a dir
+        pass
+    finally:
+        os.close(handle)
+    return marker
+
+
+def admission_findings(destination: Path, generation: Path) -> list[str]:
+    """Why ``generation`` may not be withdrawn from ``destination``, if it may not.
+
+    Three answers and no inference between them: the ledger could not be read,
+    the generation has no readable identity to look up, or it has one and it is
+    in the ledger. An empty list means a readable ledger that does not contain
+    this generation — the only basis on which a withdrawal may proceed.
+    """
+    digests, findings = admitted_digests(destination)
+    if findings:
+        return findings
+    manifest, manifest_findings = read_manifest(generation)
+    if manifest is None or manifest_findings:
+        return [f"{FINDING_ADMISSION_UNPROVED}:manifest"]
+    if manifest_digest(manifest) in digests:
+        return [FINDING_GENERATION_SERVED]
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Control-plane mutual exclusion
+#
+# The one lock implementation the control plane has, used for the pointer
+# interval (owned by :mod:`.graph_generation_runtime`) and for the generation
+# admission guard below. One implementation rather than two, because two locks
+# with two acquisition disciplines is how a deadlock or a missed interval is
+# introduced.
+# ---------------------------------------------------------------------------
+
+#: How long an operation waits for a control-plane lock another process or
+#: thread is holding. Long on purpose: the contended case is a second operator
+#: command, and waiting for it is the correct answer. A refusal is reserved for
+#: a lock that is genuinely unobtainable.
+LOCK_TIMEOUT_SECONDS = 120.0
+
+#: Why a lock could not be taken, as bounded labels carried on
+#: :class:`ControlLockError`: another holder outlasted the timeout
+#: (``busy``/``busy_thread``), the path may not hold a lock file
+#: (``path_rejected:…``), or this thread already holds it (``reentrant``).
+FINDING_LOCK_UNAVAILABLE = "control_lock_unavailable"
+FINDING_LOCK_PATH_REJECTED = "control_lock_path_rejected"
+
+
+class ControlLockError(RuntimeError):
+    """A control-plane lock that could not be taken, named by a bounded label.
+
+    Raised rather than returned because every caller is inside a report-building
+    function that already knows how to turn one label into its own refusal
+    status; an exception keeps the "we never entered the interval" path from
+    looking like a result.
+    """
+
+    def __init__(self, label: str) -> None:
+        super().__init__(label)
+        self.label = label
+
+
+#: One re-entrancy-detecting mutex per lock path, for threads of *this* process.
+#: Thread ownership also detects reentry before waiting for the kernel lock.
+#: The thread mutex is always taken *before* the file lock, in every
+#: caller, which is what makes the two layers deadlock-free.
+_THREAD_LOCKS: dict[str, threading.Lock] = {}
+_THREAD_LOCKS_GUARD = threading.Lock()
+
+#: The lock paths this thread is already inside. A second acquisition of the
+#: same path on one thread is a programming fault, and a plain mutex would
+#: answer it with a hang; it is named and raised instead, so a mistaken nesting
+#: (or an injected one) fails fast rather than stopping the process.
+_HELD_PATHS = threading.local()
+
+
+def lock_path_findings(path: Path) -> list[str]:
+    """Why a lock file may not be created at ``path``, if it may not.
+
+    Creates nothing. A symlink is refused rather than followed — a lock file is
+    a control-plane artifact, and one that resolves elsewhere would serialise
+    the wrong thing while looking exactly like serialisation. An existing
+    non-file is refused, and so is a parent that is not already a directory:
+    the directory a lock lives in is validated by the operation that owns it and
+    is never brought into existence by taking a lock.
+    """
+    if path.is_symlink():
+        return [f"{FINDING_LOCK_PATH_REJECTED}:symlink"]
+    if path.exists() and not path.is_file():
+        return [f"{FINDING_LOCK_PATH_REJECTED}:not_a_file"]
+    parent = path.parent
+    if parent.is_symlink():
+        return [f"{FINDING_LOCK_PATH_REJECTED}:parent_symlink"]
+    if not parent.is_dir():
+        return [f"{FINDING_LOCK_PATH_REJECTED}:parent_absent"]
+    return []
+
+
+@contextmanager
+def control_lock(
+    path: Path, *, timeout: float = LOCK_TIMEOUT_SECONDS, directory: bool = False
+) -> Iterator[None]:
+    """Hold one control-plane lock across threads **and** processes.
+
+    Two layers, always in the same order — thread mutex, then file lock — so
+    that two operations in one process exclude each other for the same reason
+    two operations in two processes do, and so that no caller can produce a lock
+    cycle by taking them the other way round.
+
+    With ``directory=True``, lock the existing parent directory's inode instead
+    of creating a file. All guards in that directory then share one lock,
+    without changing any member or directory mtime. The reserved ``path``
+    is still validated, but never opened. Unsupported directory locking refuses
+    closed rather than falling back to a filesystem write or an unlocked run.
+
+    Otherwise lock the named file's inode. Normal release unlinks the file
+    while still holding its lock, then closes the descriptor. A waiter that
+    opened the old inode must retry rather than enter on an unlinked lock.
+    Process death releases the kernel lock; a subsequent holder removes any
+    abandoned file on normal exit. Neither mode falls back to a soft lock.
+
+    Raises:
+        ControlLockError: the path may not hold a lock, this thread already
+            holds it, or another holder outlasted ``timeout``. The interval was
+            never entered, so the caller has written nothing.
+    """
+    if directory:
+        with _directory_control_lock(path, timeout=timeout):
+            yield
+        return
+
+    key = os.fspath(path)
+    held = getattr(_HELD_PATHS, "paths", None)
+    if held is None:
+        held = set()
+        _HELD_PATHS.paths = held
+    if key in held:
+        raise ControlLockError("reentrant")
+
+    rejected = lock_path_findings(path)
+    if rejected:
+        raise ControlLockError(rejected[0])
+
+    with _THREAD_LOCKS_GUARD:
+        mutex = _THREAD_LOCKS.setdefault(key, threading.Lock())
+    if not mutex.acquire(timeout=timeout):
+        raise ControlLockError("busy_thread")
+    held.add(key)
+
+    try:
+        with _file_control_lock(path, timeout=timeout):
+            yield
+    finally:
+        held.discard(key)
+        mutex.release()
+
+
+@contextmanager
+def _file_control_lock(path: Path, *, timeout: float) -> Iterator[None]:
+    """Own the file inode and its unlink lifecycle, independently of filelock.
+
+    Path identity is checked after acquisition: a waiter may have opened the
+    inode before its last holder unlinked it. Cleanup only removes our own
+    inode, and always closes the descriptor even if unlink fails.
+    """
+    try:
+        import fcntl
+
+        flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW
+    except (ImportError, AttributeError) as exc:
+        raise ControlLockError(f"{FINDING_LOCK_PATH_REJECTED}:unsupported") from exc
+
+    descriptor = None
+    deadline = time.monotonic() + timeout
+    try:
+        try:
+            while True:
+                rejected = lock_path_findings(path)
+                if rejected:
+                    raise ControlLockError(rejected[0])
+                descriptor = os.open(path, flags, 0o644)
+                identity = os.fstat(descriptor)
+                if not stat.S_ISREG(identity.st_mode):
+                    raise ControlLockError(f"{FINDING_LOCK_PATH_REJECTED}:not_a_file")
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    pass
+                else:
+                    try:
+                        current = path.stat(follow_symlinks=False)
+                    except FileNotFoundError:
+                        current = None
+                    if current is not None and (current.st_dev, current.st_ino) == (
+                        identity.st_dev, identity.st_ino
+                    ):
+                        break
+                os.close(descriptor)
+                descriptor = None
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ControlLockError("busy")
+                time.sleep(min(0.05, remaining))
+        except OSError as exc:
+            raise ControlLockError(
+                f"{FINDING_LOCK_PATH_REJECTED}:{type(exc).__name__}"
+            ) from exc
+        try:
+            yield
+        finally:
+            try:
+                current = path.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                current = None
+            if current is not None and (current.st_dev, current.st_ino) == (
+                identity.st_dev, identity.st_ino
+            ):
+                path.unlink()
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+@contextmanager
+def _directory_control_lock(path: Path, *, timeout: float) -> Iterator[None]:
+    """Lock a read-only directory descriptor, with no create/unlink lifecycle.
+
+    Kernel ownership ends on close or process death. Thread ownership is keyed
+    by the same device/inode identity, not the reserved lock filename, so two
+    guards in one root cannot deadlock through an undetected reentry.
+    """
+    try:
+        import fcntl
+
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    except (ImportError, AttributeError) as exc:
+        raise ControlLockError(f"{FINDING_LOCK_PATH_REJECTED}:unsupported") from exc
+
+    try:
+        rejected = lock_path_findings(path)
+        if rejected:
+            raise ControlLockError(rejected[0])
+        descriptor = os.open(path.parent, flags)
+    except OSError as exc:
+        raise ControlLockError(
+            f"{FINDING_LOCK_PATH_REJECTED}:{type(exc).__name__}"
+        ) from exc
+
+    try:
+        try:
+            identity = os.fstat(descriptor)
+        except OSError as exc:
+            raise ControlLockError(
+                f"{FINDING_LOCK_PATH_REJECTED}:{type(exc).__name__}"
+            ) from exc
+        key = f"directory:{identity.st_dev}:{identity.st_ino}"
+        held = getattr(_HELD_PATHS, "paths", None)
+        if held is None:
+            held = set()
+            _HELD_PATHS.paths = held
+        if key in held:
+            raise ControlLockError("reentrant")
+
+        with _THREAD_LOCKS_GUARD:
+            mutex = _THREAD_LOCKS.setdefault(key, threading.Lock())
+        deadline = time.monotonic() + timeout
+        if not mutex.acquire(timeout=timeout):
+            raise ControlLockError("busy_thread")
+        held.add(key)
+        try:
+            try:
+                while True:
+                    try:
+                        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise ControlLockError("busy")
+                        time.sleep(min(0.05, remaining))
+                current = path.parent.stat(follow_symlinks=False)
+                if (current.st_dev, current.st_ino) != (identity.st_dev, identity.st_ino):
+                    raise ControlLockError(f"{FINDING_LOCK_PATH_REJECTED}:parent_changed")
+                rejected = lock_path_findings(path)
+                if rejected:
+                    raise ControlLockError(rejected[0])
+            except OSError as exc:
+                raise ControlLockError(
+                    f"{FINDING_LOCK_PATH_REJECTED}:{type(exc).__name__}"
+                ) from exc
+            yield
+        finally:
+            held.discard(key)
+            mutex.release()
+    finally:
+        os.close(descriptor)
 
 
 def new_staging_path(destination: Path) -> Path:

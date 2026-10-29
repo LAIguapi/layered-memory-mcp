@@ -386,6 +386,16 @@ _GRAPH_RECALL_MODES = ("graph_recall", "graph")
 #: Modes in which an explicit semantic write decision may reach a store.
 _GRAPH_WRITE_MODES = ("graph_write", "graph")
 
+#: Modes in which something graph-shaped is switched on at all — every mode
+#: except ``"legacy"``, listed explicitly so that adding a mode has to state
+#: which side of the switch it is on.
+#:
+#: Deliberately not spelled ``!= DEFAULT_GRAPH_MODE``: ``"legacy"`` is the
+#: *contract* for a disabled graph, while the default is a rollout choice an
+#: operator may one day move. Deriving this from the default would invert every
+#: caller's meaning the day the default changes.
+_GRAPH_ENABLED_MODES = ("shadow", "graph_recall", "graph_write", "graph")
+
 
 def _normalize_agent_extensions(raw: object) -> dict:
     """Normalise the ``agent_extensions`` section to a complete, safe shape.
@@ -590,6 +600,7 @@ class MemoryConfig:
         # v3.6.1 — the semantic decision journal (the write authority). Same
         # resolution and validation rules as graph_db_path, declared separately.
         graph_journal_path: str | None = None,
+        graph_active_pointer: str | Path | None = None,
     ):
         self.home = Path(home) if home else default_home()
 
@@ -1247,12 +1258,77 @@ class MemoryConfig:
         else:
             self._knowledge_root = self.knowledge_dir
             self._shared_knowledge_dir = None  # already in knowledge_dir
+
+        self.vector_db_path: Path = self.home / "data" / "vectors.db"
+        pointer_setting = (
+            graph_active_pointer
+            if graph_active_pointer is not None
+            else os.environ.get(
+                "LAYERED_MEMORY_GRAPH_ACTIVE_POINTER", _graph_yaml.get("active_pointer")
+            )
+        )
+        self.graph_active_pointer = _resolve_graph_db_path(
+            pointer_setting, field="graph_active_pointer"
+        )
+        if pointer_setting is not None and self.graph_active_pointer is None:
+            raise ValueError("Invalid graph_active_pointer: an explicit pointer must not be blank.")
+        if self.graph_active_pointer is not None:
+            self._bind_graph_generation(explicit_knowledge=bool(knowledge_dir))
         
         # Ensure directories exist
         self.home.mkdir(parents=True, exist_ok=True)
         self.knowledge_dir.mkdir(parents=True, exist_ok=True)
         if self._shared_knowledge_dir:
             self._shared_knowledge_dir.mkdir(parents=True, exist_ok=True)
+
+    def _bind_graph_generation(self, *, explicit_knowledge: bool) -> None:
+        """Validate the explicit authority before creating any service directories.
+
+        The existing resolver owns attestation and read-only health. Its fixed
+        layout supports shared knowledge and the default L0 rendering only;
+        the manifest does not attest arbitrary namespace, format or tag choices.
+        Auxiliary service state remains under this configuration's own home.
+        """
+        from .graph_generation_runtime import resolve_generation_runtime
+
+        if self.graph_mode != "graph":
+            raise ValueError("graph_active_pointer requires authoritative graph_mode='graph'.")
+        if self.namespace != "shared":
+            raise ValueError("graph_active_pointer does not support a namespaced generation layout.")
+        if self.l0_format != "hermes" or self.l0_tag != "[L0]":
+            raise ValueError("graph_active_pointer does not support this L0 format/tag layout.")
+
+        runtime = resolve_generation_runtime(
+            pointer=self.graph_active_pointer, graph_mode=self.graph_mode
+        )
+        if not runtime.usable or runtime.config is None:
+            raise ValueError(
+                f"Invalid graph_active_pointer: {runtime.report.status}: "
+                + ", ".join(runtime.report.findings)
+            )
+        bound = runtime.config
+        for field in ("l0_index_file", "vector_db_path"):
+            if not getattr(bound, field).is_file():
+                raise ValueError(f"graph_active_pointer requires an existing {field}.")
+        if not bound.knowledge_dir.is_dir():
+            raise ValueError("graph_active_pointer requires an existing knowledge_dir.")
+        declared_paths = {
+            "graph_db_path": self.graph_db_path,
+            "graph_journal_path": self.graph_journal_path,
+            "knowledge_dir": self.knowledge_dir if explicit_knowledge else None,
+            "l0_index_file": self.l0_index_file,
+        }
+        for field, declared in declared_paths.items():
+            if declared is not None and Path(declared).resolve() != getattr(bound, field).resolve():
+                raise ValueError(f"graph_active_pointer conflicts with explicit {field}.")
+
+        self.graph_db_path = bound.graph_db_path
+        self.graph_journal_path = bound.graph_journal_path
+        self.knowledge_dir = bound.knowledge_dir
+        self._knowledge_root = bound.knowledge_dir
+        self._shared_knowledge_dir = None
+        self.l0_index_file = bound.l0_index_file
+        self.vector_db_path = bound.vector_db_path
 
     # ------------------------------------------------------------------
     # Agent-native environment (adapters/environment.py)
@@ -1372,8 +1448,14 @@ class MemoryConfig:
 
     @property
     def graph_enabled(self) -> bool:
-        """Whether anything graph-shaped is switched on at all."""
-        return self.graph_mode != DEFAULT_GRAPH_MODE
+        """Whether anything graph-shaped is switched on at all.
+
+        Reads the explicit legacy contract, *not* ``DEFAULT_GRAPH_MODE``: if the
+        rollout default ever moves off ``"legacy"``, a comparison against the
+        default would start reporting a graph-enabled config as disabled (and
+        legacy as enabled) everywhere at once.
+        """
+        return self.graph_mode in _GRAPH_ENABLED_MODES
 
     @property
     def graph_recall_enabled(self) -> bool:

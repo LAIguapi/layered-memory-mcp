@@ -37,6 +37,7 @@ import numpy as np
 import pytest
 
 from layered_memory_mcp import graph_migration
+from layered_memory_mcp import graph_migration_generation as generation_module
 from layered_memory_mcp.graph_entry_identity import markdown_section_entry_id
 from layered_memory_mcp.graph_fixture_store import InMemoryGraphStore
 from layered_memory_mcp.graph_journal import (
@@ -266,13 +267,26 @@ def destination(tmp_path) -> Path:
 
 # ---------------------------------------------------------------------------
 # Tree snapshots — content, membership and modification times
+#
+# Including the snapshotted directory's **own** modification time, which is the
+# one thing these baselines used to miss: a file created and removed inside a
+# directory leaves the directory's contents identical and its own ``mtime``
+# changed, so a snapshot that only described the children could not see a
+# transient lock, marker or temporary file at the top level at all.
 # ---------------------------------------------------------------------------
 
+#: The key :func:`tree_state` records the snapshotted directory itself under.
+#: Named rather than spelled out, because the few places that must compare
+#: everything *except* this one entry have to say so explicitly.
+ROOT_KEY = "./"
+
+
 def tree_state(root: Path) -> dict[str, tuple]:
-    """Every path under ``root`` with its kind, size, mtime and content hash."""
+    """Every path under ``root`` — and ``root`` itself — with kind, size, mtime
+    and content hash."""
     if not root.exists():
         return {}
-    state: dict[str, tuple] = {}
+    state: dict[str, tuple] = {ROOT_KEY: ("dir", root.lstat().st_mtime_ns)}
     for path in sorted(root.rglob("*")):
         rel = path.relative_to(root).as_posix()
         stat = path.lstat()
@@ -288,6 +302,22 @@ def tree_state(root: Path) -> dict[str, tuple]:
                 hashlib.sha256(path.read_bytes()).hexdigest(),
             )
     return state
+
+
+def changed_paths(before: dict[str, tuple], after: dict[str, tuple]) -> set[str]:
+    """Every snapshot key that differs between two :func:`tree_state` calls.
+
+    Used instead of a bare equality where the expected difference has to be
+    *named*: an applying operation serialises itself with a lock file in the
+    directory it is about to write in, and creating and removing that file
+    changes that directory's own ``mtime`` even when the operation goes on to
+    write nothing at all. A test for such an operation asserts that the set of
+    differences is at most :data:`ROOT_KEY` — every member, every
+    subdirectory's own ``mtime`` and every byte identical — and then asserts
+    separately that no lock or temporary file was left behind. Nothing here
+    excuses a changed *file*, an appeared member or a touched subdirectory.
+    """
+    return {key for key in {*before, *after} if before.get(key) != after.get(key)}
 
 
 def vector_rows(path: Path) -> list[tuple]:
@@ -1530,6 +1560,7 @@ def test_rollback_refuses_a_changed_target(source, destination):
     assert report["exit_code"] == graph_migration.EXIT_BLOCKED
     assert generation(destination).exists()
     assert tree_state(destination) == before
+    assert not generation_module.served_lock_path(destination).exists()
 
 
 def test_rollback_refuses_unknown_destination_contents(source, destination):
@@ -1557,3 +1588,242 @@ def test_apply_after_rollback_republishes_from_the_retained_source(
     # The withdrawn generation is retained, not reused and not deleted.
     assert retained.is_dir()
     assert (retained / "manifest.json").is_file()
+
+
+# ---------------------------------------------------------------------------
+# The admission ledger: a destination entry, owned as strictly as the rest
+#
+# ``served/`` is where an activation records that a runtime has been given a
+# generation, and ``.served.lock`` is the guard both operations take. They are
+# the only control artifacts this destination grows, and adding them must not
+# turn the destination into a place arbitrary files are tolerated: every name in
+# there is this tool's, every record is this tool's format, and anything else
+# makes the destination refusable exactly as a stray file always has.
+# ---------------------------------------------------------------------------
+
+def served(destination: Path) -> Path:
+    return destination / generation_module.SERVED_DIR
+
+
+def admit(destination: Path) -> str:
+    """Record a genuine admission for the published generation, as the tool does."""
+    body, findings = generation_module.read_manifest(generation(destination))
+    assert body is not None and findings == [], findings
+    digest = generation_module.manifest_digest(body)
+    generation_module.register_admission(
+        destination, generation(destination), digest, tool="test"
+    )
+    return digest
+
+
+def test_the_admission_ledger_is_an_owned_destination_entry(source, destination):
+    graph_migration.apply_migration(source=source, destination=destination)
+    digest = admit(destination)
+
+    findings, warnings = generation_module.destination_findings(destination)
+
+    assert findings == []
+    assert warnings == []
+    assert served(destination).is_dir()
+    assert generation_module.admitted_digests(destination) == (frozenset({digest}), [])
+    # A verify still reads the generation and reports it intact beside it.
+    verified = graph_migration.verify_migration(destination=destination)
+    assert verified["status"] == graph_migration.STATUS_VERIFIED
+
+
+def test_a_repeated_admission_of_one_generation_writes_nothing_new(
+    source, destination
+):
+    graph_migration.apply_migration(source=source, destination=destination)
+    digest = admit(destination)
+    before = tree_state(destination)
+
+    assert admit(destination) == digest
+
+    assert tree_state(destination) == before
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["stray.json", "notes.txt", "deadbeef.json", "", "0123456789abcdef.json"],
+)
+def test_an_unknown_file_in_the_admission_ledger_refuses_the_destination(
+    source, destination, name
+):
+    """The ledger is a closed set of names, not a tolerated directory."""
+    graph_migration.apply_migration(source=source, destination=destination)
+    admit(destination)
+    served(destination).mkdir(parents=True, exist_ok=True)
+    stray = served(destination) / (name or "no-suffix")
+    stray.write_text("{}", encoding="utf-8")
+    before = tree_state(destination)
+
+    findings, _warnings = generation_module.destination_findings(destination)
+    report = graph_migration.rollback_migration(destination=destination)
+
+    assert any(
+        finding.startswith(generation_module.FINDING_SERVED_REJECTED)
+        for finding in findings
+    ), findings
+    assert report["status"] == graph_migration.STATUS_ROLLBACK_REFUSED
+    assert generation(destination).is_dir()
+    assert tree_state(destination) == before
+
+
+def test_a_symlinked_admission_record_refuses_the_destination(
+    source, destination, tmp_path
+):
+    graph_migration.apply_migration(source=source, destination=destination)
+    digest = admit(destination)
+    elsewhere = tmp_path / "elsewhere.json"
+    elsewhere.write_text("{}", encoding="utf-8")
+    link = served(destination) / f"{'b' * 64}.json"
+    link.symlink_to(elsewhere)
+
+    findings, _warnings = generation_module.destination_findings(destination)
+    report = graph_migration.rollback_migration(destination=destination)
+
+    rejected = f"{generation_module.FINDING_SERVED_REJECTED}:{link.name}:symlink"
+    assert rejected in findings
+    assert report["status"] == graph_migration.STATUS_ROLLBACK_REFUSED
+    assert generation(destination).is_dir()
+    # The planted link is refused by name; the genuine record is left alone.
+    assert (served(destination) / f"{digest}.json").is_file()
+    assert elsewhere.read_text(encoding="utf-8") == "{}"
+
+
+@pytest.mark.parametrize(
+    ("body", "reason"),
+    [
+        ("not json at all", "JSONDecodeError"),
+        ("[]", "not_a_mapping"),
+        ('{"served_version": 99, "manifest_sha256": "", "generation": "current"}',
+         "version_unsupported"),
+        ('{"served_version": 1, "manifest_sha256": "nope", "generation": "current"}',
+         "digest_mismatch"),
+        ('{"served_version": 1, "manifest_sha256": "%s", "generation": "../escape"}'
+         % ("c" * 64),
+         "generation_rejected"),
+    ],
+)
+def test_a_forged_admission_record_fails_closed(source, destination, body, reason):
+    """An unreadable ledger cannot establish that a generation was *not* served."""
+    graph_migration.apply_migration(source=source, destination=destination)
+    served(destination).mkdir(parents=True, exist_ok=True)
+    marker = served(destination) / f"{'c' * 64}.json"
+    marker.write_text(body, encoding="utf-8")
+    before = tree_state(destination)
+
+    findings, _warnings = generation_module.destination_findings(destination)
+    report = graph_migration.rollback_migration(destination=destination)
+
+    assert f"{generation_module.FINDING_SERVED_REJECTED}:{marker.name}:{reason}" in (
+        findings
+    ), findings
+    assert report["status"] == graph_migration.STATUS_ROLLBACK_REFUSED
+    assert generation(destination).is_dir()
+    assert tree_state(destination) == before
+
+
+@pytest.mark.parametrize("kind", ["symlink", "file"])
+def test_an_unusable_admission_ledger_refuses_the_destination(
+    source, destination, tmp_path, kind
+):
+    graph_migration.apply_migration(source=source, destination=destination)
+    if kind == "symlink":
+        target = tmp_path / "ledger"
+        target.mkdir()
+        served(destination).symlink_to(target, target_is_directory=True)
+        expected = f"{generation_module.FINDING_SERVED_REJECTED}:served:symlink"
+    else:
+        served(destination).write_text("not a directory\n", encoding="utf-8")
+        expected = f"{generation_module.FINDING_SERVED_REJECTED}:served:not_a_directory"
+
+    findings, _warnings = generation_module.destination_findings(destination)
+    report = graph_migration.rollback_migration(destination=destination)
+    planned = graph_migration.plan_migration(source=source, destination=destination)
+
+    assert expected in findings
+    assert report["status"] == graph_migration.STATUS_ROLLBACK_REFUSED
+    assert planned["status"] == graph_migration.STATUS_DESTINATION_REFUSED
+    assert generation(destination).is_dir()
+
+
+@pytest.mark.parametrize("kind", ["symlink", "directory"])
+def test_a_guard_lock_path_that_is_not_a_lock_refuses_the_destination(
+    source, destination, tmp_path, kind
+):
+    """The unused reserved guard path must still be absent or a regular file."""
+    graph_migration.apply_migration(source=source, destination=destination)
+    lock = generation_module.served_lock_path(destination)
+    if kind == "symlink":
+        elsewhere = tmp_path / "lock-elsewhere"
+        elsewhere.write_text("", encoding="utf-8")
+        lock.symlink_to(elsewhere)
+    else:
+        lock.mkdir()
+    before = tree_state(destination)
+
+    findings, _warnings = generation_module.destination_findings(destination)
+    report = graph_migration.rollback_migration(destination=destination)
+
+    assert f"{generation_module.FINDING_DESTINATION_UNKNOWN}:{lock.name}" in findings
+    assert report["status"] == graph_migration.STATUS_ROLLBACK_REFUSED
+    assert generation(destination).is_dir()
+    assert tree_state(destination) == before
+
+
+def test_a_generation_with_no_readable_identity_is_not_withdrawn(
+    source, destination
+):
+    """No identity, no lookup, no withdrawal: the ledger cannot clear it.
+
+    A manifest that does not match its own digest sidecar makes "was this ever
+    admitted?" unanswerable, and an unanswerable question is a refusal here —
+    the same direction every other guard in this module fails in.
+    """
+    graph_migration.apply_migration(source=source, destination=destination)
+    manifest = generation(destination) / "manifest.json"
+    body = json.loads(manifest.read_text(encoding="utf-8"))
+    body["counts"] = {"tampered": 1}
+    manifest.write_text(json.dumps(body, indent=2) + "\n", encoding="utf-8")
+    before = tree_state(destination)
+
+    report = graph_migration.rollback_migration(destination=destination)
+
+    assert report["status"] == graph_migration.STATUS_ROLLBACK_REFUSED
+    assert f"{generation_module.FINDING_ADMISSION_UNPROVED}:manifest" in (
+        report["findings"]
+    )
+    assert generation(destination).is_dir()
+    assert tree_state(destination) == before
+    assert not generation_module.served_lock_path(destination).exists()
+
+
+def test_a_never_served_destination_still_rolls_back_and_repeats_as_a_no_op(
+    source, destination
+):
+    """The ordinary path, restated beside the new refusals.
+
+    The ledger must not become a reason an ordinary rollback stops working: a
+    destination nothing was ever served from has no records, and the withdrawal
+    behaves exactly as it did — once, retaining everything, then as a no-op.
+    """
+    graph_migration.apply_migration(source=source, destination=destination)
+    assert not served(destination).exists()
+
+    first = graph_migration.rollback_migration(destination=destination)
+
+    assert first["status"] == graph_migration.STATUS_ROLLED_BACK
+    assert first["generation"]["admitted"] is False
+    retained = Path(first["generation"]["withdrawn_to"])
+    assert retained.is_dir()
+    after = tree_state(destination)
+
+    second = graph_migration.rollback_migration(destination=destination)
+
+    assert second["status"] == graph_migration.STATUS_ROLLBACK_NOTHING
+    assert second["exit_code"] == graph_migration.EXIT_OK
+    assert tree_state(destination) == after
+    # Taking the guard left nothing behind in the destination either.
+    assert not generation_module.served_lock_path(destination).exists()

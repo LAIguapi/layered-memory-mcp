@@ -512,6 +512,7 @@ def publish_vector(config: Any, domains: Iterable[str]) -> dict[str, Any]:
             path.read_text(encoding="utf-8") if path.exists() else "",
             replace_domain=True,
             source_path=path if path.exists() else None,
+            vector_db_path=getattr(config, "vector_db_path", None),
         )
         if not result.get("success"):
             raise ProjectionError(f"vector publication failed for domain {domain!r}")

@@ -678,8 +678,8 @@ def test_no_measurement_carries_a_memory_body_or_a_source_path():
 #: Backend strings a store could hand back that name an internal location.
 #: None of them may reach a measurement, in whole or in part.
 PATH_SHAPED_BACKENDS = (
-    "/root/.local/share/layered-memory/graph.db",
-    "sqlite:////root/.local/share/layered-memory/graph.db",
+    "/srv/example-memory/graph.db",
+    "sqlite:////srv/example-memory/graph.db",
     "C:\\Users\\someone\\AppData\\layered-memory\\graph.db",
 )
 
