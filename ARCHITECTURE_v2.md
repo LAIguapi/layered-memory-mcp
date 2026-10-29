@@ -1337,6 +1337,74 @@ Before changing the rollout default, the subsequent integration batch must:
    is implied merely by a git push or tag. Only after the release is verified may
    the operator pull/install that release and run its migration/update entry point.
 
+##### Normal configuration binding and post-update implementation boundaries
+
+Read-only call-path inspection identified the following next-batch plan. These
+items are NOT_IMPLEMENTED and are not acceptance evidence. Implement and verify
+the adapter concurrency/withdrawal repairs before entering this batch.
+
+- Extend the complete `MemoryConfig` with `graph_active_pointer`, resolved by
+  constructor, `LAYERED_MEMORY_GRAPH_ACTIVE_POINTER`, `graph.active_pointer` in
+  the selected home's YAML, then unset. Resolve an explicit pointer after
+  namespace handling but before any directory creation. Use the existing runtime
+  resolver and bind graph, journal, knowledge, vector and L0 as one unit, without
+  replacing unrelated service settings with the adapter's narrower config.
+- Expose one `vector_db_path` on the config, with the existing home/data vector
+  location as the unbound fallback. Do not relocate `data_dir`: review, TODO,
+  access-log and other auxiliary stores retain their original ownership. Trace
+  and adapt every config-driven vector reader/writer and parameterized helper,
+  including MCP, HTTP, dashboard, semantic projection, injector, compaction and
+  promotion. Do not implement a second vector publisher. Existing helper callers
+  without a bound config retain their explicit legacy-path contract.
+- Invalid, missing or unhealthy explicit pointers fail before mkdir, store/model
+  construction or writes. Do not fall back to a legacy or empty store. Explicit
+  legacy/shadow without a pointer and direct graph/journal paths remain supported.
+  Reject a pointer combined with a non-authoritative mode or incompatible layout;
+  do not silently override a namespace or claim that L0 format/tag compatibility
+  is attested when the manifest does not encode it. Reject conflicting explicit
+  graph/journal targets rather than selecting a mixed-generation binding.
+- Exercise normal MCP and HTTP config/store factories, not only the standalone
+  resolver: migration, activation, actual semantic write, handle close/reopen,
+  recall and restore. Verify returned content, every projection's real path,
+  unchanged source bytes and auxiliary-store locations. Keep the current default
+  until this complete chain and the fresh-store contract have passed.
+
+Fresh initialization is a separate explicit bootstrap operation, not migration
+with invented source history. Default to preview; require explicit inspected
+home/source, destination, pointer and apply. Existing legacy data blocks fresh
+bootstrap. Build a staged empty journal, graph, vector, knowledge and L0 through
+the existing stores/publishers. Distinguish fresh from migration in manifest and
+verification: zero events and zero head/checkpoint are valid fresh authority, but
+must not weaken migration source-backup or bootstrap-event verification. No
+implicit bootstrap during normal startup; missing declared authority fails
+without creating a replacement store.
+
+Add a project-owned `layered-memory-update` entry point without repurposing the
+existing legacy `layered-memory-migrate` command. Its post-install contract takes
+explicit service home, source, destination and pointer; preview is the default.
+It does not fetch code, install packages, restart a service or alter an agent
+product's updater. Reuse migration plan/apply/verify and runtime activation APIs.
+A pure configuration-resolution seam must allow update preflight before normal
+config would create directories or reject a not-yet-activated pointer.
+
+Provide an explicit prepare-binding step for that service home and pointer.
+Apply may atomically update only required graph keys in the selected YAML,
+retaining other fields and a recoverable original; duplicate or malformed graph
+configuration is refused. Report binding preparation and activation separately:
+there is no claimed transaction spanning config, generation and pointer files.
+The run step must verify that effective service configuration selects this exact
+pointer and authoritative mode; environment overrides or a missing binding block
+execution. Operator success must not depend on an unperformed manual config edit.
+
+An already activated, matching generation is checked through attested runtime
+health and remains a no-op, including after accepted semantic writes; do not run
+publication-time database hashes as its health gate. Explicit source-drift
+preflight must refuse a new migration/cutover without changing the prior pointer.
+Tests must distinguish first migration, no-op repeat, post-write repeat, refusal,
+restore and partial preparation recovery. Only legacy-specific fixtures may opt
+into explicit legacy mode after the default changes; tests of the rollout default
+must assert the new default, never hide it behind a fixture override.
+
 The acceptance evidence and operator commands belong in
 `docs/GRAPH_MIGRATION_VERIFY.md`; this architecture section owns the integration
 contract. Production execution, installed-service activation and remote release
