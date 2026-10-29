@@ -1413,7 +1413,8 @@ successful isolated migration.
 
 ### Production snapshot adaptation — approved staged implementation
 
-Status: approved contract; implementation and acceptance pending. The strict
+Status: Batch 1 implemented in `77ddcd7` and independently accepted (183 focused
+tests plus a separately authored zero-write/copy probe); Batch 2 pending. The strict
 migration source layout remains unchanged. A separate, explicit snapshot
 adapter prepares a bundle with `source/` (migration inputs), `evidence/`
 (original L0 if present), and a versioned manifest outside `source/`.
@@ -1449,6 +1450,45 @@ to existing canonical graph identities. It must preserve row IDs, text and
 embedding bytes, reject ambiguous/stale maps and retain unresolved rows. Missing
 graph metadata alone does not prove a row orphaned; identity resolution must
 trace the row ID and current L1 producer. No fuzzy or embedding matching.
+
+#### Batch 2 identity bridge contract
+
+The migration inventory owns legacy-identity adaptation; the existing backfill
+planner continues to own row-ID-based resolution, metadata validation and atomic
+metadata-only publication. Do not change the canonical entry-ID producer or
+create another graph identity algorithm. The bridge consumes only an explicitly
+supplied immutable migration source, after the existing layout/reader gates.
+
+For an otherwise valid unresolved row, automatic correspondence requires exact
+domain, a declared metadata section and UTF-8 projection text equality, with one
+candidate in that section. No whitespace, case, heading or body normalization is
+allowed by the bridge. The graph target comes from the existing entry identity
+function. Validate metadata and stored graph identities before accepting any
+correspondence; malformed or conflicting identities cannot be overwritten.
+
+Reserve targets already claimed by resolved rows or validated operator mappings.
+Compute automatic proposals as a group: multiple rows proposing one target are
+all unresolved, not first-row-wins. A duplicate-section candidate set is ambiguous
+even when only one body matches. Operator mappings remain explicit declarations,
+not semantic guesses; keep their existing validation and additionally prevent
+collisions with automatic claims. Unresolved rows remain in the source and block
+publication; this batch does not publish a partial or orphan-dropping generation.
+
+Report every row's outcome and bounded reason, candidate count, mapping origin
+and canonical target identity without echoing bodies, headings or arbitrary
+metadata. Derived mapping evidence is recomputed on every plan/apply from the
+current source fingerprint; do not cache or silently reuse a stale report. Both
+automatic and explicit metadata updates must use the existing staged backfill
+transaction, preserve unrelated metadata and leave row IDs, text and embeddings
+unchanged. Manifest and verification must account for both mapping origins.
+
+Acceptance uses neutral random-ID fixtures, exact success, absent/wrong section,
+same-text wrong domain, whitespace mismatch, duplicate headings, duplicate claims,
+malformed/conflicting metadata, explicit-map interaction, source drift, and a
+separately authored end-to-end plan/apply/verify/no-op/rollback probe. Assert tree
+metadata and hashes before any apply to prove dry-run zero writes. No production
+data, default-mode changes, update hook, dependency change or service operation
+belongs to this batch.
 
 Batch 3 diagnoses projection/canonical reader disagreements without printing
 memory bodies or headings. Parser defects are fixed generically with neutral
