@@ -7,7 +7,7 @@ semantics. That distinction is the whole batch, so these tests pin it directly:
 
   * **No request, no graph.** A call shaped exactly like today's reaches no
     graph operation and gets back exactly today's response, with no ``graph``
-    key. The default mode stays ``legacy``.
+    key. Explicit ``legacy`` remains the no-graph compatibility mode.
   * **The decision arrives from the caller, validated.** A graph write happens
     only because the caller handed over a serialized
     :class:`~layered_memory_mcp.graph_write.SemanticWriteRequest`. Nothing —

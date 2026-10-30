@@ -2,15 +2,15 @@
 
 Why this file exists: ARCHITECTURE_v2.md §12 Batch H turns the B–G graph seams
 into a *reversible* runtime integration. Reversible means exactly one validated
-switch, defaulting to the old behaviour, that a caller can read without string
-comparisons — not a handful of booleans that drift apart until nobody can say
-whether the graph is authoritative.
+switch, defaulting to graph with an explicit legacy rollback, that a caller can
+read without string comparisons — not a handful of booleans that drift apart
+until nobody can say whether the graph is authoritative.
 
 These tests pin:
 
-  * **Legacy is the default.** A ``MemoryConfig()`` built the way every existing
-    test builds one keeps the old recall and the old write path, and the three
-    predicates all say so.
+  * **Graph is the rollout default.** A ``MemoryConfig()`` with no mode override
+    enables authoritative graph recall and write, not shadow. Explicit legacy
+    keeps both graph paths disabled for rollback.
   * **The mode is validated, never guessed.** An unknown value raises at
     construction instead of silently degrading to legacy — a half-enabled graph
     is the one state this batch must not be able to reach by typo.
@@ -72,13 +72,16 @@ def test_the_declared_modes_are_the_five_batch_h_modes():
     )
 
 
-def test_default_is_legacy_and_nothing_graph_shaped_is_enabled(tmp_path):
+@pytest.mark.parametrize("body", [None, "graph: {}\n"])
+def test_default_is_graph_and_authoritative_on_both_paths(tmp_path, body):
+    if body is not None:
+        _write_graph_yaml(tmp_path, body)
     config = _config(tmp_path)
 
-    assert config.graph_mode == "legacy"
-    assert config.graph_enabled is False
-    assert config.graph_recall_enabled is False
-    assert config.graph_write_enabled is False
+    assert config.graph_mode == "graph"
+    assert config.graph_enabled is True
+    assert config.graph_recall_enabled is True
+    assert config.graph_write_enabled is True
     assert config.graph_shadow_enabled is False
 
 
@@ -88,7 +91,7 @@ def test_existing_programmatic_construction_still_works(tmp_path):
         home=str(tmp_path / "plain"),
         knowledge_dir=str(tmp_path / "plain" / "knowledge"),
     )
-    assert config.graph_mode == "legacy"
+    assert config.graph_mode == "graph"
 
 
 # ---------------------------------------------------------------------------
@@ -171,10 +174,10 @@ def test_environment_beats_config_yaml(tmp_path, monkeypatch):
     assert _config(tmp_path).graph_mode == "graph_recall"
 
 
-def test_a_malformed_graph_section_falls_back_to_legacy(tmp_path):
+def test_a_malformed_graph_section_falls_back_to_graph(tmp_path):
     """A broken config.yaml must not crash start-up (project convention)."""
     _write_graph_yaml(tmp_path, "graph: not-a-mapping\n")
-    assert _config(tmp_path).graph_mode == "legacy"
+    assert _config(tmp_path).graph_mode == "graph"
 
 
 def test_an_invalid_mode_in_config_yaml_still_fails_loudly(tmp_path):

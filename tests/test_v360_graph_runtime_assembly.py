@@ -2,7 +2,7 @@
 
 Why this file exists: ARCHITECTURE_v2.md §12 Batch I scope items 1 and 4 require
 that a configured, *isolated* SQLite graph store can be initialized, reopened,
-health-checked and reported on — while the default behaviour stays ``legacy``,
+health-checked and reported on — while the rollout default is ``graph``,
 nothing is inferred from an agent's private memory path, and the diagnostics
 leak neither a host path nor memory content.
 
@@ -125,12 +125,12 @@ def test_a_configured_path_alone_opens_nothing(tmp_path):
     assert not database.exists()
 
 
-def test_the_default_legacy_config_assembles_no_store(tmp_path):
+def test_the_default_graph_config_assembles_no_store(tmp_path):
     config = _config(tmp_path)
 
     with graph_store_session(config) as assembly:
         assert assembly.store is None
-        assert assembly.report.mode == "legacy"
+        assert assembly.report.mode == "graph"
         assert assembly.report.status == GRAPH_STORE_NOT_REQUESTED
 
 
@@ -209,7 +209,9 @@ def test_the_assembly_never_rebuilds_the_graph(tmp_path, monkeypatch):
 
 
 def test_opening_under_the_legacy_mode_is_allowed_but_flagged(tmp_path):
-    config = _config(tmp_path, graph_db_path=str(_database(tmp_path)))
+    config = _config(
+        tmp_path, graph_mode="legacy", graph_db_path=str(_database(tmp_path))
+    )
 
     with graph_store_session(config, require=True) as assembly:
         assert assembly.report.mode == "legacy"

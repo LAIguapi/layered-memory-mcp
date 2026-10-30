@@ -1553,10 +1553,10 @@ def test_legacy_semantic_search_reaches_no_graph_seam_at_all(monkeypatch, tmp_pa
     assert response["results"] == [_semantic_row()]
 
 
-def test_the_default_mode_adds_no_graph_block_to_semantic_search(
+def test_unset_mode_is_graph_but_explicit_legacy_search_has_no_graph_block(
     monkeypatch, tmp_path
 ):
-    """Not just the explicit string: the *unset* config must stay legacy too."""
+    """Unset config uses graph; explicit legacy keeps the no-graph response."""
     from layered_memory_mcp.config import MemoryConfig
 
     monkeypatch.delenv("LAYERED_MEMORY_GRAPH_MODE", raising=False)
@@ -1564,11 +1564,21 @@ def test_the_default_mode_adds_no_graph_block_to_semantic_search(
     knowledge = home / "knowledge"
     knowledge.mkdir(parents=True, exist_ok=True)
     config = MemoryConfig(home=str(home), knowledge_dir=str(knowledge))
-    assert config.graph_mode == "legacy"
+    assert config.graph_mode == "graph"
+    assert config.graph_enabled is True
+
+    legacy_config = MemoryConfig(
+        home=str(home), knowledge_dir=str(knowledge), graph_mode="legacy"
+    )
+    assert legacy_config.graph_mode == "legacy"
+    assert legacy_config.graph_enabled is False
+    assert legacy_config.graph_recall_enabled is False
+    assert legacy_config.graph_write_enabled is False
+    assert legacy_config.graph_shadow_enabled is False
 
     store = _RecordingStore()
     response = _semantic_response(
-        monkeypatch, tmp_path, "legacy", store=store, config=config
+        monkeypatch, tmp_path, "legacy", store=store, config=legacy_config
     )
 
     assert "graph" not in response

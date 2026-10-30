@@ -1,23 +1,21 @@
 """v3.6.1 — ``graph_enabled`` reads the legacy contract, not the rollout default.
 
 Why this file exists: ``MemoryConfig.graph_enabled`` used to be spelled
-``graph_mode != DEFAULT_GRAPH_MODE``. That is correct only by coincidence —
-it holds *because* the rollout default happens to be ``"legacy"``. The two are
-different ideas:
+``graph_mode != DEFAULT_GRAPH_MODE``. That was correct only by coincidence
+when the rollout default was ``"legacy"``. The two are different ideas:
 
   * ``"legacy"`` is the **contract** for "nothing graph-shaped is switched on".
     Every caller that branches on ``graph_enabled`` means exactly that.
   * ``DEFAULT_GRAPH_MODE`` is a **rollout choice** — which mode an operator who
     declared nothing lands in.
 
-Tying the predicate to the default means the day the default moves off
-``"legacy"``, every caller's question silently inverts: an explicitly
-graph-enabled config reports disabled, and legacy reports enabled. These tests
-pin the predicate to the contract so that failure cannot happen quietly.
+Tying the predicate to a non-legacy default silently inverts callers' questions:
+an explicitly graph-enabled config reports disabled, and legacy reports enabled.
+These tests pin the predicate to the contract so that failure cannot happen quietly.
 
-These tests do **not** change or endorse changing the default; the default is
-still ``"legacy"`` and ``test_v360_graph_integration_config.py`` keeps pinning
-that. The monkeypatched-default cases below pass an *explicit* ``graph_mode``
+The rollout default is ``"graph"`` and
+``test_v360_graph_integration_config.py`` pins that resolution. The
+monkeypatched-default cases below pass an *explicit* ``graph_mode``
 precisely because they are about the predicate, not about the default.
 
 Every config here is built against ``tmp_path`` with an explicit home. Nothing
@@ -54,7 +52,12 @@ def _config(tmp_path: Path, **kwargs) -> MemoryConfig:
 # ---------------------------------------------------------------------------
 
 def test_legacy_is_the_only_mode_that_means_disabled(tmp_path):
-    assert _config(tmp_path, graph_mode="legacy").graph_enabled is False
+    config = _config(tmp_path, graph_mode="legacy")
+
+    assert config.graph_enabled is False
+    assert config.graph_recall_enabled is False
+    assert config.graph_write_enabled is False
+    assert config.graph_shadow_enabled is False
 
 
 @pytest.mark.parametrize("mode", ["shadow", "graph_recall", "graph_write", "graph"])
@@ -101,38 +104,43 @@ def test_the_contract_covers_every_declared_mode(tmp_path):
 # and only monkeypatches the module constant, to show the predicate no longer
 # reads it.
 
-def test_the_default_is_still_legacy():
+def test_the_rollout_default_is_graph():
     """Guard for the cases below: they are about the predicate, not the default."""
-    assert DEFAULT_GRAPH_MODE == "legacy"
+    assert DEFAULT_GRAPH_MODE == "graph"
 
 
-def test_legacy_stays_disabled_when_the_default_is_patched_to_graph(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize("default_mode", GRAPH_MODES)
+def test_legacy_stays_disabled_when_the_default_is_patched(
+    tmp_path, monkeypatch, default_mode
 ):
-    monkeypatch.setattr(config_module, "DEFAULT_GRAPH_MODE", "graph")
+    monkeypatch.setattr(config_module, "DEFAULT_GRAPH_MODE", default_mode)
 
     config = _config(tmp_path, graph_mode="legacy")
 
     assert config.graph_mode == "legacy"
-    # The old spelling (``!= DEFAULT_GRAPH_MODE``) would say True here.
+    # The old spelling (``!= DEFAULT_GRAPH_MODE``) fails for non-legacy defaults.
     assert config.graph_enabled is False
 
 
+@pytest.mark.parametrize("default_mode", GRAPH_MODES)
 @pytest.mark.parametrize("mode", ["shadow", "graph_recall", "graph_write", "graph"])
-def test_enabled_modes_stay_enabled_when_the_default_is_patched_to_graph(
-    tmp_path, monkeypatch, mode
+def test_enabled_modes_stay_enabled_when_the_default_is_patched(
+    tmp_path, monkeypatch, mode, default_mode
 ):
-    monkeypatch.setattr(config_module, "DEFAULT_GRAPH_MODE", "graph")
+    monkeypatch.setattr(config_module, "DEFAULT_GRAPH_MODE", default_mode)
 
     config = _config(tmp_path, graph_mode=mode)
 
     assert config.graph_mode == mode
-    # The old spelling would say False for ``"graph"`` here.
+    # The old spelling would say False when the explicit mode equals the default.
     assert config.graph_enabled is True
 
 
-def test_the_other_predicates_are_also_default_independent(tmp_path, monkeypatch):
-    monkeypatch.setattr(config_module, "DEFAULT_GRAPH_MODE", "graph")
+@pytest.mark.parametrize("default_mode", GRAPH_MODES)
+def test_the_other_predicates_are_also_default_independent(
+    tmp_path, monkeypatch, default_mode
+):
+    monkeypatch.setattr(config_module, "DEFAULT_GRAPH_MODE", default_mode)
 
     legacy = _config(tmp_path, graph_mode="legacy")
     shadow = _config(tmp_path, graph_mode="shadow")

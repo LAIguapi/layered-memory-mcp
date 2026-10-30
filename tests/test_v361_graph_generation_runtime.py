@@ -2826,23 +2826,33 @@ def test_the_migration_verbs_still_plan_apply_verify_and_rollback(
 
 
 # ---------------------------------------------------------------------------
-# Backward compatibility: the legacy default is untouched
+# Rollout default: graph mode does not infer store paths
 # ---------------------------------------------------------------------------
 
-def test_the_legacy_memory_config_default_is_unchanged(tmp_path, monkeypatch):
+def test_memory_config_rollout_default_is_graph_without_implicit_paths(
+    tmp_path, monkeypatch
+):
     monkeypatch.delenv("LAYERED_MEMORY_GRAPH_DB_PATH", raising=False)
     monkeypatch.delenv("LAYERED_MEMORY_GRAPH_JOURNAL_PATH", raising=False)
     monkeypatch.delenv("LAYERED_MEMORY_GRAPH_MODE", raising=False)
-    home = tmp_path / "legacy-home"
+    home = tmp_path / "default-home"
     home.mkdir()
 
     config = MemoryConfig(home=str(home))
 
-    assert config.graph_mode == "legacy"
-    assert config.graph_enabled is False
-    assert config.graph_write_enabled is False
+    assert config.graph_mode == "graph"
+    assert config.graph_enabled is True
+    assert config.graph_write_enabled is True
     assert resolve_graph_database_path(config) is None
     assert resolve_journal_database_path(config) is None
+
+    legacy_config = MemoryConfig(home=str(home), graph_mode="legacy")
+
+    assert legacy_config.graph_mode == "legacy"
+    assert legacy_config.graph_enabled is False
+    assert legacy_config.graph_write_enabled is False
+    assert resolve_graph_database_path(legacy_config) is None
+    assert resolve_journal_database_path(legacy_config) is None
 
 
 @pytest.mark.parametrize("mode", GRAPH_MODES)

@@ -363,7 +363,7 @@ ROUTING_MODES = ("advisory", "enforce")
 #: validated decision rather than several booleans that can drift into a
 #: half-enabled state nobody declared:
 #:
-#:   "legacy"       -- old recall, old write. The default, and the way back.
+#:   "legacy"       -- old recall, old write. The explicit rollback mode.
 #:   "shadow"       -- old behaviour stays authoritative; graph recall/write
 #:                     preparation may be *observed*, changes no answer and
 #:                     commits no graph state.
@@ -371,14 +371,13 @@ ROUTING_MODES = ("advisory", "enforce")
 #:                     (with graph_recall.py's own fallback); writes stay legacy.
 #:   "graph_write"  -- semantic graph writes are enabled where an explicit
 #:                     decision is supplied; recall stays legacy.
-#:   "graph"        -- both.
+#:   "graph"        -- both. The rollout default.
 #:
 #: Order is the enabling order, so the tuple reads as the rollout ladder.
 GRAPH_MODES = ("legacy", "shadow", "graph_recall", "graph_write", "graph")
 
-#: The default. A graph that turns itself on would make the integration
-#: irreversible in exactly the batch that exists to keep it reversible.
-DEFAULT_GRAPH_MODE = "legacy"
+#: The rollout default. Explicit "legacy" keeps the graph disabled for rollback.
+DEFAULT_GRAPH_MODE = "graph"
 
 #: Modes in which graph-assisted recall may decide the answer.
 _GRAPH_RECALL_MODES = ("graph_recall", "graph")
@@ -1450,10 +1449,9 @@ class MemoryConfig:
     def graph_enabled(self) -> bool:
         """Whether anything graph-shaped is switched on at all.
 
-        Reads the explicit legacy contract, *not* ``DEFAULT_GRAPH_MODE``: if the
-        rollout default ever moves off ``"legacy"``, a comparison against the
-        default would start reporting a graph-enabled config as disabled (and
-        legacy as enabled) everywhere at once.
+        Reads the explicit legacy contract, *not* ``DEFAULT_GRAPH_MODE``:
+        comparing against the graph rollout default would report graph mode as
+        disabled and legacy as enabled everywhere at once.
         """
         return self.graph_mode in _GRAPH_ENABLED_MODES
 
