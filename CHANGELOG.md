@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Introduce the Layered Memory Graph v1 domain contracts, deterministic fixture
   store, embedded SQLite adapter, legacy identity backfill seam, graph-assisted
   recall seam, guarded semantic write seam, and explicit runtime modes. The
-  default remains `legacy`.
+  rollout default was later switched to `graph`, with explicit `legacy` rollback.
 - Add isolated measured shadow evaluation for legacy/graph recall preservation,
   stale exposure, provenance coverage, fallback reasons, and bounded latency.
 - Add separated normal-path/fallback-path evaluation and SQLite close/reopen

@@ -669,26 +669,29 @@ Each batch must be independently reviewable and testable.
 
 - Add the explicit runtime modes `legacy`, `shadow`, `graph_recall`,
   `graph_write`, and `graph`.
-- Keep `legacy` as the default and preserve the original L1 result on graph
-  failure, missing mappings, unavailable stores, or invalid graph metadata.
+- The rollout default is now `graph`, with explicit `legacy` rollback. Preserve
+  the original L1 result on graph failure, missing mappings, unavailable stores,
+  or invalid graph metadata.
 - Add additive graph recall output and an explicit semantic graph-write seam;
   do not silently turn the existing injector into a second write path.
-- Add runtime/config/version regression tests and verify that the default path
-  performs no graph operation.
+- Add runtime/config/version regression tests and verify that the explicit
+  `legacy` path performs no graph operation.
 - Accepted in commit `660c8e2` (`feat: add reversible graph runtime
   integration`): `1441 passed, 2 skipped`; focused Batch H tests `117 passed`.
 
-Batch H is integration scaffolding, not production cutover. It does not yet
+Batch H itself was integration scaffolding, not production cutover. It did not
 construct a persistent graph store, generate graph node IDs for real vector
 rows, run a legacy backfill, enable graph-aware defaults, or publish graph
-quality metrics.
+quality metrics. The later graph rollout default does not imply real production
+migration, a service restart, or production cutover.
 
 ### Batch I — production assembly and migration readiness
 
 Batch I is deliberately split so that runtime assembly, retrieval wiring, and
 legacy data reconciliation cannot silently become one irreversible migration.
-The default mode remains `legacy` throughout this batch, and no real user
-memory store is read or written by the Batch I test suite.
+The rollout default is now `graph`, while explicit `legacy` remains the
+rollback/compatibility mode. No real user memory store is read or written by
+the Batch I test suite.
 
 #### Batch I-A — persistent assembly and identity producers (complete)
 
@@ -798,12 +801,12 @@ I-C exit criteria:
   vector snapshot;
 - graph projection and vector metadata reconciliation have separate seams and
   are independently auditable;
-- the full existing test suite passes and default `MemoryConfig()`/MCP
-  behavior remains `legacy`.
+- the full existing test suite passes, the `MemoryConfig()`/MCP rollout default
+  is `graph`, and explicit `legacy` compatibility remains tested.
 
 #### Batch I remaining non-scope
 
-- no default switch away from `legacy`;
+- the graph rollout default does not imply production migration or cutover;
 - no destructive rewrite or physical deletion of L1, vector, or graph data;
 - no direct access to production configuration or real user memory in tests;
 - no external graph service or new mandatory dependency;
@@ -869,7 +872,7 @@ seam``):
 
 I-D exit criteria:
 
-- default legacy calls remain graph-free and response-compatible;
+- explicit legacy calls remain graph-free and response-compatible;
 - explicit requests are validated and bounded without leaking source content,
   private paths, or backend diagnostics;
 - ``shadow`` is plan-only;
@@ -878,8 +881,8 @@ I-D exit criteria:
 - a pre-populated graph snapshot remains byte-identical on the refusal path;
 - L1 success, L1 failure, no-change, and deferred outcomes are distinct from
   graph commit status;
-- the full existing test suite passes and default ``MemoryConfig()`` remains
-  ``legacy``.
+- the full existing test suite passes, the ``MemoryConfig()`` rollout default
+  is ``graph``, and explicit ``legacy`` compatibility remains tested.
 
 ### Batch J — measured shadow evaluation (complete)
 
@@ -911,8 +914,9 @@ evaluation``):
 - security audit: ``0 CRITICAL / 0 HIGH / 0 MEDIUM`` (LOW results are existing
   project-name/path matches).
 
-Batch J deliberately leaves the default mode as ``legacy``. Acceptance
-thresholds and any rollback decision remain a later governance step; no vendor
+The rollout default is now ``graph``, with explicit ``legacy`` rollback; Batch J
+measurement alone does not establish production cutover. Acceptance thresholds
+and any production rollback decision remain a later governance step; no vendor
 benchmark is treated as repository evidence.
 
 ### Batch K — separated evaluation and persistent parity (complete)
@@ -974,8 +978,9 @@ the actual persistent adapter together with the graph-recall seam without
 opening a production path. The verification must compare the SQLite result to
 the in-memory reference for node IDs, edge IDs, statuses, provenance,
 fallback behavior, and bounded output. It must also verify that the runtime
-assembly reaches the persistent store only in an explicit graph mode; default
-``MemoryConfig()`` remains ``legacy`` and performs zero graph calls.
+assembly reaches the persistent store only in a graph-enabled mode with explicit
+store configuration. The ``MemoryConfig()`` rollout default is ``graph``, while
+explicit ``legacy`` compatibility remains tested and performs zero graph calls.
 
 The delivered parity helper supports explicit nodes/edges or an explicit
 ``MemoryEvent`` stream, writes a temporary SQLite fixture, closes the writer,
@@ -1007,13 +1012,13 @@ No threshold is invented from the current six-case K-A fixture or the single
 K-B parity fixture. K-C remains open: the repository still needs a broader,
 reviewed corpus, explicit threshold decisions, a latency aggregate across
 repeated in-memory and SQLite runs, and ownership of the complete
-``MemoryEvent`` stream for graph writes. Until those are met, the default stays
-``legacy`` and no production configuration is changed. If a future explicit
-opt-in is enabled, the rollback record must name the configuration change, the
-previous mode, the graph-store snapshot/backup boundary, and the verification
-that legacy recall is restored after disabling the opt-in. Removing obsolete
-paths remains out of scope until an explicit equivalence or intentional
-behavior-change record.
+``MemoryEvent`` stream for graph writes. The rollout default is now ``graph``,
+with explicit ``legacy`` rollback; this does not satisfy the K-C gates or change
+production configuration. If a future production opt-in is enabled, the rollback
+record must name the configuration change, the previous mode, the graph-store
+snapshot/backup boundary, and the verification that explicit ``legacy`` restores
+legacy recall. Removing obsolete paths remains out of scope until an explicit
+equivalence or intentional behavior-change record.
 
 ### Batch L — stable projection identity and request-scoped graph assembly (complete)
 
@@ -1112,9 +1117,10 @@ request-lifecycle, and vector-maintenance tests **115 passed**; full regression
 passed. Security scans covered all six changed files with **0 CRITICAL,
 0 HIGH, 0 MEDIUM**; LOW informational findings remain. AST comparison confirmed
 the injector change is confined to ``_vector_entries`` and server function changes
-to recall-store selection/lifecycle and injection documentation. The default
-remains ``legacy``; no dependencies, lockfile, startup hook, migration, production
-configuration, or production graph population were introduced.
+to recall-store selection/lifecycle and injection documentation. The rollout
+default is now ``graph``, with explicit ``legacy`` rollback; this batch introduced
+no dependencies, lockfile, startup hook, migration, production configuration, or
+production graph population.
 
 The identity is ``mdsec1_`` plus the first 32 hexadecimal SHA-256 characters
 (128 digest bits), with the version and length-prefixed exact labels in the
@@ -1123,7 +1129,7 @@ actual MCP semantic search over a populated SQLite graph, one open/close per
 request, injected-store precedence, safe fallbacks, and unchanged write refusal.
 This is isolated runtime evidence, not production retrieval-quality evidence.
 Production population, a complete semantic event stream, broader measured
-acceptance, and an explicitly approved default cutover remain open targets.
+acceptance, and an explicitly approved production cutover remain open targets.
 
 ### Framework completion and migration delivery contract (framework delivered; cutover pending)
 
@@ -1155,9 +1161,10 @@ Graph-write-enabled entry points must validate and commit through this authority
 before projection side effects. An entrance not supporting a semantic operation
 must refuse it before mutation, naming the supported alternative. Audit injection,
 batch injection, whole-file CRUD, review, cleanup/consolidation, REST CRUD,
-maintenance and task mutations for bypasses. Keep `legacy` the default and retain
-legacy/shadow compatibility; an explicit graph mode must work using configured
-persistent stores without injected test handles or a manually supplied event list.
+maintenance and task mutations for bypasses. The rollout default is `graph`;
+retain explicit `legacy` rollback and legacy/shadow compatibility. Graph mode must
+work using configured persistent stores without injected test handles or a
+manually supplied event list.
 
 #### Projections and read paths
 

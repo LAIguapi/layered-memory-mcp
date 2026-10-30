@@ -221,8 +221,8 @@ PYTHONPATH=src python -m layered_memory_mcp.graph_migration \
 ## 9. 当前未处理项
 
 - 生产数据迁移仍冻结。本记录早期隔离验收未访问真实目录；后续获批的真实副本严格预演安全拒绝，未 apply。身份桥接实现与验收只使用中性样本，未访问或修改生产目录。
-- 默认 `graph_mode` 仍为 `legacy`。
-- `pyproject.toml` 尚未新增 graph migration console script；当前稳定入口是显式的 `python -m ...`。
+- 默认 `graph_mode` 已切换为 `graph`；显式 `legacy` 仍是回滚/兼容模式，不代表已完成生产迁移或 cutover。
+- `pyproject.toml` 已提供 `layered-memory-update` 更新入口；迁移模块入口 `python -m layered_memory_mcp.graph_migration` 仍可用。
 - 仓外 Agent 工作目录中的越界记忆文件不属于本批迁移产物，本批未删除或修改；需要单独授权和单独审计。
 - 本文档记录的是本地隔离能力验收，不是生产 cutover runbook，也不构成“已迁移真实记忆”的声明。
 
