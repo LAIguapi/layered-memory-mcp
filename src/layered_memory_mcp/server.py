@@ -68,6 +68,7 @@ from .agent_integrator import (
 from .models import KnowledgeEntry, KnowledgeType, SourceInfo, SourceType, ReviewItem, ConfidenceScorer
 from .models import TodoEntry, TodoStatus, TodoPriority
 from .storage import L1Store, VectorStore, ReviewQueue, AccessLogStore
+from .unified_recall import build_unified_engine
 from .extractor import SessionReader, KnowledgeExtractor
 from .todo_store import TodoStore
 
@@ -96,6 +97,18 @@ def _get_v2_stores():
             daemon=True,
         ).start()
     return _v2_stores
+
+
+def _run_unified_recall(query: str, top_n: int, domain: str | None = None) -> dict:
+    """Run the shared opt-in retrieval engine for either MCP read entrance."""
+    stores = _get_v2_stores()
+    engine = build_unified_engine(
+        _get_config(),
+        vector_store=stores["vector"],
+        l1_store=stores["l1"],
+        graph_store=_graph_store,
+    )
+    return engine.retrieve(query, top_n=top_n, domain=domain)
 
 
 # ---------------------------------------------------------------------------
@@ -1114,6 +1127,7 @@ async def recall_knowledge(
     keyword: str,
     top_n: int = 5,
     search_mode: str = "keyword",
+    unified: bool = False,
 ) -> str:
     """Search L1 knowledge files by keyword with relevance scoring.
 
@@ -1131,6 +1145,9 @@ async def recall_knowledge(
         JSON with matched files, relevance scores, and content sections.
     """
     config = _get_config()
+    if unified:
+        result = await asyncio.to_thread(_run_unified_recall, keyword, top_n)
+        return json.dumps(result, ensure_ascii=False, indent=2)
     # v0.6.0: namespace-aware search (namespace dir + shared dir)
     kdirs = [str(d) for d in config.knowledge_dirs]
     result = await asyncio.to_thread(
@@ -2885,6 +2902,7 @@ async def search_semantic(
     query: str,
     top_n: int = 5,
     domain: str | None = None,
+    unified: bool = False,
 ) -> str:
     """Semantic search for knowledge entries using vector similarity.
 
@@ -2899,6 +2917,10 @@ async def search_semantic(
     Returns:
         JSON with search results and similarity scores.
     """
+    if unified:
+        result = await asyncio.to_thread(_run_unified_recall, query, top_n, domain)
+        return json.dumps(result, ensure_ascii=False, indent=2)
+
     stores = _get_v2_stores()
     results = stores["vector"].search(query, top_n=top_n, domain=domain)
 

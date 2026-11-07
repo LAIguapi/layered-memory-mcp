@@ -266,11 +266,12 @@ def create_app() -> FastAPI:
     # such entry and answers 404, and this search implementation — graph policy
     # included — is never reached. A literal path segment cannot be expressed as
     # a constraint on ``entry_id``, so order is the whole mechanism here.
-    @app.get("/knowledge/search", response_model=list[SearchResult])
+    @app.get("/knowledge/search", response_model=None)
     async def search_knowledge(
         q: str = Query(..., min_length=1),
         top_n: int = Query(5, ge=1, le=20),
         domain: str | None = None,
+        unified: bool = Query(False),
     ) -> list[dict]:
         """Semantic search for knowledge entries.
 
@@ -288,6 +289,17 @@ def create_app() -> FastAPI:
         diagnostics are deliberately NOT aliased into this response shape; read
         them from ``graph_memory_status`` instead.
         """
+        if unified:
+            from ..unified_recall import build_unified_engine
+
+            result = build_unified_engine(
+                api_config(),
+                vector_store=stores["vector"],
+                l1_store=stores["l1"],
+                graph_store=stores.get("graph"),
+            ).retrieve(q, top_n=top_n, domain=domain)
+            return result
+
         from ..graph_search import apply_graph_recall
 
         results = stores["vector"].search(q, top_n=top_n, domain=domain)

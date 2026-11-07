@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.6.1] - 2026-11-07
+
+Opt-in unified hybrid retrieval for MCP, REST, and isolated callers. The legacy
+recall path remains the default; production data and graph generations are not
+migrated by this release.
+
+### Added
+
+- Add a shared retrieval engine combining vector, BM25, L0 routing, graph policy,
+  identity-based L1 hydration, and deterministic reciprocal-rank fusion.
+- Add explicit `unified=true` opt-in wiring for MCP semantic recall, MCP knowledge
+  recall, and REST `GET /knowledge/search`.
+- Add contract, failure-observability, determinism, adapter, and independent-entry
+  coverage for the unified retrieval path.
+
+### Changed
+
+- Keep the existing legacy recall shape and default behavior unchanged unless the
+  unified opt-in is requested.
+
 ## [3.6.0] - 2026-11-05
 
 Graph architecture completion. The release includes the local implementation and
