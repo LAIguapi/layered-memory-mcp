@@ -527,21 +527,51 @@ class L0RouteAdapter:
 
 
 class L1StoreHydrator:
-    """Identity hydrator for the repository's frontmatter-backed L1 store."""
+    """Hydrate frontmatter entries and legacy multi-section L1 files."""
 
     def __init__(self, l1_store: Any):
         self.l1_store = l1_store
+
+    @staticmethod
+    def _legacy_section(
+        raw: str, section: Any
+    ) -> tuple[str, str] | None:
+        """Return one unambiguous bodyful legacy section, never a guess."""
+        if not isinstance(section, str) or not section.strip():
+            return None
+        from .injector import _bodyful_sections
+
+        matches = [
+            (label, body)
+            for label, body in _bodyful_sections(raw)
+            if label == section
+        ]
+        if len(matches) != 1:
+            return None
+        return matches[0]
+
+    @staticmethod
+    def _candidate_section(candidate: Any) -> Any:
+        payload = getattr(candidate, "payload", {})
+        if not isinstance(payload, Mapping):
+            return None
+        section = payload.get("section")
+        if section is not None:
+            return section
+        metadata = payload.get("metadata")
+        return metadata.get("section") if isinstance(metadata, Mapping) else None
 
     def hydrate(
         self, entry_ids: Sequence[str], candidates: Sequence[_Candidate] | None = None
     ) -> dict[str, dict[str, Any]]:
         hydrated: dict[str, dict[str, Any]] = {}
-        domains = {
-            candidate.entry_id: candidate.payload.get("domain")
-            for candidate in candidates or ()
+        candidate_by_id = {
+            candidate.entry_id: candidate for candidate in candidates or ()
         }
         for entry_id in entry_ids:
-            domain = domains.get(entry_id)
+            candidate = candidate_by_id.get(entry_id)
+            payload = candidate.payload if candidate is not None else {}
+            domain = payload.get("domain") if isinstance(payload, Mapping) else None
             if isinstance(domain, str) and domain:
                 meta, content = self.l1_store.read(domain)
                 if isinstance(meta, Mapping) and meta.get("id") == entry_id:
@@ -553,10 +583,23 @@ class L1StoreHydrator:
                         "text": content,
                     }
                     continue
+                section = self._candidate_section(candidate)
+                legacy = self._legacy_section(content, section)
+                if legacy is not None:
+                    label, body = legacy
+                    hydrated[entry_id] = {
+                        "id": entry_id,
+                        "entry_id": entry_id,
+                        "domain": domain,
+                        "section": label,
+                        "content": body,
+                        "text": body,
+                    }
+                    continue
             if hasattr(self.l1_store, "get_by_id"):
-                candidate = self.l1_store.get_by_id(entry_id)
-                if candidate is not None:
-                    hydrated[entry_id] = _serializable(candidate)
+                stored = self.l1_store.get_by_id(entry_id)
+                if stored is not None:
+                    hydrated[entry_id] = _serializable(stored)
         return hydrated
 
 

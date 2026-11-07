@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.6.2] - 2026-11-08
+
+Fix unified retrieval hydration for legacy multi-section L1 Markdown files.
+
+### Fixed
+
+- Hydrate legacy H2 sections by the vector row's domain and section metadata,
+  while retaining strict identity matching for frontmatter-backed entries.
+- Refuse ambiguous duplicate section labels instead of returning guessed content.
+- Keep production vector data and the legacy default recall path unchanged.
+
 ## [3.6.1] - 2026-11-07
 
 Opt-in unified hybrid retrieval for MCP, REST, and isolated callers. The legacy

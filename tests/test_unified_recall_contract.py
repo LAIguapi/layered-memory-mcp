@@ -10,6 +10,7 @@ import pytest
 from layered_memory_mcp.unified_recall import (
     GraphSearchAdapter,
     L0RouteAdapter,
+    L1StoreHydrator,
     UnifiedRecallEngine,
     build_unified_engine,
 )
@@ -232,3 +233,62 @@ def test_production_graph_adapter_uses_engine_candidate_rows():
 
     assert result["candidates"] == rows
     assert result["expanded"] == []
+
+
+def test_l1_hydrator_reads_frontmatter_entry_by_identity():
+    class Store:
+        def read(self, domain):
+            return ({"id": "entry", "section": "Section"}, "frontmatter body")
+
+    candidate = SimpleNamespace(entry_id="entry", payload={"domain": "domain"})
+    result = L1StoreHydrator(Store()).hydrate(["entry"], [candidate])
+
+    assert result["entry"]["content"] == "frontmatter body"
+    assert result["entry"]["domain"] == "domain"
+
+
+def test_l1_hydrator_reads_legacy_section_by_domain_and_section():
+    class Store:
+        def read(self, domain):
+            return None, """# Domain\n\n## First\nfirst body\n\n## Target\ntarget body\n"""
+
+    candidate = SimpleNamespace(
+        entry_id="legacy-random-id",
+        payload={"domain": "domain", "metadata": {"section": "Target"}},
+    )
+    result = L1StoreHydrator(Store()).hydrate(["legacy-random-id"], [candidate])
+
+    assert result["legacy-random-id"] == {
+        "id": "legacy-random-id",
+        "entry_id": "legacy-random-id",
+        "domain": "domain",
+        "section": "Target",
+        "content": "target body",
+        "text": "target body",
+    }
+
+
+def test_l1_hydrator_does_not_guess_duplicate_legacy_sections():
+    class Store:
+        def read(self, domain):
+            return None, "## Target\nfirst\n\n## Target\nsecond\n"
+
+    candidate = SimpleNamespace(
+        entry_id="legacy-random-id",
+        payload={"domain": "domain", "metadata": {"section": "Target"}},
+    )
+
+    assert L1StoreHydrator(Store()).hydrate(["legacy-random-id"], [candidate]) == {}
+
+
+def test_l1_hydrator_uses_candidate_metadata_for_legacy_section():
+    class Store:
+        def read(self, domain):
+            return None, "## Target\ntarget body\n"
+
+    candidate = SimpleNamespace(
+        entry_id="legacy-random-id",
+        payload={"domain": "domain", "metadata": {"section": "Other"}},
+    )
+
+    assert L1StoreHydrator(Store()).hydrate(["legacy-random-id"], [candidate]) == {}
