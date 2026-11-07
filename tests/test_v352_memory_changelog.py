@@ -523,11 +523,20 @@ class TestInjectKnowledgeRecording:
 
 
 class TestWholeFileToolRecording:
+    """What the changelog records for the whole-file L1 tools.
+
+    Legacy-contract: the graph default refuses all three before they mutate, so
+    there is no legacy write for the changelog to record. The mode is a
+    *dependency* of the config fixture rather than a mark on each test, because
+    this autouse fixture resolves the mode and would otherwise run first.
+    """
+
     @pytest.fixture(autouse=True)
-    def _server_config(self, tmp_path, monkeypatch):
+    def _server_config(self, tmp_path, monkeypatch, legacy_graph_mode):
         from layered_memory_mcp import server
 
         cfg = _cfg(tmp_path)
+        assert cfg.graph_mode == legacy_graph_mode
         monkeypatch.setattr(server, "_config", cfg)
         self.cfg = cfg
         return cfg

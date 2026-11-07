@@ -142,8 +142,14 @@ class TestUnsafeAutoDetectIsRefused:
         assert _digest(detect_prod) == before
         assert "[L0] infra:" in detect_prod.read_text(encoding="utf-8")
 
+    @pytest.mark.usefixtures("legacy_graph_mode")
     def test_auto_maintain_skips_and_reports(self, tmp_path, monkeypatch, detect_prod):
-        """The same unsafe path is reported at the maintenance entry point."""
+        """The same unsafe path is reported at the maintenance entry point.
+
+        Legacy-only: the graph default suspends the whole ``auto_maintain`` job
+        and reports that instead, so the guard's own report shape is reachable
+        only in the rollback mode that still runs lazy compaction.
+        """
         cfg = _bare_config(tmp_path, monkeypatch, auto_maintain_interval_days=0.0)
         before = _digest(detect_prod)
 
@@ -187,10 +193,16 @@ class TestUnsafeAutoDetectIsRefused:
         assert report["stats"]["before_entries"] == 2
         assert _digest(detect_prod) == before
 
+    @pytest.mark.usefixtures("legacy_graph_mode")
     def test_inject_knowledge_writes_l1_and_surfaces_the_refusal(
         self, tmp_path, monkeypatch, detect_prod
     ):
-        """The L1 write succeeds while the unsafe projection is refused."""
+        """The L1 write succeeds while the unsafe projection is refused.
+
+        Legacy-only: under the graph default an ``inject_knowledge`` call with
+        no ``semantic_write_request`` is refused for want of a decision, so the
+        legacy dual-write that this guard protects never runs.
+        """
         cfg = _bare_config(tmp_path, monkeypatch)
         before = _digest(detect_prod)
 
@@ -492,6 +504,12 @@ class TestIntegrateAgentInjectMemory:
 
         return _set
 
+    # ``integrate_agent`` writes into the agent product's own home, which the
+    # graph default refuses outright on external-ownership grounds (see
+    # ``graph_mutation_guard.REFUSED_OPERATIONS``). These three pin what the
+    # legacy rollback mode preserves; the read-only ``status`` case below is
+    # deliberately *not* marked, because it must keep working under the default.
+    @pytest.mark.usefixtures("legacy_graph_mode")
     def test_an_auto_detected_memory_file_is_refused(
         self, tmp_path, monkeypatch, prod, hermes_host
     ):
@@ -509,6 +527,7 @@ class TestIntegrateAgentInjectMemory:
         assert _digest(prod) == before
         assert prod.read_text(encoding="utf-8") == PROD_CONTENT
 
+    @pytest.mark.usefixtures("legacy_graph_mode")
     def test_an_explicitly_configured_file_is_still_injected(
         self, tmp_path, monkeypatch, hermes_host
     ):
@@ -531,6 +550,7 @@ class TestIntegrateAgentInjectMemory:
         again = self._run(cfg)
         assert again["action"] == "already_injected"
 
+    @pytest.mark.usefixtures("legacy_graph_mode")
     def test_the_opt_in_restores_the_legacy_behaviour(
         self, tmp_path, monkeypatch, hermes_host
     ):

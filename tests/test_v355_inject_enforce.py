@@ -790,6 +790,17 @@ class TestCompactionIsGatedByModeInstead:
 
 
 class TestMcpTool:
+    """The MCP surface of routing enforcement.
+
+    ``inject_knowledge_tool`` is one of the two authority entrances, so the
+    graph default does not refuse it — it requires a caller-supplied
+    ``semantic_write_request`` instead. The calls below deliberately omit one,
+    which is the legacy, non-semantic shape of the tool, so those tests ask for
+    ``legacy_graph_mode`` by name. The two that are purely about argument
+    validation and capability reporting are left unmarked: they must keep
+    holding under the rollout default, and they do.
+    """
+
     def _run(self, cfg, coro_factory):
         from layered_memory_mcp import server
 
@@ -799,6 +810,7 @@ class TestMcpTool:
         finally:
             server._config = None
 
+    @pytest.mark.usefixtures("legacy_graph_mode")
     def test_old_call_without_the_argument_still_works(self, tmp_path):
         cfg = _strict(tmp_path)
         payload = self._run(
@@ -810,6 +822,7 @@ class TestMcpTool:
         assert payload["success"] is True
         assert payload["routing_enforcement"]["override_requested"] == "none"
 
+    @pytest.mark.usefixtures("legacy_graph_mode")
     def test_tool_refuses_a_non_l1_write_and_keeps_the_shape(self, tmp_path):
         cfg = _strict(tmp_path)
         payload = self._run(
@@ -824,6 +837,7 @@ class TestMcpTool:
         assert payload["suggested_action"]["surface"] == "skill"
         assert _knowledge_files(cfg) == []
 
+    @pytest.mark.usefixtures("legacy_graph_mode")
     def test_tool_accepts_the_override(self, tmp_path):
         cfg = _strict(tmp_path)
         payload = self._run(
@@ -853,6 +867,7 @@ class TestMcpTool:
         assert "Invalid routing_override" in payload["error"]
         assert _knowledge_files(cfg) == []
 
+    @pytest.mark.usefixtures("legacy_graph_mode")
     def test_batch_carries_the_refusal_per_item(self, tmp_path):
         cfg = _strict(tmp_path)
         payload = self._run(
@@ -878,6 +893,7 @@ class TestMcpTool:
         assert refused["routing_enforcement"]["gate_active"] is True
         assert _knowledge_files(cfg) == ["infra.md"]
 
+    @pytest.mark.usefixtures("legacy_graph_mode")
     def test_batch_override_applies_to_every_item(self, tmp_path):
         cfg = _strict(tmp_path)
         payload = self._run(

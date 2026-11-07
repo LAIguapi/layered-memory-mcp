@@ -13,9 +13,16 @@ In ``graph_write``/``graph`` modes the journal is the authority and L1, the
 vector rows and L0 are *its* projections. An entrance that writes one of those
 directly would publish state no decision produced, and the next replay would
 silently erase it — so it refuses instead, before any effect, and names what to
-call. An entrance with no journal-backed semantics at all (a TODO, an
+call. An entrance with no journal-backed semantics at all (a review verdict, an
 agent-owned Skill file) refuses for the other reason: there is no honest way to
 represent it as a semantic decision yet, and inventing one would be worse.
+
+v3.6.1 moved the task entrances *out* of this table. They were in it for the
+second reason, which was true at the time and is not any more: a task mutation
+is a typed semantic decision now (:mod:`~layered_memory_mcp.graph_task`) and the
+TODO view is a managed projection, so there is nothing left to refuse. A
+capability that gets implemented leaves the refusal table; it does not keep a
+refusal with a nicer message.
 
 Every other mode is untouched. ``legacy``, ``shadow`` and ``graph_recall`` keep
 their existing behaviour exactly, which is what keeps the rollout reversible.
@@ -71,9 +78,25 @@ REASON_NO_SEMANTIC_MAPPING = "no_semantic_mapping"
 REASON_EXTERNAL_OWNERSHIP = "external_ownership"
 
 #: The entrances that *do* route through the authority.
+#:
+#: The task and review entrances joined this list in v3.6.1. They used to be refused for
+#: want of a journal-backed representation, which was true and is no longer: a
+#: task mutation is now a typed semantic decision
+#: (:mod:`~layered_memory_mcp.graph_task`) and the TODO view is the ``todo``
+#: projection of the journal. ``apply_semantic_lifecycle`` joined it for the
+#: same reason — a retraction is a decision, not a missing capability. Review
+#: verdicts use the same target-only lifecycle path; rejection is represented
+#: by the existing retract event.
 AUTHORITY_ENTRANCES: tuple[str, ...] = (
     "inject_knowledge_tool",
     "batch_inject_knowledge_tool",
+    "apply_semantic_lifecycle",
+    "add_todo",
+    "update_todo",
+    "delete_todo",
+    "dashboard_update_todo",
+    "approve_knowledge",
+    "reject_knowledge",
 )
 
 _INJECT = (
@@ -90,6 +113,30 @@ _RECOVER = (
     "recover_graph_projections() — the managed projections are republished "
     "from the semantic journal, never rebuilt from the files they produced"
 )
+#: For the auxiliary stores that have *no* journal-backed equivalent at all.
+#:
+#: Pointing these at the semantic write would be a false alternative: a review
+#: verdict is not a claim, and ``inject_knowledge_tool`` cannot represent one.
+#: So the refusal says what it actually is — a capability the graph write path
+#: does not have — and then stops.
+#:
+#: It deliberately does **not** suggest running the entrance under
+#: ``graph_mode='legacy'``. That is a downgrade pathway, not a fix: moving off
+#: the legacy authority is the point of this work, and advising an operator to
+#: move back to it would be advising them to abandon it. The honest answer to a
+#: missing capability is that it is missing.
+#:
+#: This used to cover the task entrances too. It no longer does — a task
+#: mutation is a committed semantic decision now (see
+#: :data:`AUTHORITY_ENTRANCES`) — and what is left here is only what genuinely
+#: has no semantic form yet.
+_AUXILIARY = (
+    "no equivalent: the semantic journal has no representation for this store, "
+    "and this refusal is a missing capability rather than a redirection. The "
+    "store itself is unchanged and still readable, and a journal-backed form of "
+    "this operation is not implemented — it must not be improvised from a claim, "
+    "and it is not available by moving the service back to a legacy mode"
+)
 _DRY_RUN = "the same call with dry_run=True, which inspects and writes nothing"
 _READ_ONLY = "the read-only form of this call"
 
@@ -100,9 +147,7 @@ REFUSED_OPERATIONS: dict[str, tuple[str, str]] = {
     "create_knowledge_file": (REASON_MANAGED_PROJECTION, _INJECT),
     "update_knowledge_file": (REASON_MANAGED_PROJECTION, _INJECT),
     "delete_knowledge_file": (REASON_MANAGED_PROJECTION, _SUPERSEDE),
-    # --- MCP: review lifecycle ---------------------------------------------
-    "approve_knowledge": (REASON_NO_SEMANTIC_MAPPING, _INJECT),
-    "reject_knowledge": (REASON_NO_SEMANTIC_MAPPING, _SUPERSEDE),
+
     # --- MCP: derived index/vector maintenance ------------------------------
     "reindex_vector_store_tool": (REASON_MANAGED_PROJECTION, _RECOVER),
     "sync_l0_index_tool": (REASON_MANAGED_PROJECTION, _RECOVER),
@@ -115,21 +160,21 @@ REFUSED_OPERATIONS: dict[str, tuple[str, str]] = {
     "init_framework": (REASON_EXTERNAL_OWNERSHIP, _READ_ONLY),
     "integrate_agent": (REASON_EXTERNAL_OWNERSHIP, "integrate_agent(action='status')"),
     # --- MCP: tasks ---------------------------------------------------------
-    "add_todo": (REASON_NO_SEMANTIC_MAPPING, _INJECT),
-    "update_todo": (REASON_NO_SEMANTIC_MAPPING, _INJECT),
-    "delete_todo": (REASON_NO_SEMANTIC_MAPPING, _SUPERSEDE),
+    # Not here any more, and the absence is the point: `add_todo`,
+    # `update_todo` and `delete_todo` commit through the journal in a write
+    # mode (see AUTHORITY_ENTRANCES). They are not refused and they are not
+    # redirected; they work.
     # --- REST ---------------------------------------------------------------
     "rest_create_knowledge": (REASON_MANAGED_PROJECTION, _INJECT),
     "rest_update_knowledge": (REASON_MANAGED_PROJECTION, _INJECT),
     "rest_delete_knowledge": (REASON_MANAGED_PROJECTION, _SUPERSEDE),
-    "rest_approve_review": (REASON_NO_SEMANTIC_MAPPING, _INJECT),
-    "rest_reject_review": (REASON_NO_SEMANTIC_MAPPING, _SUPERSEDE),
+    "rest_approve_review": (REASON_NO_SEMANTIC_MAPPING, _AUXILIARY),
+    "rest_reject_review": (REASON_NO_SEMANTIC_MAPPING, _AUXILIARY),
     # --- Dashboard plugin ---------------------------------------------------
     "dashboard_inject_knowledge": (REASON_MANAGED_PROJECTION, _INJECT),
-    "dashboard_approve_knowledge": (REASON_NO_SEMANTIC_MAPPING, _INJECT),
-    "dashboard_reject_knowledge": (REASON_NO_SEMANTIC_MAPPING, _SUPERSEDE),
+    "dashboard_approve_knowledge": (REASON_NO_SEMANTIC_MAPPING, _AUXILIARY),
+    "dashboard_reject_knowledge": (REASON_NO_SEMANTIC_MAPPING, _AUXILIARY),
     "dashboard_compact_memory": (REASON_NO_SEMANTIC_MAPPING, _DRY_RUN),
-    "dashboard_update_todo": (REASON_NO_SEMANTIC_MAPPING, _INJECT),
     "dashboard_rebuild_vectors": (REASON_MANAGED_PROJECTION, _RECOVER),
 }
 

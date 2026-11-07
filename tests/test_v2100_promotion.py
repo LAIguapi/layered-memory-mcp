@@ -351,6 +351,8 @@ def test_case7_disabled_skips_in_audit(tmp_path, fake_embed):
 # End-to-end integration: inject into misc surfaces the promotion suggestion
 # ---------------------------------------------------------------------------
 
+# A non-semantic ``inject_knowledge`` call: the legacy write shape.
+@pytest.mark.usefixtures("legacy_graph_mode")
 def test_integration_inject_attaches_promotion(tmp_path, fake_embed):
     from layered_memory_mcp import injector
 

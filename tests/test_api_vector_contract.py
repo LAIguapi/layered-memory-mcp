@@ -1,4 +1,12 @@
-"""Optional HTTP transports use the same derived-vector contracts."""
+"""Optional HTTP transports use the same derived-vector contracts.
+
+The mutating routes below are legacy-contract entrances: under the ``graph``
+rollout default ``POST``/``PUT``/``DELETE /knowledge`` refuse before mutating
+and name the semantic write instead, because the vector rows are a projection
+of the journal there (``graph_mutation_guard.REFUSED_OPERATIONS``). That
+refusal is covered by ``test_v361_graph_entrances.py``; each test here that
+drives a legacy REST write asks for the rollback mode by name.
+"""
 import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -16,10 +24,15 @@ from layered_memory_mcp.storage import vector_store
 
 
 @pytest.fixture
-def cfg(tmp_path, monkeypatch):
+def cfg(tmp_path, monkeypatch, legacy_graph_mode):
+    # ``legacy_graph_mode`` is a *dependency* rather than a usefixtures mark so
+    # the ordering is guaranteed by construction: the mode has to be chosen
+    # before this ``MemoryConfig`` resolves it, not merely before the test body.
     monkeypatch.setattr(vector_store, "_embed_texts", lambda texts:
                         np.ones((len(texts), 512), dtype=np.float32) / np.sqrt(512))
-    return MemoryConfig(home=str(tmp_path / "store"), auto_maintain=False)
+    config = MemoryConfig(home=str(tmp_path / "store"), auto_maintain=False)
+    assert config.graph_mode == legacy_graph_mode
+    return config
 
 
 @pytest.mark.asyncio

@@ -458,8 +458,18 @@ class TestServerTools:
 # Server-level Tool Tests — Write
 # ---------------------------------------------------------------------------
 
+@pytest.mark.usefixtures("legacy_graph_mode")
 class TestServerWriteTools:
-    """Test MCP write tool functions."""
+    """Test MCP write tool functions.
+
+    Whole-file L1 CRUD is a legacy-contract entrance. Under the ``graph``
+    rollout default these three tools refuse before mutating and name
+    ``inject_knowledge_tool(..., semantic_write_request=...)`` instead, because
+    L1 is a projection of the semantic journal there (see
+    ``graph_mutation_guard.REFUSED_OPERATIONS``). That refusal is covered by
+    ``test_v361_graph_entrances.py``; this class covers the behaviour explicit
+    ``legacy`` rollback keeps, so it asks for that mode by name.
+    """
 
     @pytest.mark.asyncio
     async def test_create_knowledge_file(self, tmp_path):
@@ -874,8 +884,14 @@ class TestFilenameValidation:
     """Test filename validation edge cases."""
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("legacy_graph_mode")
     async def test_rejects_filename_too_long(self, tmp_path):
-        """Filenames exceeding 255 chars should be rejected."""
+        """Filenames exceeding 255 chars should be rejected.
+
+        Legacy-only: under the graph default ``create_knowledge_file`` refuses
+        the *entrance* before it ever looks at the filename, so the name-length
+        check is reachable only in the rollback mode that still owns that write.
+        """
         import layered_memory_mcp.server as srv
         srv._config = MemoryConfig(knowledge_dir=str(tmp_path / "k"))
 
@@ -906,8 +922,14 @@ class TestFilenameValidation:
         srv._config = None
 
 
+@pytest.mark.usefixtures("legacy_graph_mode")
 class TestDeleteBakCleanup:
-    """Test .bak cleanup on delete."""
+    """Test .bak cleanup on delete.
+
+    Legacy-only for the same reason as ``TestServerWriteTools``: the graph
+    default refuses ``delete_knowledge_file`` and points at a SUPERSEDES
+    decision, so there is no legacy backup for it to clean up.
+    """
 
     @pytest.mark.asyncio
     async def test_delete_cleans_bak(self, tmp_path):

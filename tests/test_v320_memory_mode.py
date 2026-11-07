@@ -194,6 +194,7 @@ def test_pointers_mode_legacy_upsert(tmp_path):
 # --- auto_maintain dispatch ------------------------------------------------
 
 
+@pytest.mark.usefixtures("legacy_graph_mode")
 def test_auto_maintain_dispatches_index_only(tmp_path):
     mem = tmp_path / "MEMORY.md"
     mem.write_text(f"{_POINTER_A}\n", encoding="utf-8")
@@ -213,6 +214,7 @@ def test_auto_maintain_dispatches_index_only(tmp_path):
     assert body.count(_knowledge_index_marker(cfg)) == 1
 
 
+@pytest.mark.usefixtures("legacy_graph_mode")
 def test_auto_maintain_dispatches_off(tmp_path):
     mem = tmp_path / "MEMORY.md"
     # Empty memory: no bloat, so lazy compaction stays out of the way and

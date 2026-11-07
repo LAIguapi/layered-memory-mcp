@@ -139,7 +139,12 @@ def test_unknown_members_are_visible_coverage_blockers(adapter, source, tmp_path
     if path.suffix:
         path.write_bytes(b"neutral-unrecognized")
     else:
+        # Directories carry a member: a *nonempty* unrecognised directory is
+        # the case that must never be silently dropped. Proved-empty knowledge
+        # namespaces are a separate, explicitly reported outcome — see
+        # ``test_an_empty_knowledge_namespace_is_reported_not_blocked``.
         path.mkdir()
+        (path / "unread.md").write_bytes(b"neutral-unrecognized")
     before = tree_state(tmp_path)
     report = preview(adapter, source, tmp_path)
     assert report["status"] == "refused"
@@ -177,6 +182,10 @@ def test_exclusions_are_classified_but_never_opened(adapter, source, tmp_path, m
         "data/vector_maintenance.json", "data/vector_maintenance.lock",
         "knowledge/alpha.md.lock", "data/vectors.db-wal", "data/vectors.db-journal",
         "data/vectors.db-shm",
+        # Operational state this project writes under the home: a real store
+        # has these, and refusing them made legitimate sources unsnapshottable.
+        ".gitignore", ".last_auto_compact", ".last_auto_compact_attempt",
+        ".last_l1_dedup", "write_guard_state.json",
     ]
     directories = ["models", ".git", "backups", "data/backups"]
     for relative in files:
@@ -207,6 +216,144 @@ def test_exclusions_are_classified_but_never_opened(adapter, source, tmp_path, m
         assert classified[relative] in {"excluded", "sidecar"}
     assert "neutral-excluded" not in json.dumps(report)
     assert tree_state(tmp_path) == before
+
+
+def test_an_operator_declared_root_member_is_covered_but_never_opened(
+    adapter, source, tmp_path, monkeypatch,
+):
+    """Positive control for the explicit, per-run root exclusion."""
+    (source / "operator-owned.json").write_bytes(b"neutral-operator-owned")
+    (source / "operator-archive").mkdir()
+    (source / "operator-archive" / "unread.md").write_bytes(b"neutral-operator-owned")
+    declared = ["operator-archive", "operator-owned.json"]
+    archive_inode = (source / "operator-archive").stat().st_ino
+    before = tree_state(tmp_path)
+    real_open = os.open
+    real_scan = os.scandir
+
+    def guarded_open(path, *args, **kwargs):
+        if not isinstance(path, int):
+            assert Path(path).name not in {
+                "operator-owned.json", "operator-archive", "unread.md",
+            }, "declared member opened"
+        return real_open(path, *args, **kwargs)
+
+    def guarded_scan(path):
+        if isinstance(path, int):
+            assert os.fstat(path).st_ino != archive_inode, "declared subtree traversed"
+        return real_scan(path)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "open", guarded_open)
+        patch.setattr(os, "scandir", guarded_scan)
+        report = adapter.plan_snapshot(
+            source=source, destination=tmp_path / "bundle", exclude=list(reversed(declared)),
+        )
+    assert report["status"] == "preview"
+    assert report["operator_exclusions"] == declared
+    assert report["manifest"]["operator_exclusions"] == declared
+    classified = {item["path"]: item["classification"] for item in report["inventory"]}
+    assert classified["operator-owned.json"] == "operator_excluded"
+    assert classified["operator-archive"] == "operator_excluded"
+    assert "neutral-operator-owned" not in json.dumps(report)
+    assert [record["path"] for record in report["manifest"]["files"]] == [
+        "L0.md", "data/memory_changelog.jsonl", "data/vectors.db", "knowledge/alpha.md",
+    ]
+    assert tree_state(tmp_path) == before
+    applied = adapter.apply_snapshot(
+        source=source, destination=tmp_path / "bundle", exclude=declared,
+    )
+    assert applied["status"] == "snapshot_created"
+    assert applied["manifest"] == report["manifest"]
+    assert sorted(path.name for path in (tmp_path / "bundle" / "source").iterdir()) == [
+        "data", "knowledge",
+    ]
+
+
+def test_an_undeclared_root_member_still_blocks_even_beside_a_declared_one(
+    adapter, source, tmp_path,
+):
+    """Negative control: a declaration covers one name, never 'the unknown'."""
+    (source / "operator-owned.json").write_bytes(b"neutral-operator-owned")
+    (source / "second-unknown.json").write_bytes(b"neutral-second")
+    before = tree_state(tmp_path)
+    report = adapter.plan_snapshot(
+        source=source, destination=tmp_path / "bundle",
+        exclude=["operator-owned.json"],
+    )
+    assert report["status"] == "refused"
+    assert report["findings"] == [
+        "source_coverage_blocked", "source_unknown_member:second-unknown.json",
+    ]
+    assert tree_state(tmp_path) == before
+
+
+@pytest.mark.parametrize("declared,finding", [
+    (["knowledge"], "operator_exclusion_reserved:knowledge"),
+    (["data"], "operator_exclusion_reserved:data"),
+    (["L0.md"], "operator_exclusion_reserved:L0.md"),
+    ([".env"], "operator_exclusion_reserved:.env"),
+    (["config.yaml"], "operator_exclusion_reserved:config.yaml"),
+    (["*"], "operator_exclusion_pattern:*"),
+    (["*.json"], "operator_exclusion_pattern:*.json"),
+    (["draft?"], "operator_exclusion_pattern:draft?"),
+    (["knowledge/alpha.md"], "operator_exclusion_invalid:knowledge/alpha.md"),
+    (["."], "operator_exclusion_invalid:."),
+    ([".."], "operator_exclusion_invalid:.."),
+    (["../escape"], "operator_exclusion_invalid:../escape"),
+    ([""], "operator_exclusion_invalid"),
+    ([" spaced"], "operator_exclusion_invalid"),
+    ([None], "operator_exclusion_invalid"),
+    ([7], "operator_exclusion_invalid"),
+    (["dup", "dup"], "operator_exclusion_duplicate:dup"),
+    (["never-present"], "operator_exclusion_absent:never-present"),
+])
+def test_invalid_operator_exclusions_are_refused_without_writes(
+    adapter, source, tmp_path, declared, finding,
+):
+    before = tree_state(tmp_path)
+    report = adapter.apply_snapshot(
+        source=source, destination=tmp_path / "bundle", exclude=declared,
+    )
+    assert report["status"] == "refused"
+    assert finding in report["findings"]
+    assert not (tmp_path / "bundle").exists()
+    assert tree_state(tmp_path) == before
+
+
+@pytest.mark.parametrize("kind", ["symlink", "special"])
+def test_a_declaration_cannot_launder_a_symlink_or_special_member(
+    adapter, source, tmp_path, kind,
+):
+    path = source / "operator-owned"
+    if kind == "symlink":
+        path.symlink_to(tmp_path / "absent")
+        expected = "source_symlink:operator-owned"
+    else:
+        os.mkfifo(path)
+        expected = "source_special_file:operator-owned"
+    before = tree_state(tmp_path)
+    report = adapter.apply_snapshot(
+        source=source, destination=tmp_path / "bundle", exclude=["operator-owned"],
+    )
+    assert report["status"] == "refused"
+    assert expected in report["findings"]
+    assert tree_state(tmp_path) == before
+
+
+def test_a_declaration_does_not_reach_into_knowledge_or_data(adapter, source, tmp_path):
+    """Root-member scope only: a nested unknown is not covered by a root name."""
+    (source / "data" / "operator-owned.json").write_bytes(b"neutral")
+    (source / "knowledge" / "operator-owned.bin").write_bytes(b"neutral")
+    (source / "operator-owned.json").write_bytes(b"neutral")
+    report = adapter.plan_snapshot(
+        source=source, destination=tmp_path / "bundle",
+        exclude=["operator-owned.json", "operator-owned.bin"],
+    )
+    assert report["status"] == "refused"
+    assert "source_unknown_member:data/operator-owned.json" in report["findings"]
+    assert "source_unknown_member:knowledge/operator-owned.bin" in report["findings"]
+    assert "operator_exclusion_absent:operator-owned.bin" in report["findings"]
 
 
 @pytest.mark.parametrize("relative", [
@@ -356,6 +503,7 @@ def test_apply_validates_before_creating_anything(adapter, source, tmp_path, kin
         (source / "data" / f'vectors.db-{kind.removeprefix("nonempty_")}').write_bytes(b"neutral")
     elif kind == "nested_knowledge":
         (source / "knowledge" / "nested").mkdir()
+        (source / "knowledge" / "nested" / "held.md").write_bytes(b"neutral-held")
     elif kind == "symlink":
         (source / "models").symlink_to(tmp_path / "absent")
     elif kind == "special":
@@ -506,12 +654,25 @@ def test_atomic_publication_does_not_clobber_racing_target(
     assert tree_state(source) == before
 
 
+def cli_environment():
+    """Run the working tree's module, never an installed snapshot of it."""
+    environment = dict(os.environ)
+    source_root = str(Path(__file__).resolve().parents[1] / "src")
+    environment["PYTHONPATH"] = (
+        source_root + os.pathsep + environment.get("PYTHONPATH", "")
+    )
+    return environment
+
+
 def test_real_cli_preview_apply_repeat_and_invalid_arguments(source, tmp_path):
     destination = tmp_path / "bundle"
     command = ["/usr/bin/python3", "-m", "layered_memory_mcp.graph_migration_snapshot"]
     paths = ["--source", str(source), "--destination", str(destination)]
     before = tree_state(tmp_path)
-    planned = subprocess.run(command + paths, capture_output=True, text=True, check=False)
+    planned = subprocess.run(
+        command + paths, capture_output=True, text=True, check=False,
+        env=cli_environment(),
+    )
     assert planned.stdout.strip(), "CLI must emit its JSON report"
     report = json.loads(planned.stdout)
     assert planned.returncode == report["exit_code"] == 0
@@ -520,6 +681,7 @@ def test_real_cli_preview_apply_repeat_and_invalid_arguments(source, tmp_path):
     assert tree_state(tmp_path) == before
     published = subprocess.run(
         command + paths + ["--apply"], capture_output=True, text=True, check=False,
+        env=cli_environment(),
     )
     report = json.loads(published.stdout)
     assert published.returncode == report["exit_code"] == 0
@@ -527,17 +689,48 @@ def test_real_cli_preview_apply_repeat_and_invalid_arguments(source, tmp_path):
     before_repeat = tree_state(tmp_path)
     repeated = subprocess.run(
         command + paths + ["--apply"], capture_output=True, text=True, check=False,
+        env=cli_environment(),
     )
     assert repeated.returncode == json.loads(repeated.stdout)["exit_code"] == 2
     assert tree_state(tmp_path) == before_repeat
     invalid = subprocess.run(
         command + ["--unrecognized=neutral-private-value"],
-        capture_output=True, text=True, check=False,
+        capture_output=True, text=True, check=False, env=cli_environment(),
     )
     report = json.loads(invalid.stdout)
     assert invalid.returncode == report["exit_code"] == 2
     assert report["findings"] == ["cli_arguments_invalid"]
     assert "neutral-private-value" not in invalid.stdout + invalid.stderr
+
+
+def test_the_real_cli_accepts_declared_exclusions_and_refuses_bad_ones(source, tmp_path):
+    command = ["/usr/bin/python3", "-m", "layered_memory_mcp.graph_migration_snapshot"]
+    paths = ["--source", str(source), "--destination", str(tmp_path / "bundle")]
+    (source / "operator-owned.json").write_bytes(b"neutral-operator-owned")
+    before = tree_state(tmp_path)
+    refused = subprocess.run(
+        command + paths, capture_output=True, text=True, check=False,
+        env=cli_environment(),
+    )
+    assert json.loads(refused.stdout)["findings"] == [
+        "source_coverage_blocked", "source_unknown_member:operator-owned.json",
+    ]
+    declared = subprocess.run(
+        command + paths + ["--exclude", "operator-owned.json"],
+        capture_output=True, text=True, check=False, env=cli_environment(),
+    )
+    report = json.loads(declared.stdout)
+    assert declared.returncode == report["exit_code"] == 0
+    assert report["status"] == "preview"
+    assert report["operator_exclusions"] == ["operator-owned.json"]
+    reserved = subprocess.run(
+        command + paths + ["--exclude", "knowledge"],
+        capture_output=True, text=True, check=False, env=cli_environment(),
+    )
+    report = json.loads(reserved.stdout)
+    assert reserved.returncode == report["exit_code"] == 2
+    assert report["findings"] == ["operator_exclusion_reserved:knowledge"]
+    assert tree_state(tmp_path) == before
 
 
 def test_root_membership_drift_during_final_scan_is_not_missed(
@@ -661,7 +854,7 @@ def test_apply_never_reads_exclusions_or_uses_sqlite_or_config(
     assert not any(record["path"] in forbidden for record in report["manifest"]["files"])
 
 
-@pytest.mark.parametrize("relative", ["unknown", "data/unknown", "knowledge/nested"])
+@pytest.mark.parametrize("relative", ["unknown", "data/unknown"])
 def test_unknown_subtrees_are_not_traversed(adapter, source, tmp_path, monkeypatch, relative):
     directory = source / relative
     directory.mkdir()
@@ -680,6 +873,118 @@ def test_unknown_subtrees_are_not_traversed(adapter, source, tmp_path, monkeypat
         report = apply(adapter, source, tmp_path / "bundle")
     assert hits
     assert report["status"] == "refused"
+    assert tree_state(tmp_path) == before
+
+
+def test_a_nonempty_knowledge_namespace_blocks_without_reading_its_members(
+    adapter, source, tmp_path, monkeypatch,
+):
+    """The namespace handle is opened to *list* names — never its members.
+
+    A knowledge subdirectory is the one unrecognised shape whose emptiness has
+    to be established before it can be dismissed, and metadata cannot establish
+    it. So this directory is opened once; what must never happen is a member of
+    it being opened or a byte of it being read.
+    """
+    directory = source / "knowledge" / "nested"
+    directory.mkdir()
+    (directory / "held.md").write_bytes(b"neutral-held")
+    (directory / "deeper").mkdir()
+    before = tree_state(tmp_path)
+    original_open = os.open
+    original_read = os.read
+    namespace_handles = []
+
+    def guarded_open(path, *args, **kwargs):
+        assert Path(path).name not in {"held.md", "deeper"}, "namespace member opened"
+        descriptor = original_open(path, *args, **kwargs)
+        if not isinstance(path, int) and Path(path).name == "nested":
+            namespace_handles.append(descriptor)
+        return descriptor
+
+    def guarded_read(descriptor, count):
+        assert descriptor not in namespace_handles, "namespace payload read"
+        return original_read(descriptor, count)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "open", guarded_open)
+        patch.setattr(os, "read", guarded_read)
+        report = apply(adapter, source, tmp_path / "bundle")
+    assert namespace_handles, "emptiness must actually be checked, not assumed"
+    assert report["status"] == "refused"
+    assert "knowledge_directory_uncovered:knowledge/nested" in report["findings"]
+    assert {
+        item["path"]: item["classification"] for item in report["inventory"]
+    }["knowledge/nested"] == "blocked"
+    assert "knowledge/nested/held.md" not in {
+        item["path"] for item in report["inventory"]
+    }
+    assert "neutral-held" not in json.dumps(report)
+    assert tree_state(tmp_path) == before
+
+
+def test_an_empty_knowledge_namespace_is_reported_not_blocked(adapter, source, tmp_path):
+    """Positive control for the one bounded namespace allowance."""
+    for name in ("alpha-namespace", "beta-namespace"):
+        (source / "knowledge" / name).mkdir()
+    report = apply(adapter, source, tmp_path / "bundle")
+    assert report["status"] == "snapshot_created"
+    assert report["empty_namespaces"] == [
+        "knowledge/alpha-namespace", "knowledge/beta-namespace",
+    ]
+    assert report["manifest"]["empty_namespaces"] == report["empty_namespaces"]
+    assert "empty_knowledge_namespace" in report["warnings"]
+    classified = {item["path"]: item["classification"] for item in report["inventory"]}
+    assert classified["knowledge/alpha-namespace"] == "empty_namespace"
+    # An empty namespace is accounted for, not copied: the bundle keeps the
+    # adapter's two-directory shape so migration sees no phantom namespace.
+    assert sorted(path.name for path in (tmp_path / "bundle" / "source" / "knowledge").iterdir()) == [
+        "alpha.md"
+    ]
+    assert [record["path"] for record in report["manifest"]["files"]] == [
+        "L0.md", "data/memory_changelog.jsonl", "data/vectors.db", "knowledge/alpha.md",
+    ]
+
+
+def test_a_knowledge_namespace_that_fills_up_is_rechecked_before_publication(
+    adapter, source, tmp_path, monkeypatch,
+):
+    """Emptiness proved at inspection must not be trusted at publication."""
+    namespace = source / "knowledge" / "late-namespace"
+    namespace.mkdir()
+    original = adapter._copy_file
+    hits = []
+
+    def filling_copy(*args, **kwargs):
+        result = original(*args, **kwargs)
+        hits.append(1)
+        if len(hits) == 1:
+            (namespace / "late.md").write_bytes(b"neutral-late")
+        return result
+
+    monkeypatch.setattr(adapter, "_copy_file", filling_copy)
+    report = apply(adapter, source, tmp_path / "bundle")
+    assert hits
+    assert report["status"] == "failed"
+    assert not (tmp_path / "bundle").exists()
+    assert Path(report["staging"]).is_dir()
+
+
+@pytest.mark.parametrize("name", [
+    "alpha.md", "alpha.md.lock", "nested.md",
+])
+def test_a_markdown_named_knowledge_directory_is_still_a_wrong_type(
+    adapter, source, tmp_path, name,
+):
+    """A directory shaped like a document is a defect, not a namespace."""
+    path = source / "knowledge" / name
+    if path.exists():
+        path.unlink()
+    path.mkdir()
+    before = tree_state(tmp_path)
+    report = apply(adapter, source, tmp_path / "bundle")
+    assert report["status"] == "refused"
+    assert f"source_wrong_type:knowledge/{name}" in report["findings"]
     assert tree_state(tmp_path) == before
 
 

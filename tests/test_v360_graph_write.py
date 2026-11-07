@@ -1089,7 +1089,15 @@ _ALLOWED_IMPORTS = {
     "collections.abc",
     "datetime",
     "hashlib",
+    # v3.6.1: the target-only lifecycle request serializes itself (it is a
+    # validated dataclass rather than a GraphModel, so it does not inherit
+    # ``to_json``). Standard library, which this boundary has always allowed.
+    "json",
     "pydantic",
+    # The same pydantic the models already use, in its dataclass form: a
+    # *request* is not a persisted payload, and the lifecycle request has to be
+    # a real dataclass so "this shape carries no node" is inspectable.
+    "pydantic.dataclasses",
     "typing",
     ".graph_models",
     ".graph_store",

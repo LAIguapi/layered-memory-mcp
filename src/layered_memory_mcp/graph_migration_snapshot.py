@@ -8,6 +8,12 @@ The path contract rejects symlinks, noncanonical parent components and aliases.
 Linux no-atime descriptor reads preserve source access times as well as bytes.
 Callers must control the explicit parent namespace throughout the operation;
 ancestor identities are rechecked, but there is no service/write barrier.
+
+Coverage is decided by one policy (``_ROOT_POLICY``/``_DATA_POLICY``/
+``_policy``). Unrecognised members block; they are never ignored. Two bounded
+allowances exist, both explicit and both recorded: a knowledge namespace
+subdirectory that is *proved* empty, and a root member the operator declares
+per run. Neither opens, reads or traverses anything it covers.
 """
 
 from __future__ import annotations
@@ -29,16 +35,39 @@ from typing import Any, Sequence
 
 REPORT_VERSION = 1
 _CHUNK_SIZE = 1 << 20
+
+#: Every root member this adapter recognises, as ``name -> (class, kind)``.
+#:
+#: ``directory`` members are traversed, ``selected``/``evidence`` members are
+#: copied, and ``excluded`` members are classified from their metadata alone —
+#: never opened, read or traversed. A member that is not listed here is a
+#: coverage blocker, because "unrecognised" and "unwanted" are not the same
+#: claim: silently ignoring unknown roots is how a knowledge namespace would
+#: get dropped. Operator-owned roots that this project does not produce are
+#: declared per run instead (see :func:`_validate_exclusions`), so no
+#: installation-specific name has to live in this source file.
 _ROOT_POLICY = {
+    # Migration inputs.
     "knowledge": ("directory", "directory"),
     "data": ("directory", "directory"),
     "L0.md": ("evidence", "file"),
+    # Configuration, credentials, model cache, repository and backup metadata.
     "config.yaml": ("excluded", "file"),
     ".env": ("excluded", "file"),
     "models": ("excluded", "directory"),
     ".git": ("excluded", "directory"),
+    ".gitignore": ("excluded", "file"),
     "backups": ("excluded", "directory"),
+    # Maintenance state this project writes under the home itself: cadence
+    # markers and the write guard's state are operational, not memory.
+    ".last_auto_compact": ("excluded", "file"),
+    ".last_auto_compact_attempt": ("excluded", "file"),
+    ".last_l1_dedup": ("excluded", "file"),
+    "write_guard_state.json": ("excluded", "file"),
 }
+#: Root members an operator may never redeclare: the three migration inputs
+#: carry memory, and the rest already have a typed verdict above.
+_RESERVED_EXCLUSIONS = frozenset(_ROOT_POLICY)
 _DATA_POLICY = {
     "vectors.db": ("selected", "file"),
     "memory_changelog.jsonl": ("selected", "file"),
@@ -71,6 +100,36 @@ class _Scan:
     selected: list[str]
     findings: list[str]
     warnings: list[str]
+    empty_namespaces: list[str]
+    observed_exclusions: list[str]
+
+
+def _validate_exclusions(values: Sequence[str] | None) -> tuple[str, ...]:
+    """Accept only explicit, single-component, non-reserved root member names.
+
+    This is the escape hatch for a root member that belongs to the operator
+    rather than to this project — and it is deliberately a narrow one. There
+    is no pattern, no recursion and no "ignore what you do not know": each
+    name is one literal root member, and :func:`_scan_source` additionally
+    refuses a declared name that is not actually present, so a stale or
+    speculative list cannot quietly cover a future unknown member.
+    """
+    exclusions: list[str] = []
+    for value in values or ():
+        if not isinstance(value, str):
+            raise _Refused("operator_exclusion_invalid")
+        if value != value.strip() or not value:
+            raise _Refused("operator_exclusion_invalid")
+        if "/" in value or os.sep in value or "\x00" in value or value in {".", ".."}:
+            raise _Refused("operator_exclusion_invalid", value)
+        if any(character in value for character in "*?[]"):
+            raise _Refused("operator_exclusion_pattern", value)
+        if value in _RESERVED_EXCLUSIONS:
+            raise _Refused("operator_exclusion_reserved", value)
+        if value in exclusions:
+            raise _Refused("operator_exclusion_duplicate", value)
+        exclusions.append(value)
+    return tuple(sorted(exclusions))
 
 
 def _signature(metadata: os.stat_result) -> tuple[int, ...]:
@@ -140,26 +199,65 @@ def _check_target(parent: int, name: str) -> None:
     raise _Refused(reason)
 
 
-def _policy(parent: str, name: str, kind: str) -> tuple[str, str]:
+def _policy(
+    parent: str, name: str, kind: str, exclusions: tuple[str, ...] = (),
+) -> tuple[str, str]:
+    """One verdict per member: the only place a classification is decided."""
     if parent == ".":
-        return _ROOT_POLICY.get(name, ("blocked", kind))
+        if name in _ROOT_POLICY:
+            return _ROOT_POLICY[name]
+        if name in exclusions:
+            # The declared kind is whatever is there: an operator declaration
+            # covers a member, it does not launder a symlink or special file,
+            # both of which are refused before this verdict is consulted.
+            return "operator_excluded", kind
+        return "blocked", kind
     if parent == "data":
         return _DATA_POLICY.get(name, ("blocked", kind))
-    if kind == "directory":
+    if parent == "knowledge":
+        # Suffix before shape, so a *directory* named like a memory document
+        # stays a wrong-type refusal instead of passing as a namespace.
+        if name.endswith(".md"):
+            return "selected", "file"
+        if name.endswith(".lock"):
+            return "excluded", "file"
+        if kind == "directory":
+            # A namespace subdirectory is not copied by this adapter. It is
+            # accepted only once it has been *proved* empty, so a namespace
+            # holding memory stays a coverage blocker instead of a silent drop.
+            return "namespace", "directory"
         return "blocked", kind
-    if name.endswith(".lock"):
-        return "excluded", "file"
-    if name.endswith(".md"):
-        return "selected", "file"
     return "blocked", kind
 
 
-def _scan_source(root: int) -> _Scan:
+def _namespace_is_empty(parent: int, name: str, expected) -> bool:
+    """List one knowledge namespace's member names; never open a member.
+
+    Emptiness cannot be read out of metadata: a directory's link count only
+    counts subdirectories, so a namespace holding nothing but Markdown would
+    look identical to an empty one. Listing names is therefore the smallest
+    check that can prove the claim, and it still reads no payload.
+    """
+    with ExitStack() as stack:
+        descriptor = os.open(name, _read_flags(directory=True), dir_fd=parent)
+        stack.callback(os.close, descriptor)
+        if _signature(os.fstat(descriptor)) != expected:
+            raise _Refused("source_drift", name)
+        with os.scandir(descriptor) as entries:
+            empty = next(iter(entries), None) is None
+        if _signature(os.fstat(descriptor)) != expected:
+            raise _Refused("source_drift", name)
+    return empty
+
+
+def _scan_source(root: int, exclusions: tuple[str, ...] = ()) -> _Scan:
     inventory = []
     states = {}
     selected = []
     findings = []
     warnings = []
+    empty_namespaces = []
+    observed_exclusions = []
     with ExitStack() as stack:
         pending = [(".", root)]
         directories = []
@@ -184,20 +282,25 @@ def _scan_source(root: int) -> _Scan:
                     kind = "file"
                 else:
                     kind = "special"
-                classification, expected = _policy(relative, name, kind)
+                classification, expected = _policy(relative, name, kind, exclusions)
                 reason = None
                 if kind == "symlink":
                     reason = "source_symlink"
                 elif kind == "special":
                     reason = "source_special_file"
                 elif classification == "blocked":
-                    reason = (
-                        "knowledge_directory_uncovered"
-                        if relative == "knowledge" and kind == "directory"
-                        else "source_unknown_member"
-                    )
+                    reason = "source_unknown_member"
                 elif kind != expected:
                     reason = "source_wrong_type"
+                elif classification == "namespace":
+                    if _namespace_is_empty(descriptor, name, states[record]):
+                        classification = "empty_namespace"
+                        empty_namespaces.append(record)
+                        warnings.append("empty_knowledge_namespace")
+                    else:
+                        reason = "knowledge_directory_uncovered"
+                elif classification == "operator_excluded":
+                    observed_exclusions.append(name)
                 elif classification == "sidecar":
                     suffix = name.rsplit("-", 1)[1]
                     if suffix in {"wal", "journal"} and metadata.st_size:
@@ -238,9 +341,16 @@ def _scan_source(root: int) -> _Scan:
         warnings.append("l0_absent")
     if "data/memory_changelog.jsonl" not in selected:
         warnings.append("changelog_absent")
+    for declared in exclusions:
+        if declared not in observed_exclusions:
+            # A declaration that matches nothing is refused rather than kept
+            # "just in case": otherwise one stale run's list would silently
+            # pre-authorise a member nobody has classified yet.
+            findings.append(f"operator_exclusion_absent:{declared}")
     return _Scan(
         sorted(inventory, key=lambda item: item["path"]), states,
         sorted(selected), sorted(findings), sorted(warnings),
+        sorted(empty_namespaces), sorted(observed_exclusions),
     )
 
 
@@ -275,10 +385,13 @@ def _digest_file(root: int, relative: str, expected=None, sink: int | None = Non
     return size, digest.hexdigest()
 
 
-def _observe_source(root: int, report: dict[str, Any]):
-    scan = _scan_source(root)
+def _observe_source(
+    root: int, report: dict[str, Any], exclusions: tuple[str, ...] = (),
+):
+    scan = _scan_source(root, exclusions)
     report["inventory"] = scan.inventory
     report["warnings"] = sorted({*report["warnings"], *scan.warnings})
+    report["empty_namespaces"] = scan.empty_namespaces
     if scan.findings:
         report["findings"].extend(scan.findings)
         raise _Refused("source_coverage_blocked")
@@ -294,19 +407,26 @@ def _observe_source(root: int, report: dict[str, Any]):
             "st_mtime_ns": scan.states[relative][4],
             "sha256": digest,
         })
-    after = _scan_source(root)
+    after = _scan_source(root, exclusions)
     if after.states != scan.states:
         raise _Refused("source_drift")
     manifest = {
         "manifest_version": 1,
         "consistency": "observed_stable",
         "production_consistency_proven": False,
+        # Coverage evidence travels with the bundle: an accepted snapshot
+        # records which namespaces were proved empty and which root members the
+        # operator declared, so neither reads later as an unexplained absence.
+        "empty_namespaces": scan.empty_namespaces,
+        "operator_exclusions": list(exclusions),
         "files": records,
     }
     return manifest, scan.states
 
 
-def _report(source, destination, dry_run: bool) -> dict[str, Any]:
+def _report(
+    source, destination, dry_run: bool, exclusions: Sequence[str] = (),
+) -> dict[str, Any]:
     return {
         "report_version": REPORT_VERSION,
         "status": "refused", "dry_run": dry_run,
@@ -315,6 +435,7 @@ def _report(source, destination, dry_run: bool) -> dict[str, Any]:
         "consistency": "not_checked", "production_consistency_proven": False,
         "manifest": None, "inventory": [], "findings": [],
         "warnings": ["observational_only", "production_readiness_not_assessed"],
+        "empty_namespaces": [], "operator_exclusions": list(exclusions),
         "staging": None, "exit_code": 2,
     }
 
@@ -444,10 +565,14 @@ def _rename_noreplace(parent: int, staging_name: str, target_name: str) -> None:
         raise _Refused("publication_failed")
 
 
-def _snapshot(*, source, destination, dry_run: bool) -> dict[str, Any]:
-    report = _report(source, destination, dry_run)
+def _snapshot(
+    *, source, destination, dry_run: bool, exclude: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    report = _report(source, destination, dry_run, exclude or ())
     phase = "inspection"
     try:
+        exclusions = _validate_exclusions(exclude)
+        report["operator_exclusions"] = list(exclusions)
         source_path = _absolute(source)
         destination_path = _absolute(destination)
         report.update(
@@ -465,7 +590,7 @@ def _snapshot(*, source, destination, dry_run: bool) -> dict[str, Any]:
                 destination_path.parent, stack, "destination_parent"
             )
             _check_target(parent, destination_path.name)
-            manifest, states = _observe_source(root, report)
+            manifest, states = _observe_source(root, report, exclusions)
             source_directories = {
                 (metadata[1], metadata[2]) for metadata in states.values()
                 if stat.S_ISDIR(metadata[0])
@@ -512,11 +637,11 @@ def _snapshot(*, source, destination, dry_run: bool) -> dict[str, Any]:
                 os.fsync(descriptor)
             phase = "verification"
             _verify_bundle(staging, manifest)
-            final_manifest, final_states = _observe_source(root, report)
+            final_manifest, final_states = _observe_source(root, report, exclusions)
             if (final_manifest, final_states) != (manifest, states):
                 raise _Refused("source_drift")
             _verify_bundle(staging, manifest)
-            if _scan_source(root).states != states:
+            if _scan_source(root, exclusions).states != states:
                 raise _Refused("source_drift")
             _check_ancestors(source_chain + destination_chain)
             _check_target(parent, destination_path.name)
@@ -546,14 +671,22 @@ def _snapshot(*, source, destination, dry_run: bool) -> dict[str, Any]:
 
 def plan_snapshot(
     *, source: str | os.PathLike[str], destination: str | os.PathLike[str],
+    exclude: Sequence[str] | None = None,
 ) -> dict[str, Any]:
-    """Read-only preview; the destination parent must already exist."""
-    return _snapshot(source=source, destination=destination, dry_run=True)
+    """Read-only preview; the destination parent must already exist.
+
+    ``exclude`` names root members this project does not own, one literal
+    member per entry. Every name must be present in the source; nothing is
+    ignored implicitly and no subtree of an excluded member is ever read.
+    """
+    return _snapshot(
+        source=source, destination=destination, dry_run=True, exclude=exclude,
+    )
 
 
 def apply_snapshot(
     *, source: str | os.PathLike[str], destination: str | os.PathLike[str],
-    dry_run: bool = False,
+    dry_run: bool = False, exclude: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Explicitly publish a new private bundle, retaining staging on failures.
 
@@ -563,7 +696,9 @@ def apply_snapshot(
     never recursively delete anything; retained staging is not an accepted
     snapshot, even if it contains a manifest.
     """
-    return _snapshot(source=source, destination=destination, dry_run=dry_run)
+    return _snapshot(
+        source=source, destination=destination, dry_run=dry_run, exclude=exclude,
+    )
 
 
 class _ArgumentParser(argparse.ArgumentParser):
@@ -577,11 +712,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--source", required=True)
     parser.add_argument("--destination", required=True)
     parser.add_argument("--apply", action="store_true")
+    parser.add_argument(
+        "--exclude", action="append", default=[], metavar="ROOT_MEMBER",
+        help=(
+            "one literal root member this project does not own; repeatable. "
+            "A name that is reserved, patterned or absent is refused."
+        ),
+    )
     try:
         arguments = parser.parse_args(argv)
         report = _snapshot(
             source=arguments.source, destination=arguments.destination,
-            dry_run=not arguments.apply,
+            dry_run=not arguments.apply, exclude=arguments.exclude,
         )
     except _Refused as exc:
         report = _report("", "", True)

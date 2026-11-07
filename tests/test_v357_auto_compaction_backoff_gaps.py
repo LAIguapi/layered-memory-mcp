@@ -69,6 +69,13 @@ from layered_memory_mcp.storage.auto_compaction_state import (
     target_key,
 )
 
+#: Same reason as ``test_v356_auto_compaction_backoff.py``: the cadence markers
+#: and the classifier shortcut only exist on the legacy maintenance path, which
+#: the ``graph`` rollout default suspends and reports rather than running. These
+#: tests pin what explicit ``legacy`` rollback preserves; the suspension itself
+#: is covered by ``test_v361_graph_maintenance_bypass.py``.
+pytestmark = pytest.mark.usefixtures("legacy_graph_mode")
+
 SEPARATOR = "§"
 
 POINTER = "[L0] infra: proxy notes → knowledge/infra.md"

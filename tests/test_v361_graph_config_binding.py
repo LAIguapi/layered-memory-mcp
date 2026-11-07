@@ -107,7 +107,7 @@ def test_unbound_direct_paths_and_legacy_vector_layout(tmp_path, monkeypatch, mo
     assert config.graph_db_path == graph
     assert config.graph_journal_path == journal
     assert not graph.parent.exists()
-    assert DEFAULT_GRAPH_MODE == "legacy"
+    assert DEFAULT_GRAPH_MODE == "graph"
 
 
 @pytest.mark.parametrize("case", [
@@ -218,10 +218,35 @@ def test_malformed_yaml_pointer_is_not_ignored(activated, monkeypatch, value):
     assert tree_state(home.parent) == before
 
 
-def test_pointer_does_not_switch_the_rollout_default(activated, monkeypatch):
-    home, _, _, _ = activated
+def test_the_rollout_default_is_authoritative_and_binds_an_explicit_pointer(
+    activated, monkeypatch,
+):
+    """The forward counterpart of the old 'a pointer cannot flip the default'.
+
+    That test existed because the default was ``legacy`` and a pointer alone
+    must not have promoted the mode. The default is now ``graph``, so the
+    contract to protect is the other direction: the default *is* authoritative,
+    so an explicit pointer binds without any mode being named anywhere — and a
+    pointer still does not conjure a generation when none is pointed at.
+    """
+    home, _, generation, pointer = activated
     monkeypatch.delenv("LAYERED_MEMORY_GRAPH_MODE")
+    config = config_for(home)
+    assert config.graph_mode == DEFAULT_GRAPH_MODE == "graph"
+    assert_bound(config, home, generation, pointer)
+    monkeypatch.delenv("LAYERED_MEMORY_GRAPH_ACTIVE_POINTER")
+    unbound = config_for(home)
+    assert unbound.graph_mode == "graph"
+    assert unbound.graph_active_pointer is None
+    assert unbound.vector_db_path == home / "data" / "vectors.db"
+    assert unbound.graph_db_path is None
+
+
+def test_an_explicit_legacy_rollback_still_refuses_a_pointer(activated, monkeypatch):
+    """The rejection the default change must not quietly retire."""
+    home, _, _, _ = activated
+    monkeypatch.setenv("LAYERED_MEMORY_GRAPH_MODE", "legacy")
+    before = tree_state(home.parent)
     with pytest.raises(ValueError, match="graph_active_pointer"):
         config_for(home)
-    monkeypatch.delenv("LAYERED_MEMORY_GRAPH_ACTIVE_POINTER")
-    assert config_for(home).graph_mode == DEFAULT_GRAPH_MODE == "legacy"
+    assert tree_state(home.parent) == before

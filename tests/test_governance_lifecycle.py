@@ -314,6 +314,9 @@ class TestSafeApply:
         )
         assert res["applied"][0]["report"]["sections"] == 2 and calls == [1]
 
+    # The approve/reject review lifecycle has no journal-backed semantics, so
+    # the graph default refuses it; this round trip is the legacy contract.
+    @pytest.mark.usefixtures("legacy_graph_mode")
     @pytest.mark.asyncio
     async def test_mcp_tools_round_trip(self, tmp_path, monkeypatch):
         import layered_memory_mcp.server as srv

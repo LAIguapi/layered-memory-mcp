@@ -83,12 +83,15 @@ record the caller did not supply.
 from __future__ import annotations
 
 import hashlib
+import json
 from datetime import timedelta
 from typing import Any, Iterable, Mapping, Sequence
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import ConfigDict, Field, field_validator, model_validator
+from pydantic.dataclasses import dataclass as validated_dataclass
 
 from .graph_models import (
+    NODE_LIFECYCLE_TRANSITIONS,
     PROVENANCE_REQUIRED_RELATIONS,
     Derivation,
     GraphEdge,
@@ -168,6 +171,34 @@ _ID_DIGEST_LENGTH = 16
 ROLE_NODE = "node"
 ROLE_EDGE = "edge"
 ROLE_SUPERSEDE = "supersede"
+
+#: The role a target-only lifecycle event plays. A fourth role rather than a
+#: reuse of ``ROLE_SUPERSEDE``: a retraction and a supersession of the same
+#: target are different decisions and must not hash to the same event identity.
+ROLE_LIFECYCLE = "lifecycle"
+
+#: Default identity namespace for a target-only lifecycle decision.
+SEMANTIC_LIFECYCLE_EVENT_NAMESPACE = "semantic_lifecycle"
+
+# Review entrances own their request identity and generate the decision time;
+# retries must therefore reuse the first committed event's timestamp.
+REVIEW_EVENT_NAMESPACE = "review"
+
+#: The actions a *target-only* request may ask for, and the event kind each one
+#: commits as. Read from the §8.2 vocabulary, and deliberately a subset of it:
+#:
+#: * ``supersede`` is absent because a supersession without the replacement it
+#:   declares would retire a memory with nothing taking its place. An update
+#:   stays an explicit new version plus ``SUPERSEDES``
+#:   (:class:`SemanticWriteRequest`);
+#: * ``inject``/``revise``/``migrate`` are absent because they carry a payload,
+#:   and a request with no node has none to carry.
+LIFECYCLE_ACTIONS: dict[str, MemoryEventKind] = {
+    "retract": MemoryEventKind.RETRACT,
+    "restore": MemoryEventKind.RESTORE,
+    "approve": MemoryEventKind.APPROVE,
+    "reject": MemoryEventKind.RETRACT,
+}
 
 
 class SemanticWriteError(RuntimeError):
@@ -380,6 +411,222 @@ class SemanticWriteRequest(GraphModel):
     def target_ids(self) -> list[str]:
         """Every explicitly named target, sorted and deduplicated."""
         return sorted({assertion.target_id for assertion in self.declared})
+
+
+# ---------------------------------------------------------------------------
+# The target-only lifecycle decision
+# ---------------------------------------------------------------------------
+
+@validated_dataclass(config=ConfigDict(extra="forbid"))
+class SemanticLifecycleRequest:
+    """One explicit lifecycle decision about a memory that already exists.
+
+    The request that does **not** carry a node, and the whole point of it. A
+    retraction used to be expressible only as a :class:`SemanticWriteRequest`
+    superseding the target — which means inventing a replacement node, with
+    content nobody decided, to say "this is no longer true". That is not a
+    retract contract: it writes a fact in order to delete one.
+
+    So this request names a target, an action, when the decision was made and
+    the key it retries under, and nothing else. There is no ``node`` field, by
+    design and by test.
+
+    Fields:
+
+    * ``target_id`` — the existing node this decision applies to. Required, and
+      never discovered: the caller names it.
+    * ``action`` — one of :data:`LIFECYCLE_ACTIONS` (``retract``, ``restore``,
+      ``approve``, ``reject``). ``supersede`` is deliberately not available here.
+    * ``occurred_at`` — when the decision was made; the event's ledger position.
+    * ``request_key`` — the stable retry identity the event ID is hashed from.
+      Defaults to the target ID, which is stable for one decision about one
+      memory; pass an explicit key when one target takes two distinguishable
+      decisions.
+    * ``event_namespace`` — identity namespace for the same hash.
+    * ``scope`` — the scope stamped on the generated event. ``None`` means "the
+      target's own", which the committing layer then *checks* rather than
+      assumes: a decision made under the wrong scope is refused, not widened.
+    * ``reviewer`` / ``note`` — review-decision payload carried in the
+      authoritative lifecycle event for ``approve`` and ``reject``.
+
+    A plain validated dataclass rather than a :class:`GraphModel`: it is a
+    request, not a persisted payload, and the transport shape is its own
+    :meth:`to_dict`.
+    """
+
+    target_id: str
+    action: str
+    occurred_at: Timestamp
+    request_key: str = ""
+    event_namespace: str = SEMANTIC_LIFECYCLE_EVENT_NAMESPACE
+    scope: GraphScope | None = None
+    reviewer: str = "human"
+    note: str = ""
+
+    def __post_init__(self) -> None:
+        self.target_id = clean_identifier(self.target_id, "target_id")
+        self.event_namespace = clean_identifier(
+            self.event_namespace, "event_namespace"
+        )
+        self.reviewer = clean_text_line(self.reviewer, "reviewer")
+        self.note = clean_text_line(self.note, "note")
+        action = clean_identifier(self.action, "action")
+        if action not in LIFECYCLE_ACTIONS:
+            raise ValueError(
+                f"unknown lifecycle action {action!r}; expected one of "
+                f"{sorted(LIFECYCLE_ACTIONS)}. A replacement is an explicit new "
+                "version with a SUPERSEDES decision, not a lifecycle action."
+            )
+        self.action = action
+        self.request_key = (
+            clean_identifier(self.request_key, "request_key")
+            if self.request_key.strip()
+            else self.target_id
+        )
+
+    @property
+    def event_kind(self) -> MemoryEventKind:
+        """The append-only event kind this action commits as."""
+        return LIFECYCLE_ACTIONS[self.action]
+
+    def to_dict(self) -> dict[str, Any]:
+        """The transport shape: plain JSON types, every field present."""
+        return {
+            "target_id": self.target_id,
+            "action": self.action,
+            "occurred_at": self.occurred_at.isoformat(),
+            "request_key": self.request_key,
+            "event_namespace": self.event_namespace,
+            "scope": None if self.scope is None else self.scope.to_dict(),
+            "reviewer": self.reviewer,
+            "note": self.note,
+        }
+
+    def to_json(self) -> str:
+        """Sorted keys, like :meth:`GraphModel.to_json`, for the same reason:
+        two equal requests serialize byte-identically."""
+        return json.dumps(self.to_dict(), sort_keys=True, ensure_ascii=False)
+
+
+class SemanticLifecyclePlan(GraphModel):
+    """The single event one lifecycle decision projects to.
+
+    One event, always: a lifecycle transition is one effect, unlike a
+    supersession, which is two (§8.2). ``from_status``/``to_status`` are the
+    §8.2 answer for the target this plan was validated against, so a caller can
+    report what it changed without re-deriving it.
+    """
+
+    request_key: str
+    target_id: str
+    action: str
+    event_id: str
+    occurred_at: Timestamp
+    from_status: str = ""
+    to_status: str = ""
+    events: list[MemoryEvent] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+    @property
+    def event_ids(self) -> list[str]:
+        return [event.id for event in self.events]
+
+
+def plan_semantic_lifecycle(
+    request: SemanticLifecycleRequest,
+    *,
+    existing_nodes: Mapping[str, GraphNode] | Iterable[GraphNode] | None = None,
+) -> SemanticLifecyclePlan:
+    """Turn one target-only lifecycle decision into its single event.
+
+    Fail-closed, and in three ways the write planner only warns about — because
+    there is no payload here to make the decision meaningful on its own. A
+    lifecycle request whose target does not exist, whose scope disagrees with
+    the target's, or whose transition the target's current status cannot take,
+    is a :class:`ValueError`:
+
+    * **unknown target** — the event would project an ``unknown_target`` error
+      and leave the graph permanently unhealthy;
+    * **wrong scope** — a decision made in one scope must not retire a memory
+      belonging to another;
+    * **invalid transition** — the projection would report
+      ``ignored_transition`` and change nothing, i.e. an accepted request that
+      did nothing. Checked against
+      :data:`~layered_memory_mcp.graph_models.NODE_LIFECYCLE_TRANSITIONS`, the
+      same table the projection applies, so the planner cannot accept a
+      transition the projection would then ignore.
+
+    ``existing_nodes`` of ``None`` means "no material supplied": the shape is
+    still validated and the absence is *reported* as
+    ``target_existence_unchecked:1`` rather than treated as verified.
+    """
+    nodes = _normalize_nodes(existing_nodes)
+    kind = request.event_kind
+    warnings: set[str] = set()
+    from_status = ""
+    to_status, applies_from = NODE_LIFECYCLE_TRANSITIONS[kind]
+
+    if nodes is None:
+        warnings.add("target_existence_unchecked:1")
+        scope = request.scope
+    else:
+        target = nodes.get(request.target_id)
+        if target is None:
+            raise ValueError(
+                f"lifecycle target {request.target_id!r} is not present in the "
+                "supplied node material"
+            )
+        if (
+            request.scope is not None
+            and target.scope.to_json() != request.scope.to_json()
+        ):
+            raise ValueError(
+                f"lifecycle target {request.target_id!r} belongs to another "
+                "scope than the decision declares"
+            )
+        if target.status not in applies_from:
+            raise ValueError(
+                f"a {request.action} does not apply to {request.target_id!r} "
+                f"from status {target.status.value}"
+            )
+        from_status = target.status.value
+        scope = request.scope if request.scope is not None else target.scope
+
+    event_id = _semantic_event_id(
+        request.event_namespace, request.request_key, ROLE_LIFECYCLE, request.target_id
+    )
+    return SemanticLifecyclePlan(
+        request_key=request.request_key,
+        target_id=request.target_id,
+        action=request.action,
+        event_id=event_id,
+        occurred_at=request.occurred_at,
+        from_status=from_status,
+        to_status=to_status.value,
+        events=[
+            MemoryEvent(
+                id=event_id,
+                kind=kind,
+                occurred_at=request.occurred_at,
+                scope=scope,
+                target_id=request.target_id,
+                metadata={
+                    "request_key": request.request_key,
+                    "role": ROLE_LIFECYCLE,
+                    "action": request.action,
+                    **(
+                        {
+                            "reviewer": request.reviewer,
+                            "note": request.note,
+                        }
+                        if request.action in {"approve", "reject"}
+                        else {}
+                    ),
+                },
+            )
+        ],
+        warnings=sorted(warnings),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -880,9 +1127,13 @@ def _material_from_events(
 __all__ = [
     "CONTRADICTION_KINDS",
     "DECISION_RELATIONS",
+    "LIFECYCLE_ACTIONS",
+    "REVIEW_EVENT_NAMESPACE",
     "ROLE_EDGE",
+    "ROLE_LIFECYCLE",
     "ROLE_NODE",
     "ROLE_SUPERSEDE",
+    "SEMANTIC_LIFECYCLE_EVENT_NAMESPACE",
     "SEMANTIC_WRITE_EVENT_NAMESPACE",
     "SEMANTIC_WRITE_EVENT_PREFIX",
     "SEMANTIC_WRITE_OPERATIONS",
@@ -890,10 +1141,13 @@ __all__ = [
     "SUPERSESSION_SOURCE_KINDS",
     "RelationAssertion",
     "RelationDecision",
+    "SemanticLifecyclePlan",
+    "SemanticLifecycleRequest",
     "SemanticWriteError",
     "SemanticWritePlan",
     "SemanticWriteProjection",
     "SemanticWriteRequest",
+    "plan_semantic_lifecycle",
     "plan_semantic_write",
     "project_semantic_write",
 ]

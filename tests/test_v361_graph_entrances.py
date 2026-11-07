@@ -344,8 +344,6 @@ REFUSED_CALLS = {
     "create_knowledge_file": lambda: server.create_knowledge_file("notes.md", "# Notes\n"),
     "update_knowledge_file": lambda: server.update_knowledge_file("notes.md", "# Notes\n"),
     "delete_knowledge_file": lambda: server.delete_knowledge_file("notes.md"),
-    "approve_knowledge": lambda: server.approve_knowledge("entry-1"),
-    "reject_knowledge": lambda: server.reject_knowledge("entry-1"),
     "reindex_vector_store_tool": lambda: server.reindex_vector_store_tool(),
     "sync_l0_index_tool": lambda: server.sync_l0_index_tool(dry_run=False),
     "manage_l0_entry_tool": lambda: server.manage_l0_entry_tool(
@@ -358,12 +356,62 @@ REFUSED_CALLS = {
     "apply_agent_action": lambda: server.apply_agent_action(
         surface="skill", source_content="x", operation="create"
     ),
-    "add_todo": lambda: server.add_todo(domain=DOMAIN, content="do something"),
-    "update_todo": lambda: server.update_todo(todo_id="t-1", status="done"),
-    "delete_todo": lambda: server.delete_todo(todo_id="t-1"),
     "init_framework": lambda: server.init_framework(),
     "integrate_agent": lambda: server.integrate_agent(action="inject_memory"),
 }
+
+REVIEW_CALLS = {
+    "approve_knowledge": lambda: server.approve_knowledge("entry-1"),
+    "reject_knowledge": lambda: server.reject_knowledge("entry-1"),
+}
+
+
+@pytest.mark.parametrize("operation", sorted(REVIEW_CALLS))
+def test_the_review_entrances_route_through_the_authority_instead_of_refusing(
+    graph_config, operation
+):
+    response = _call(REVIEW_CALLS[operation]())
+
+    assert response["success"] is False, response
+    assert response["error"] == "graph_write_rejected_invalid_replay", response
+    assert response["error"] != GRAPH_MUTATION_REFUSED, operation
+    assert response["action"] == operation.removesuffix("_knowledge"), response
+    assert response["graph"]["committed"] is False, response
+
+#: The task entrances used to be in ``REFUSED_CALLS`` above. They are not any
+#: more, and the replacement is **not** a deletion of coverage: they route
+#: through the authority now (``test_the_task_entrances_route_through_the_
+#: authority_instead_of_refusing`` below is the positive control, and
+#: ``test_v361_core_closure.py`` owns the full add→list→complete→reopen→delete
+#: contract, the negative controls and the migration). What is asserted here is
+#: the one thing this file is about: they no longer answer with a guard refusal,
+#: and they still mutate nothing in the knowledge files.
+TASK_CALLS = {
+    "add_todo": lambda: server.add_todo(domain=DOMAIN, content="do something"),
+    "update_todo": lambda: server.update_todo(todo_id="t-1", status="completed"),
+    "delete_todo": lambda: server.delete_todo(todo_id="t-1"),
+}
+
+
+@pytest.mark.parametrize("operation", sorted(TASK_CALLS))
+def test_the_task_entrances_route_through_the_authority_instead_of_refusing(
+    graph_config, operation
+):
+    before = _knowledge_files(graph_config)
+
+    response = _call(TASK_CALLS[operation]())
+
+    assert response.get("error") != GRAPH_MUTATION_REFUSED, operation
+    # `add_todo` commits; the other two name a task that does not exist, which
+    # is a *task* refusal rather than a capability refusal — and either way the
+    # knowledge files are not what a task decision touches.
+    if operation == "add_todo":
+        assert response["success"] is True, response
+        assert response["task_id"] == response["id"]
+    else:
+        assert response["success"] is False, response
+        assert response["error"] == "graph_task_unknown", response
+    assert _knowledge_files(graph_config) == before
 
 
 @pytest.mark.parametrize("operation", sorted(REFUSED_CALLS))
@@ -486,8 +534,21 @@ READ_ONLY_TOOLS = frozenset({
     "validate_knowledge",
 })
 
-#: The two entrances that route a mutation through the semantic authority.
-AUTHORITY_TOOLS = frozenset({"inject_knowledge_tool", "batch_inject_knowledge_tool"})
+#: The entrances that route a mutation through the semantic authority.
+#:
+#: The task entrances and ``apply_semantic_lifecycle`` joined this set in the
+#: core-closure batch. They were previously guarded names; a capability that
+#: gets implemented moves *here*, which is the only honest place for it.
+AUTHORITY_TOOLS = frozenset({
+    "inject_knowledge_tool",
+    "batch_inject_knowledge_tool",
+    "apply_semantic_lifecycle",
+    "add_todo",
+    "update_todo",
+    "delete_todo",
+    "approve_knowledge",
+    "reject_knowledge",
+})
 
 
 def _mcp_tool_names() -> set[str]:

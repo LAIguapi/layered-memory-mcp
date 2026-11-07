@@ -293,11 +293,13 @@ __all__ = [
     "STATUS_RUNTIME_INVALID",
     "STATUS_RUNTIME_ROLLBACK",
     "TOOL_NAME",
+    "SERVING_STATUSES",
     "ActivePointer",
     "GenerationResolution",
     "GenerationRuntime",
     "GenerationRuntimeConfig",
     "activate_generation",
+    "generation_is_served",
     "add_cutover_verbs",
     "cutover_command",
     "exit_code",
@@ -1463,6 +1465,33 @@ def status_generation(
         findings=report.findings,
         warnings=report.warnings,
     )
+
+
+#: Pointer states in which a generation is actually being served.
+SERVING_STATUSES = frozenset({STATUS_RUNTIME_ACTIVE, STATUS_RUNTIME_ROLLBACK})
+
+
+def generation_is_served(*, pointer: Any, generation: Any) -> tuple[bool, dict[str, Any]]:
+    """Is ``generation`` the one this pointer currently serves? Reads only.
+
+    One seam, so every operator asks the question the same way. It exists
+    because the answer decides *which proof applies*: a never-served generation
+    is proved as a publication — manifest, membership, hashes — while a served
+    one is writable, so those same hashes stop being a health test the moment a
+    semantic write is accepted. Running the publication proof against a served
+    generation would report a healthy, correctly-written store as corrupt.
+
+    Returns the verdict and the read-only status report behind it, so a caller
+    can report attested runtime health rather than re-deriving it.
+    """
+    report = status_generation(pointer=pointer)
+    if report.get("status") not in SERVING_STATUSES:
+        return False, report
+    resolved = report.get("generation")
+    if not resolved:
+        return False, report
+    target = os.path.abspath(os.path.expanduser(os.fspath(generation)))
+    return os.path.abspath(str(resolved)) == target, report
 
 
 # ---------------------------------------------------------------------------

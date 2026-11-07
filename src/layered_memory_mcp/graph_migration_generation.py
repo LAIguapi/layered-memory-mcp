@@ -116,6 +116,7 @@ from .graph_journal import (
     PROJECTION_L0,
     PROJECTION_L1,
     PROJECTION_NAMES,
+    PROJECTION_TODO,
     PROJECTION_VECTOR,
     REQUEST_KIND_BOOTSTRAP,
     MemoryEventJournal,
@@ -170,6 +171,10 @@ __all__ = [
     "VerificationReport",
     "admission_findings",
     "admitted_digests",
+    "GENERATION_TYPES",
+    "GENERATION_TYPE_FRESH",
+    "GENERATION_TYPE_MIGRATION",
+    "build_fresh_generation",
     "build_generation",
     "control_lock",
     "lock_path_findings",
@@ -238,6 +243,18 @@ DESTINATION_ENTRIES = frozenset({GENERATION_DIR, ROLLBACK_DIR, DEBRIS_DIR, SERVE
 #: The manifest layout version. Recorded and checked; never migrated.
 MANIFEST_VERSION = 1
 
+#: What a generation *is*, and therefore which proofs apply to it.
+#:
+#: A migration generation derives from a source, so it must carry frozen source
+#: bytes, bootstrap events and an identity bridge, and verification demands all
+#: three. A fresh generation derives from nothing: zero events, a zero head and
+#: zero checkpoints are its complete and valid authority. These are two
+#: contracts rather than one relaxed contract, because "no events" must never
+#: become an accepted answer for a migration that failed to produce any.
+GENERATION_TYPE_MIGRATION = "migration"
+GENERATION_TYPE_FRESH = "fresh"
+GENERATION_TYPES = (GENERATION_TYPE_MIGRATION, GENERATION_TYPE_FRESH)
+
 #: Files the manifest never describes, because they describe the manifest.
 _MANIFEST_FILES = frozenset({MANIFEST_NAME, MANIFEST_DIGEST_NAME})
 
@@ -261,6 +278,9 @@ FINDING_MANIFEST_UNREADABLE = "manifest_unreadable"
 FINDING_MANIFEST_DIGEST_ABSENT = "manifest_digest_absent"
 FINDING_MANIFEST_DIGEST_MISMATCH = "manifest_digest_mismatch"
 FINDING_MANIFEST_VERSION = "manifest_version_unsupported"
+FINDING_GENERATION_TYPE = "manifest_generation_type_unsupported"
+FINDING_FRESH_NOT_EMPTY = "fresh_generation_not_empty"
+FINDING_MIGRATION_EMPTY = "migration_generation_has_no_authority"
 FINDING_MANIFEST_PATH_REJECTED = "manifest_path_rejected"
 FINDING_ARTIFACT_MISSING = "artifact_missing"
 FINDING_ARTIFACT_UNEXPECTED = "artifact_unexpected"
@@ -701,14 +721,29 @@ def lock_path_findings(path: Path) -> list[str]:
     the directory a lock lives in is validated by the operation that owns it and
     is never brought into existence by taking a lock.
     """
-    if path.is_symlink():
-        return [f"{FINDING_LOCK_PATH_REJECTED}:symlink"]
-    if path.exists() and not path.is_file():
-        return [f"{FINDING_LOCK_PATH_REJECTED}:not_a_file"]
+    # Use one lstat snapshot per path.  The file backend unlinks its inode
+    # while still holding the kernel lock; separate ``is_*`` calls can observe
+    # that deliberate handover as "exists, then not a file" and reject a valid
+    # waiter.  A missing lock file is a normal create/open case, while the
+    # subsequent O_NOFOLLOW/open + inode checks handle the actual race.
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        metadata = None
+    if metadata is not None:
+        if stat.S_ISLNK(metadata.st_mode):
+            return [f"{FINDING_LOCK_PATH_REJECTED}:symlink"]
+        if not stat.S_ISREG(metadata.st_mode):
+            return [f"{FINDING_LOCK_PATH_REJECTED}:not_a_file"]
+
     parent = path.parent
-    if parent.is_symlink():
+    try:
+        parent_metadata = parent.lstat()
+    except FileNotFoundError:
+        return [f"{FINDING_LOCK_PATH_REJECTED}:parent_absent"]
+    if stat.S_ISLNK(parent_metadata.st_mode):
         return [f"{FINDING_LOCK_PATH_REJECTED}:parent_symlink"]
-    if not parent.is_dir():
+    if not stat.S_ISDIR(parent_metadata.st_mode):
         return [f"{FINDING_LOCK_PATH_REJECTED}:parent_absent"]
     return []
 
@@ -1294,6 +1329,22 @@ def build_generation(
             return GenerationBuild(staging, {}, findings)
         counts["l0_entries"] = int(l0.get("entries", 0))
         journal.set_checkpoint(PROJECTION_L0, head)
+
+        # 7. The readable TODO view. This generation's journal carries no task
+        #    events: the migration source is the L1/vector/L0 material, and the
+        #    task store lives under the *service home* rather than inside a
+        #    generation. So the task projection has published everything this
+        #    stream asks of it — nothing — and its checkpoint says so.
+        #
+        #    That is a statement about the stream, NOT a claim that existing
+        #    tasks were migrated. They are not, here: seeding the task authority
+        #    from the service home's own store is the separate explicit step
+        #    ``graph_application.seed_task_authority``, and until it has run the
+        #    task entrances refuse rather than rebuild those rows away. The
+        #    manifest records the distinction so a reader cannot infer the other
+        #    reading from a complete-looking checkpoint row.
+        journal.set_checkpoint(PROJECTION_TODO, head)
+        counts["tasks_seeded"] = 0
         checkpoints = {
             name: journal.checkpoint(name).position for name in PROJECTION_NAMES
         }
@@ -1307,6 +1358,7 @@ def build_generation(
             "surfaces_registered": len(surfaces),
             "external_surfaces": len(bootstrap.report.external_surfaces),
             "rows_by_category": dict(snapshot.inventory.counts_by_category),
+            "task_authority": "seeded_separately",
         }
     )
 
@@ -1315,6 +1367,7 @@ def build_generation(
 
     manifest = {
         "manifest_version": MANIFEST_VERSION,
+        "generation_type": GENERATION_TYPE_MIGRATION,
         "tool": "layered_memory_mcp.graph_migration",
         "source": str(snapshot.source),
         "destination": str(destination),
@@ -1343,6 +1396,147 @@ def build_generation(
             "inferred_fields": list(bootstrap.report.inferred_fields),
             "unresolved_references": list(bootstrap.report.unresolved_references),
             "importer_skipped": bootstrap.report.importer_skipped,
+        },
+    }
+    if not findings:
+        write_manifest(staging, manifest)
+    return GenerationBuild(staging, manifest, findings)
+
+
+def build_fresh_generation(
+    staging: Path, *, destination: Path, prestate: str
+) -> GenerationBuild:
+    """Assemble one *empty* generation under ``staging``. Writes only there.
+
+    The same publishers, in the same dependency order, with nothing to carry:
+    an empty journal is created and left empty, the graph is published from
+    that empty stream, an empty vector database is created through the store's
+    own constructor, and L0 is rendered from an empty L1. Every checkpoint is
+    still advanced only after its projection succeeded; they simply all land on
+    position ``0``, which for a fresh authority is a *proved* zero rather than
+    an unperformed step.
+
+    No source is read, no event is manufactured and no history is attributed.
+    The manifest declares :data:`GENERATION_TYPE_FRESH`, which is what keeps
+    this generation's relaxed journal expectations from ever being applied to a
+    migration — see :func:`verify_generation`.
+    """
+    from .recall import invalidate_scan_cache
+    from .storage.vector_store import VectorStore
+
+    findings: list[str] = []
+    staging.mkdir(parents=True, exist_ok=False)
+    config = GenerationConfig(root=staging)
+    config.knowledge_dir.mkdir(parents=True, exist_ok=False)
+    (staging / DATA_DIR).mkdir(parents=True, exist_ok=False)
+    invalidate_scan_cache(str(config.knowledge_dir))
+
+    counts: dict[str, Any] = {}
+    with MemoryEventJournal(config.graph_journal_path) as journal:
+        events = journal.read_events()
+        head = journal.head_position()
+        if events or head:
+            findings.append(f"{FINDING_FRESH_NOT_EMPTY}:journal")
+            return GenerationBuild(staging, {}, findings)
+        journal_facts = {
+            "request_id": "",
+            "request_kind": None,
+            "request_hash": canonical_request_hash(events),
+            "events": 0,
+            "head_position": head,
+        }
+        try:
+            with _writable_graph_store(config.graph_db_path) as store:
+                publish_graph(store, events)
+                health = store.health()
+                counts["graph_nodes"] = health.node_count
+                counts["graph_edges"] = health.edge_count
+        except Exception as exc:  # noqa: BLE001 — named, never quoted (§15)
+            label = (
+                str(exc)[:120]
+                if isinstance(exc, ProjectionError)
+                else type(exc).__name__
+            )
+            findings.append(f"{FINDING_BUILD_FAILED}:graph:{label}")
+            return GenerationBuild(staging, {}, findings)
+        journal.set_checkpoint(PROJECTION_GRAPH, head)
+
+        # No surface is bound, because no document was supplied. An empty
+        # registry is the honest state; a fresh store adopts nothing.
+        journal.set_checkpoint(PROJECTION_L1, head)
+
+        try:
+            with VectorStore(staging / VECTOR_RELATIVE) as vectors:
+                counts["vector_rows"] = len(vectors.snapshot())
+                counts["vector_rows_changed"] = 0
+        except Exception as exc:  # noqa: BLE001 — named, never quoted (§15)
+            findings.append(f"{FINDING_BUILD_FAILED}:vector:{type(exc).__name__}")
+            return GenerationBuild(staging, {}, findings)
+        if counts["vector_rows"]:
+            findings.append(f"{FINDING_FRESH_NOT_EMPTY}:vector")
+            return GenerationBuild(staging, {}, findings)
+        journal.set_checkpoint(PROJECTION_VECTOR, head)
+
+        try:
+            l0 = publish_l0(config)
+        except Exception as exc:  # noqa: BLE001 — named, never quoted (§15)
+            findings.append(f"{FINDING_BUILD_FAILED}:l0:{type(exc).__name__}")
+            return GenerationBuild(staging, {}, findings)
+        counts["l0_entries"] = int(l0.get("entries", 0))
+        journal.set_checkpoint(PROJECTION_L0, head)
+        # A fresh generation has a zero head, so every checkpoint is already at
+        # it; this is set for the same reason the others are — the complete set
+        # of managed projections is declared, not the ones that happened to have
+        # work to do.
+        journal.set_checkpoint(PROJECTION_TODO, head)
+        checkpoints = {
+            name: journal.checkpoint(name).position for name in PROJECTION_NAMES
+        }
+
+    counts.update(
+        {
+            "l1_documents": 0,
+            "l1_entries": 0,
+            "changelog_events": 0,
+            "journal_events": 0,
+            "surfaces_registered": 0,
+            "external_surfaces": 0,
+            "rows_by_category": {},
+            "tasks_seeded": 0,
+            "task_authority": "empty",
+        }
+    )
+
+    artifacts, inventory_findings = generation_inventory(staging)
+    findings.extend(inventory_findings)
+
+    manifest = {
+        "manifest_version": MANIFEST_VERSION,
+        "generation_type": GENERATION_TYPE_FRESH,
+        "tool": "layered_memory_mcp.graph_bootstrap",
+        "source": None,
+        "destination": str(destination),
+        "destination_prestate": prestate,
+        "published_at": datetime.now(timezone.utc).isoformat(),
+        "source_fingerprint": None,
+        "source_files": {},
+        "artifacts": artifacts,
+        "counts": counts,
+        "checkpoints": checkpoints,
+        "journal": journal_facts,
+        "seeds": {},
+        "surfaces": {},
+        "external_surfaces": [],
+        "identity_map": {},
+        "automatic_identity_map": {},
+        "provenance": {
+            "identity_bridge": {"version": 1, "rows": []},
+            # Deliberately not a timestamp: a fresh store has no recorded
+            # history, and stamping one would invent the thing it lacks.
+            "recorded_at": None,
+            "inferred_fields": [],
+            "unresolved_references": [],
+            "importer_skipped": 0,
         },
     }
     if not findings:
@@ -1638,6 +1832,16 @@ def verify_generation(
         findings.append(f"{FINDING_MANIFEST_UNREADABLE}:artifacts")
         return VerificationReport(generation=str(generation), findings=findings)
 
+    # Which contract applies. A manifest written before generation types
+    # existed is read as a migration: the stricter of the two, so an older
+    # generation can never be re-read as a fresh store and lose its source,
+    # bootstrap and identity proofs.
+    generation_type = manifest.get("generation_type", GENERATION_TYPE_MIGRATION)
+    if generation_type not in GENERATION_TYPES:
+        findings.append(f"{FINDING_GENERATION_TYPE}:{generation_type}")
+        return VerificationReport(generation=str(generation), findings=findings)
+    fresh = generation_type == GENERATION_TYPE_FRESH
+
     # -- paths, membership and hashes ---------------------------------------
     safe: dict[str, Path] = {}
     for relative in sorted(declared, key=str):
@@ -1671,9 +1875,25 @@ def verify_generation(
             findings.append(f"{FINDING_ARTIFACT_SIZE}:{relative}")
             hashes_ok = False
 
-    source_files_ok, source_file_findings = _verify_source_files(
-        generation, manifest.get("source_files")
-    )
+    if fresh:
+        # A fresh generation has no source, so there is nothing to freeze and
+        # nothing to recompute. What *is* checked is that it claims nothing: a
+        # manifest asserting frozen source bytes while declaring itself fresh
+        # would be making a provenance claim no backup could support.
+        source_file_findings = []
+        if manifest.get("source_files"):
+            source_file_findings.append(f"{FINDING_FRESH_NOT_EMPTY}:source_files")
+        if manifest.get("source") is not None:
+            source_file_findings.append(f"{FINDING_FRESH_NOT_EMPTY}:source")
+        if manifest.get("source_fingerprint") is not None:
+            source_file_findings.append(f"{FINDING_FRESH_NOT_EMPTY}:source_fingerprint")
+        if (generation / BACKUP_DIR).exists():
+            source_file_findings.append(f"{FINDING_FRESH_NOT_EMPTY}:backup")
+        source_files_ok = not source_file_findings
+    else:
+        source_files_ok, source_file_findings = _verify_source_files(
+            generation, manifest.get("source_files")
+        )
     findings.extend(source_file_findings)
 
     # -- the journal --------------------------------------------------------
@@ -1695,7 +1915,27 @@ def verify_generation(
             request_id = str(declared_journal.get("request_id", ""))
             recorded_hash = journal.request_hash(request_id) if request_id else None
             journal_ok = True
-            if recorded_hash is None:
+            if fresh:
+                # Zero is the whole authority, and it has to be *zero*: an
+                # event, a moved head, an advanced checkpoint, a registered
+                # surface or a declared request would all mean this generation
+                # carries something it never accounted for.
+                if events or head or request_id:
+                    findings.append(f"{FINDING_FRESH_NOT_EMPTY}:journal")
+                    journal_ok = False
+                if surfaces:
+                    findings.append(f"{FINDING_FRESH_NOT_EMPTY}:surfaces")
+                    journal_ok = False
+                if any(position for position in checkpoints.values()):
+                    findings.append(f"{FINDING_FRESH_NOT_EMPTY}:checkpoints")
+                    journal_ok = False
+            elif not events or not head:
+                # The migration contract, stated rather than implied: a
+                # migration whose journal holds nothing has no authority to
+                # project from, however consistently its manifest says so.
+                findings.append(FINDING_MIGRATION_EMPTY)
+                journal_ok = False
+            if recorded_hash is None and not fresh:
                 findings.append(f"{FINDING_JOURNAL_REQUEST}:absent")
                 journal_ok = False
             if canonical_request_hash(events) != declared_journal.get("request_hash"):
@@ -1792,14 +2032,27 @@ def verify_generation(
         vector_ok = False
     try:
         published = _read_rows(generation / VECTOR_RELATIVE)
-        frozen = _read_rows(generation / BACKUP_DIR / SOURCE_VECTOR_DB)
+        frozen = (
+            [] if fresh else _read_rows(generation / BACKUP_DIR / SOURCE_VECTOR_DB)
+        )
     except (OSError, sqlite3.Error) as exc:
         findings.append(f"{FINDING_VECTOR_UNREADABLE}:{type(exc).__name__}")
         published, frozen = [], []
         vector_ok = False
 
     report_counts["vector_rows"] = len(published)
-    if source_files_ok and membership_ok and hashes_ok:
+    if fresh:
+        # No legacy row exists, so there is no correspondence to recompute.
+        # What is checked is emptiness: a declared seed or a published row
+        # would be memory this generation never accounted for.
+        for name, value in (("seeds", declared_seeds), ("vector_rows", published)):
+            if value:
+                findings.append(f"{FINDING_FRESH_NOT_EMPTY}:{name}")
+                vector_ok = False
+        if nodes or replayed["edges"]:
+            findings.append(f"{FINDING_FRESH_NOT_EMPTY}:graph")
+            vector_ok = False
+    elif source_files_ok and membership_ok and hashes_ok:
         identity_findings = _verify_identity_bridge(generation, manifest, published)
         findings.extend(identity_findings)
         if identity_findings:

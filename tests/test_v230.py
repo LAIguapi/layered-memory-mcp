@@ -110,6 +110,7 @@ class TestDualWriteCompletion:
 class TestInjectAutoMaintain:
     """inject_knowledge should auto-complete the dual-write end to end."""
 
+    @pytest.mark.usefixtures("legacy_graph_mode")
     def test_inject_writes_pointer_to_memory(self, tmp_path):
         memfile = tmp_path / "MEMORY.md"
         memfile.write_text("", encoding="utf-8")
@@ -162,6 +163,7 @@ class TestLazyCompaction:
         _write_last_compact_time(config)
         assert _read_last_compact_time(config) > 0.0
 
+    @pytest.mark.usefixtures("legacy_graph_mode")
     def test_compaction_triggers_on_elapsed_interval(self, tmp_path):
         memfile = tmp_path / "MEMORY.md"
         # One bloat entry (long, not an L0 pointer) → compactable

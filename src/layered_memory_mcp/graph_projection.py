@@ -45,6 +45,7 @@ file it belongs in.
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -52,12 +53,20 @@ from typing import Any, Iterable, Mapping, Sequence
 from pydantic import Field
 
 from .graph_entry_identity import markdown_section_entry_id
-from .graph_journal import MemoryEventJournal, SurfaceRecord, body_sha256
+from .graph_journal import (
+    SURFACE_INTENT_PUBLISH,
+    SURFACE_INTENT_RETIRE,
+    MemoryEventJournal,
+    SurfaceIntent,
+    SurfaceRecord,
+    body_sha256,
+)
 from .graph_models import GraphModel, GraphNode, MemoryEvent
 
 __all__ = [
     "PROJECTION_METADATA_KEY",
     "PROJECTION_SURFACE_KIND",
+    "PUBLISH_TEMP_SUFFIX",
     "SURFACE_DRIFT",
     "SURFACE_NOT_ADOPTED",
     "SURFACE_UNSUPPORTED",
@@ -72,8 +81,10 @@ __all__ = [
     "publish_graph",
     "publish_l0",
     "publish_l1",
+    "publish_todo",
     "publish_vector",
     "read_section_body",
+    "replace_document",
     "surface_plans",
     "surface_refusal",
 ]
@@ -92,6 +103,13 @@ PROJECTION_SURFACE_KIND = "l1_markdown_section"
 SURFACE_DRIFT = "surface_drift"
 SURFACE_NOT_ADOPTED = "surface_not_adopted"
 SURFACE_UNSUPPORTED = "surface_unsupported"
+
+#: Suffix of the temporary file an L1 document is written through before being
+#: renamed over its target. Deliberately **not** ``.md``: every knowledge
+#: scanner globs ``*.md`` (including dotfiles), so a temporary file carrying that
+#: suffix would be a readable knowledge document for as long as it existed, and
+#: a killed process would leave a scannable fragment behind.
+PUBLISH_TEMP_SUFFIX = ".publish.tmp"
 
 _HEADING_SPLIT = re.compile(r"(?m)^(?=##[ \t])")
 _HEADING_LABEL = re.compile(r"^##[ \t]+(.*?)[ \t]*$")
@@ -321,6 +339,16 @@ def surface_refusal(
       published it, so it belongs to whoever wrote it;
     * ``surface_drift`` — the registry published it and the on-disk body has
       changed since, so republishing would overwrite an external edit.
+
+    And one thing that looks like both of those and is neither: **our own
+    unfinished write**. A publication declares its intent before replacing the
+    file (see :func:`publish_l1`), so a body that matches the recorded intent is
+    a write of ours whose finalization never ran — the second crash window. It
+    must not be reported as an external edit, because the publication that
+    produced those bytes was the authority's own and recovery has to be able to
+    finish it. A body matching *neither* the last published record nor the
+    declared intent is still drift, and still refused: that comparison is what
+    protects a human's edit, and it is not relaxed here.
     """
     path = domain_path(config, binding.domain)
     if not path.exists():
@@ -332,12 +360,20 @@ def surface_refusal(
     current = read_section_body(raw, binding.section, binding.occurrence)
     if current is None:
         return None
+    on_disk = body_sha256(current)
     record = journal.surface(binding.entry_id)
+    if record is not None and on_disk == record.body_sha256:
+        return None
+    intent = journal.surface_intent(binding.entry_id)
+    if (
+        intent is not None
+        and intent.action == SURFACE_INTENT_PUBLISH
+        and on_disk == intent.body_sha256
+    ):
+        return None
     if record is None:
         return f"{SURFACE_NOT_ADOPTED}:{binding.entry_id}"
-    if body_sha256(current) != record.body_sha256:
-        return f"{SURFACE_DRIFT}:{binding.entry_id}"
-    return None
+    return f"{SURFACE_DRIFT}:{binding.entry_id}"
 
 
 # ---------------------------------------------------------------------------
@@ -413,6 +449,26 @@ def publish_l1(
     Refuses rather than overwrites. A drifted or unadopted surface raises
     :class:`ProjectionError` before any file is written, so one external edit
     cannot be half-overwritten across a multi-section publication.
+
+    **Three phases per domain**, because a registry row may never describe bytes
+    that are not on disk:
+
+    1. **Declare.** Every surface this document is about to change is recorded
+       as a :class:`~layered_memory_mcp.graph_journal.SurfaceIntent`. The
+       published record is left exactly as it was — it still describes the body
+       the file still holds.
+    2. **Replace.** The whole document is written to a temporary sibling and
+       renamed over the target in one ``os.replace``, so the target is never
+       truncated and never half-written.
+    3. **Finalize.** Only now does the registry adopt the new body (or mark the
+       surface retired), and only now is the intent cleared.
+
+    A crash in phase 2 leaves the registry truthful, so the retry is an ordinary
+    republication. A crash between phase 2 and phase 3 leaves a file matching
+    the declared intent, which :func:`surface_refusal` recognises as ours. This
+    ordering is the whole fix for a failed publication that used to be
+    permanently misread as an external edit; moving ``record_surface`` after the
+    write alone would only swap which window was unrecoverable.
     """
     plans = surface_plans(events, nodes)
     if not plans:
@@ -450,7 +506,6 @@ def publish_l1(
                     blocks.pop(index)
                     changed = True
                     report.retired.append(plan.entry_id)
-                journal.retire_surface(plan.entry_id, position=position)
                 continue
 
             rendered = _render_block(plan.section, plan.body)
@@ -464,24 +519,81 @@ def publish_l1(
                 report.published.append(plan.entry_id)
             else:
                 report.unchanged.append(plan.entry_id)
-            journal.record_surface(
-                SurfaceRecord(
-                    entry_id=plan.entry_id,
-                    domain=plan.domain,
-                    section=plan.section,
-                    occurrence=plan.occurrence,
-                    node_id=plan.node_id,
-                    body_sha256=body_sha256(plan.body.strip()),
-                    position=position,
-                )
-            )
 
         if changed:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(_write_document(preamble, blocks), encoding="utf-8")
+            for plan in by_domain[domain]:
+                journal.record_surface_intent(_plan_intent(plan, position))
+            replace_document(path, _write_document(preamble, blocks))
+
+        for plan in by_domain[domain]:
+            if plan.action == "retire":
+                journal.retire_surface(plan.entry_id, position=position)
+            else:
+                journal.record_surface(
+                    SurfaceRecord(
+                        entry_id=plan.entry_id,
+                        domain=plan.domain,
+                        section=plan.section,
+                        occurrence=plan.occurrence,
+                        node_id=plan.node_id,
+                        body_sha256=body_sha256(plan.body.strip()),
+                        position=position,
+                    )
+                )
+            # Unconditionally, not only when this run wrote: the surface we just
+            # finalized may be one whose *previous* publication crashed after
+            # its replacement landed, in which case this run found the file
+            # already carrying the intended body, changed nothing, and is still
+            # the publication that finished it.
+            journal.clear_surface_intent(plan.entry_id)
 
     _invalidate_scan_cache(config)
     return report
+
+
+def _plan_intent(plan: SurfacePlan, position: int) -> SurfaceIntent:
+    """The intent one plan declares before its document is replaced."""
+    retire = plan.action == "retire"
+    return SurfaceIntent(
+        entry_id=plan.entry_id,
+        domain=plan.domain,
+        section=plan.section,
+        occurrence=plan.occurrence,
+        node_id=plan.node_id,
+        body_sha256="" if retire else body_sha256(plan.body.strip()),
+        action=SURFACE_INTENT_RETIRE if retire else SURFACE_INTENT_PUBLISH,
+        position=position,
+    )
+
+
+def replace_document(path: Path, text: str) -> None:
+    """Replace one L1 document atomically, or leave it exactly as it was.
+
+    The bytes go to a temporary sibling first and then over the target in a
+    single ``os.replace``, which is atomic within a directory: a reader sees
+    either the whole previous document or the whole new one, never a truncated
+    or half-written file. ``Path.write_text`` on the target cannot give that —
+    it truncates first — and a truncated knowledge file is the one outcome a
+    publication must never produce.
+
+    The temporary file is in the *target's* directory, because a rename is only
+    atomic within a filesystem and the knowledge directory may be configured
+    anywhere. It is removed on every path out, including the failing one, so an
+    interrupted publication leaves no debris for the next scan to read.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}{PUBLISH_TEMP_SUFFIX}")
+    try:
+        temporary.write_text(text, encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            # Debris cleanup may not fail a publication that landed. The
+            # ordinary case is that there is nothing to remove, because the
+            # rename consumed it; ``missing_ok`` covers that without hiding it.
+            pass
 
 
 def _invalidate_scan_cache(config: Any) -> None:
@@ -518,6 +630,21 @@ def publish_vector(config: Any, domains: Iterable[str]) -> dict[str, Any]:
             raise ProjectionError(f"vector publication failed for domain {domain!r}")
         published.append(domain)
     return {"domains": published}
+
+
+def publish_todo(config: Any, nodes: Iterable[GraphNode]) -> dict[str, Any]:
+    """Republish the readable TODO view from the replayed task state.
+
+    A projection like every other one here: derived from the journal, written
+    through one owner (:func:`~layered_memory_mcp.graph_task.publish_tasks`),
+    and refused rather than forced when the store holds rows the authority does
+    not know about. It is the one projection that depends on the *graph* alone —
+    a task is not a readable L1 surface — which is why a refused L1 section does
+    not hold it up (see ``graph_application``'s dependency table).
+    """
+    from .graph_task import publish_tasks
+
+    return publish_tasks(config, nodes)
 
 
 def publish_l0(config: Any) -> dict[str, Any]:

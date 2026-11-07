@@ -41,6 +41,7 @@ from layered_memory_mcp.graph_application import (
 )
 from layered_memory_mcp.graph_fixture_store import InMemoryGraphStore
 from layered_memory_mcp.graph_journal import (
+    PROJECTION_NAMES,
     REQUEST_KIND_BOOTSTRAP,
     MemoryEventJournal,
 )
@@ -384,7 +385,11 @@ def test_a_forced_recovery_rebuilds_every_projection_from_the_journal(config):
 
     assert report.status == RECOVERY_OK
     assert report.projections_pending == []
-    assert sorted(report.recovered) == ["graph", "l0", "l1", "vector"]
+    # *Every* managed projection, read from the constant rather than listed:
+    # "force republishes all of them" is the guarantee, and a literal list
+    # would quietly stop asserting it for a projection added later (``todo``,
+    # v3.6.1).
+    assert sorted(report.recovered) == sorted(PROJECTION_NAMES)
     assert _graph_snapshot(config) == expected
 
     with MemoryEventJournal(config.graph_journal_path) as journal:

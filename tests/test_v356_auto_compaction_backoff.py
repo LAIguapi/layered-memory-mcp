@@ -51,6 +51,17 @@ from layered_memory_mcp.storage.auto_compaction_state import (
     target_key,
 )
 
+#: Lazy auto-compaction is a legacy-mode feature end to end. Under the ``graph``
+#: rollout default the whole ``auto_maintain`` job is a *reported suspension*
+#: (``graph_mutation_guard.MAINTENANCE_JOBS``), because rewriting the agent's
+#: memory file and deduping L1 are mutations the semantic journal owns and has
+#: no caller-supplied decision for. So every test in this file is a statement
+#: about what explicit ``legacy`` rollback preserves, and says so by requesting
+#: the opt-in rather than by assuming a default. The graph-mode counterpart —
+#: that the job is suspended and names its alternative — lives in
+#: ``test_v361_graph_maintenance_bypass.py``.
+pytestmark = pytest.mark.usefixtures("legacy_graph_mode")
+
 SEPARATOR = "§"
 
 # --- one entry per surface, long enough to read as bloat ---------------------

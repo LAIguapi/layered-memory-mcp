@@ -211,12 +211,16 @@ def test_default_preview_is_json_and_writes_nothing(tmp_path, monkeypatch):
         )
         database.commit()
 
+    # The home must exist: this entry point prepares that home's *binding*, and
+    # a binding cannot be prepared — or previewed — in a home nobody installed.
+    home.mkdir()
+    (home / "config.yaml").write_text("dedup_threshold: 0.9\n", encoding="utf-8")
     before = tree_state(source)
     control_before = tree_state(control)
+    home_before = tree_state(home)
     plan = plan_migration(source=source, destination=destination)
     assert plan["status"] == "migration_planned", plan["findings"]
     assert tree_state(source) == before
-    assert not home.exists()
     assert not destination.exists()
     assert not pointer.exists()
 
@@ -243,9 +247,9 @@ def test_default_preview_is_json_and_writes_nothing(tmp_path, monkeypatch):
 
     assert tree_state(source) == before
     assert tree_state(control) == control_before
+    assert tree_state(home) == home_before
     assert not destination.exists()
     assert not pointer.exists()
-    assert not home.exists()
     assert list(control.iterdir()) == []
     assert not application.exists()
     assert completed.returncode == 0, completed.stderr
@@ -257,6 +261,13 @@ def test_default_preview_is_json_and_writes_nothing(tmp_path, monkeypatch):
     assert report["preflight"]["status"]["status"] == (
         "generation_runtime_pointer_absent"
     )
+    # The pointer is not activated yet, so only the pointer-independent half of
+    # the binding can be planned — and it says so rather than claiming success.
+    assert report["binding"]["preparation"]["status"] == (
+        "home_binding_pending_activation"
+    )
+    assert report["binding"]["preparation"]["writes"] is False
+    assert report["effective_binding"] == {}
 
 
 def test_apply_refuses_destination_outside_control_before_publication(tmp_path):
@@ -355,6 +366,11 @@ def test_apply_refuses_symlink_destination_without_publication(tmp_path):
 
 def test_apply_publishes_verifies_and_activates_exact_generation(tmp_path):
     home = tmp_path / "update-home"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "# operator note\ndedup_threshold: 0.9\nauto_maintain: false\n",
+        encoding="utf-8",
+    )
     source = neutral_source(tmp_path / "source")
     control = tmp_path / "control"
     control.mkdir()
@@ -385,9 +401,71 @@ def test_apply_publishes_verifies_and_activates_exact_generation(tmp_path):
     assert destination.joinpath("current").is_dir()
     assert pointer.is_file()
 
+    # An activated pointer the service cannot see is not an applied update: the
+    # home's configuration must now select this exact pointer, the unrelated
+    # settings must survive, and the previous bytes must be recoverable.
+    preparation = report["binding"]["preparation"]
+    assert preparation["status"] == "home_binding_applied"
+    assert preparation["changes"] == ["active_pointer", "mode"]
+    assert preparation["writes"] is True
+    configuration = (home / "config.yaml").read_text(encoding="utf-8")
+    assert "# operator note" in configuration
+    assert "dedup_threshold: 0.9" in configuration
+    assert "auto_maintain: false" in configuration
+    assert f"active_pointer: {pointer}" in configuration
+    assert "mode: graph" in configuration
+    recoverable = Path(preparation["backup"])
+    assert recoverable.read_text(encoding="utf-8") == (
+        "# operator note\ndedup_threshold: 0.9\nauto_maintain: false\n"
+    )
+    effective = report["effective_binding"]
+    assert effective["status"] == "home_binding_verified"
+    assert effective["effective"]["graph_mode"] == "graph"
+    assert effective["effective"]["graph_active_pointer"] == str(pointer)
+    generation = destination / "current"
+    assert effective["effective"]["graph_db_path"] == str(generation / "graph.db")
+    assert effective["effective"]["graph_journal_path"] == str(generation / "journal.db")
+    assert effective["effective"]["knowledge_dir"] == str(generation / "knowledge")
+    assert effective["effective"]["l0_index_file"] == str(generation / "L0.md")
+    assert effective["effective"]["vector_db_path"] == str(
+        generation / "data" / "vectors.db"
+    )
+
+
+def test_apply_refuses_a_home_whose_graph_configuration_cannot_be_rewritten(tmp_path):
+    """A config this tool cannot safely edit stops the run before publication."""
+    home = tmp_path / "update-home"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "graph:\n  mode: legacy\ngraph:\n  mode: shadow\n", encoding="utf-8"
+    )
+    source = neutral_source(tmp_path / "source")
+    control = tmp_path / "control"
+    control.mkdir()
+    destination = control / "destination"
+    pointer = control / "active.json"
+    environment = update_environment(home, tmp_path / "temporary", tmp_path / "application")
+    home_before = tree_state(home)
+    control_before = tree_state(control)
+
+    completed = run_update(
+        tmp_path, environment, home, source, destination, pointer, "--apply",
+    )
+
+    assert completed.returncode == 1, completed.stderr
+    report = json.loads(completed.stdout)
+    assert report["status"] == "graph_update_refused"
+    assert "home_binding_failed" in report["findings"]
+    assert any("duplicate_key" in finding for finding in report["findings"])
+    assert not destination.exists()
+    assert not pointer.exists()
+    assert tree_state(home) == home_before
+    assert tree_state(control) == control_before
+
 
 def test_repeat_apply_is_zero_write_after_served_generation_changes(tmp_path):
     home = tmp_path / "update-home"
+    home.mkdir()
     source = neutral_source(tmp_path / "source")
     control = tmp_path / "control"
     control.mkdir()
@@ -413,6 +491,7 @@ def test_repeat_apply_is_zero_write_after_served_generation_changes(tmp_path):
     )
     destination_before = tree_state(destination)
     control_before = tree_state(control)
+    home_before = tree_state(home)
 
     repeated = run_update(
         tmp_path,
@@ -430,10 +509,17 @@ def test_repeat_apply_is_zero_write_after_served_generation_changes(tmp_path):
     assert report["activation"]["status"] == "generation_cutover_unchanged"
     assert tree_state(destination) == destination_before
     assert tree_state(control) == control_before
+    # The binding is still *proved* on a repeat — and because it is already
+    # correct, proving it rewrites nothing, including the config's own bytes.
+    assert report["binding"]["preparation"]["status"] == "home_binding_unchanged"
+    assert report["binding"]["preparation"]["writes"] is False
+    assert report["effective_binding"]["status"] == "home_binding_verified"
+    assert tree_state(home) == home_before
 
 
 def test_repeat_apply_refuses_source_mismatch_without_touching_active_target(tmp_path):
     home = tmp_path / "update-home"
+    home.mkdir()
     source = neutral_source(tmp_path / "source")
     control = tmp_path / "control"
     control.mkdir()

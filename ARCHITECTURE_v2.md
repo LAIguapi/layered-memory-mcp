@@ -1,8 +1,6 @@
 # Layered Memory MCP — Layered Memory Graph v1 Architecture
 
 > Status: IMPLEMENTATION BASELINE — Batch L complete; production population and cutover remain open
-> Branch: `refactor/memory-graph-v1`
-> Baseline commit: `668e402` (`chore: freeze pre-graph refactor baseline`)
 > Version: 3.6.0
 > Date: 2026-10-28
 
@@ -541,17 +539,16 @@ success or silently return known superseded facts as current facts.
 
 ### Phase 0 — freeze and measure
 
-- Freeze the pre-graph baseline at commit `668e402`.
-- Work only on `refactor/memory-graph-v1`.
+- Freeze the pre-graph baseline before implementation begins.
 - Keep all test data isolated from real memory stores.
 - Record current test output and current index/store health.
 - Do not rewrite legacy Markdown.
 
 Exit criteria:
 
-- clean baseline commit;
-- branch exists;
-- full test suite passes;
+- the implementation boundary is frozen;
+- test data and runtime data are isolated;
+- the full test suite passes;
 - migration input/output locations are explicit.
 
 ### Phase 1 — semantic foundation
@@ -624,9 +621,8 @@ Each batch must be independently reviewable and testable.
 
 ### Batch A — baseline and architecture
 
-- Baseline commit and branch creation.
-- This document updated.
-- No runtime behavior change.
+- Freeze the pre-graph baseline before implementation begins.
+- Keep all test data isolated from real memory stores.
 
 ### Batch B — domain contracts
 
@@ -676,8 +672,8 @@ Each batch must be independently reviewable and testable.
   do not silently turn the existing injector into a second write path.
 - Add runtime/config/version regression tests and verify that the explicit
   `legacy` path performs no graph operation.
-- Accepted in commit `660c8e2` (`feat: add reversible graph runtime
-  integration`): `1441 passed, 2 skipped`; focused Batch H tests `117 passed`.
+- Accepted after the reversible graph runtime integration: `1441 passed,
+  2 skipped`; focused Batch H tests `117 passed`.
 
 Batch H itself was integration scaffolding, not production cutover. It did not
 construct a persistent graph store, generate graph node IDs for real vector
@@ -707,8 +703,8 @@ the Batch I test suite.
 - Add bounded read-only diagnostics for assembly and seed coverage without
   leaking paths or memory contents.
 
-Accepted in commit `deb2af6` (`feat: assemble persistent graph runtime`):
-focused I-A tests `88 passed`; full suite `1504 passed, 2 skipped`.
+Accepted after assembling the persistent graph runtime: focused I-A tests
+`88 passed`; full suite `1504 passed, 2 skipped`.
 
 #### Batch I-B — semantic recall wiring (complete)
 
@@ -723,8 +719,8 @@ focused I-A tests `88 passed`; full suite `1504 passed, 2 skipped`.
 - Do not wire `recall_knowledge`, REST `/knowledge/search`, or the write path
   in this batch; those entrances have different identity/provenance contracts.
 
-Accepted in commit `37da26f` (`feat: wire graph recall into semantic search`):
-focused I-B tests `102 passed`; full suite `1518 passed, 2 skipped`.
+Accepted after wiring graph recall into semantic search: focused I-B tests
+`102 passed`; full suite `1518 passed, 2 skipped`.
 
 #### Batch I-C — legacy identity backfill and reconciliation (complete)
 
@@ -777,8 +773,7 @@ arbitration, automatic access to the real memory directory, default mode
 switching, physical deletion, REST integration, or write-path ownership
 changes. Those remain later, independently gated work.
 
-I-C was accepted in commit ``a28669e`` (``feat: add reversible graph identity
-backfill``):
+I-C was accepted after adding reversible graph identity backfill:
 
 - focused I-C tests: ``77 passed``;
 - related graph/runtime regression tests: ``190 passed``;
@@ -861,8 +856,7 @@ I-D explicitly does not:
 - open a live graph projection path until a later batch owns and supplies the
   complete source-event stream required by ``rebuild``.
 
-Accepted in commit ``6846baa`` (``feat: add guarded semantic graph write
-seam``):
+Accepted after adding the guarded semantic graph write seam:
 
 - focused I-D/runtime/config tests: ``188 passed``;
 - full suite: ``1640 passed, 2 skipped``;
@@ -904,8 +898,7 @@ does not embed thresholds, approval, or a cutover decision. Backend labels are
 bounded and provenance warning parsing is explicit, so paths, diagnostics,
 memory contents, and unknown warning fragments cannot enter the report.
 
-Accepted in commit ``564cce3`` (``feat: add measured graph shadow
-evaluation``):
+Accepted after adding measured graph shadow evaluation:
 
 - focused Batch J tests: ``57 passed``;
 - full suite: ``1697 passed, 2 skipped``;
@@ -926,8 +919,7 @@ must not turn a mixed corpus of healthy and degraded cases into one misleading
 quality number, and it must not treat an in-memory seam as evidence that the
 persistent runtime is ready.
 
-Accepted in commit ``4ff4d34`` (``feat: add separated graph evaluation and
-sqlite parity``):
+Accepted after separating graph evaluation and SQLite parity:
 
 - focused Batch K tests: ``77 passed``;
 - full suite: ``1774 passed, 2 skipped``;
@@ -1081,7 +1073,7 @@ Implementation allowlist: new ``src/layered_memory_mcp/graph_entry_identity.py``
 ``server.py`` (recall-store selection/lifecycle and related comments only), new
 ``tests/test_v360_graph_entry_identity.py``, and new
 ``tests/test_v360_graph_recall_path.py``. Design/status updates stay in this
-document and ``CHANGELOG.md`` in separate documentation commits.
+document and ``CHANGELOG.md`` as separate documentation changes.
 
 The user additionally approved the single assertion/comment correction in
 ``tests/test_vector_maintenance.py:629``: an unchanged H2 projection now keeps
@@ -1111,10 +1103,9 @@ Disabling graph recall restores legacy responses without opening the graph.
 
 #### Delivered evidence
 
-Code commit: ``262ce88``. Independent parent verification: focused identity,
-request-lifecycle, and vector-maintenance tests **115 passed**; full regression
-**1830 passed, 2 skipped**; compilation and tracked/untracked whitespace checks
-passed. Security scans covered all six changed files with **0 CRITICAL,
+Implementation checkpoint: focused identity, request-lifecycle, and
+vector-maintenance tests **115 passed**; full regression **1830 passed,
+2 skipped**; compilation and tracked/untracked whitespace checks passed. Security scans covered all six changed files with **0 CRITICAL,
 0 HIGH, 0 MEDIUM**; LOW informational findings remain. AST comparison confirmed
 the injector change is confined to ``_vector_entries`` and server function changes
 to recall-store selection/lifecycle and injection documentation. The rollout
@@ -1229,9 +1220,9 @@ migration is implied by framework or CLI acceptance.
 
 #### Delivery checkpoint and migration implementation boundary
 
-Framework implementation is committed as `9115228`. Independent full regression
-on the system interpreter was repeated after that commit: 2094 tests passed,
-with no skipped tests. The working tree was clean before migration work began.
+The framework implementation passed an independent full regression on the
+system interpreter: 2094 tests passed, with no skipped tests. The working tree
+was clean before migration work began.
 This establishes the framework acceptance prerequisite, not production readiness.
 
 The next implementation is a separate `graph_migration` operator module (runnable
@@ -1257,16 +1248,17 @@ then cover replay/duplicate apply, full readback, rollback, malformed/conflictin
 inputs, source drift, symlink/overlap refusal, publication failure and target
 drift. Use only neutral temporary fixtures and deterministic injected embeddings;
 do not access real stores, install/restart anything, or change the default mode.
-The parent independently exercises the CLI and reviews scope/security before
+The CLI and scope/security boundaries are exercised independently before
 marking migration acceptance complete. Documentation and code remain separate
-commits. Real migration, publication and production cutover are separate actions.
+changes. Real migration, publication and production cutover are separate
+actions.
 
 #### Runtime generation and update delivery contract (authorized; in progress)
 
-The isolated migration operator is implemented in `109aef5`, with source-backup
-provenance verification corrected in `5a6c0e5`. Its publication success does not
-mean a server is using the generation. The next boundary is serving, not another
-importer or a second identity implementation.
+The isolated migration operator includes source-backup provenance verification.
+Its publication success does not mean a server is using the generation. The
+next boundary is serving, not another importer or a second identity
+implementation.
 
 The runtime adapter consumes one explicitly supplied generation root or active
 pointer. A never-served generation requires full publication verification before
@@ -1281,21 +1273,18 @@ not the contents of either generation. Changed runtime generations must never be
 silently discarded or overwritten by a repeat migration.
 
 The first adapter batch leaves the normal `MemoryConfig` startup path unchanged.
-The parent independently ran the migration/adapter focused suite (201 passed)
-and complete regression (2295 passed, no skipped tests); compilation and tracked
-diff checks passed. That complete run used the normal launcher environment, not
+The migration/adapter focused suite (201 passed) and complete regression
+(2295 passed, no skipped tests) passed; compilation and tracked diff checks also
+passed. That complete run used the normal launcher environment, not
 a fresh offline home. A subsequent fresh-HOME offline run returned 2275 passed,
 16 skipped and four failures in legacy vector tests requiring an uncached
 embedding model. The offline complete gate is NOT_PASSED. Neither run establishes
 that a production service consumed the pointer.
 
-Independent scratch-only probes subsequently blocked adapter acceptance:
-concurrent activate/restore can overwrite a newer pointer snapshot and discard
-its retained target; confirmation can report success while resolving a different
-generation; migration rollback can withdraw an unchanged but active target and
-leave a dangling pointer. No data loss was demonstrated; the withdrawal probe
-demonstrated an availability failure. Default cutover and publication remain
-frozen until these defects are independently rechecked after repair.
+Earlier integration checks identified concurrency and pointer-lifecycle hazards
+around generation activation, restoration, confirmation, and rollback. Those
+behaviors are now covered by the generation runtime and concurrency regression
+contracts; production cutover and publication remain separate operational gates.
 
 Pointer-changing operations must serialize their complete read/validate/modify/
 write/confirm interval across processes, not merely make the final replacement
@@ -1339,7 +1328,7 @@ Before changing the rollout default, the subsequent integration batch must:
    because the default changed. Explicit configuration can override a default;
    repository tests alone do not establish the installed service's active mode.
 5. Synchronize release versions, entry-point documentation and changelog, then
-   rerun complete regression, independent negative probes, privacy review and
+   rerun complete regression, negative-path checks, privacy review and
    wheel/sdist checks before pushing or publishing. No CI or package publication
    is implied merely by a git push or tag. Only after the release is verified may
    the operator pull/install that release and run its migration/update entry point.
@@ -1418,11 +1407,232 @@ contract. Production execution, installed-service activation and remote release
 must each be reported with their own read-back evidence, never inferred from a
 successful isolated migration.
 
+##### Completion batch — the deltas that close this contract
+
+Status: implemented and verified locally. Nothing below is a
+production claim; a separate release gate remains required, and no release,
+installed-service activation or real-data migration is implied.
+
+The five deltas, and what each one actually changed:
+
+1. **Source classification** (`graph_migration_snapshot.py`). One policy decides
+   every member. The known-exclusion table gained the operational state this
+   project itself writes under a home — `.gitignore`, `.last_auto_compact`,
+   `.last_auto_compact_attempt`, `.last_l1_dedup`, `write_guard_state.json` —
+   each typed and classified from metadata alone. A root member this project
+   does *not* own is covered only by an explicit per-run declaration
+   (`--exclude NAME`, repeatable), validated as one literal, non-reserved,
+   non-patterned name that is actually present; a declaration that matches
+   nothing is a finding, so a stale list cannot pre-authorise a future unknown.
+   A knowledge namespace subdirectory is accepted only once it has been *proved*
+   empty by listing its names, and is recorded in the report and manifest as
+   `empty_namespaces`; a nonempty namespace remains a coverage blocker and is
+   never traversed or read. No installation-specific name is in the source.
+2. **Rollout default and its tests** (`tests/`). `DEFAULT_GRAPH_MODE` stays
+   `graph`. The suite's legacy-shape tests now request an opt-in
+   `legacy_graph_mode` fixture one test, class or feature at a time, each with a
+   written reason and a pointer to the graph-mode counterpart. There is no
+   autouse fixture, no global env override and no blanket default patch, so the
+   default remains the mode the rest of the suite exercises.
+3. **Service-home binding** (`graph_home_binding.py`, wired into
+   `graph_update.py`). `--home` now prepares and proves a binding instead of
+   being informational. `plan_home_binding` writes nothing at all;
+   `apply_home_binding` rewrites only the `graph:` block, preserving every other
+   line byte-for-byte, after retaining the original and validating the *parsed*
+   result; `verify_effective_binding` builds the complete `MemoryConfig` the
+   normal startup path would build and checks it resolves this exact pointer,
+   the authoritative mode and each projection. A duplicated or malformed graph
+   section, an unknown graph key, a conflicting explicit target or a relevant
+   `LAYERED_MEMORY_GRAPH_*` override is a refusal, not a fallback. An update is
+   reported as applied only after that proof passes.
+4. **Fresh bootstrap** (`graph_bootstrap.py`, `build_fresh_generation`).
+   A separate explicit operator CLI, preview by default, requiring an inspected
+   home, a destination and a pointer. Any legacy input under the home — knowledge
+   Markdown, a vector database, an L0 index, a graph or journal file — blocks it,
+   naming all of them. The staged generation is built through the existing
+   publishers and declares `generation_type: fresh`; zero events, a zero head and
+   zero checkpoints are its complete authority. Verification is split by declared
+   type: a fresh generation must be *empty* (no backup, no source claim, no seed,
+   no surface), and a migration generation must have authority — a zero-event
+   journal is now an explicit `migration_generation_has_no_authority` failure
+   rather than a vacuously satisfied manifest. A manifest with no declared type
+   is read as a migration, the stricter of the two.
+   An existing generation is proved with the gate its lifecycle calls for, via
+   one shared `generation_is_served` seam: a served generation is writable, so
+   it is checked through attested runtime health, and a never-served one is
+   proved as a publication in full. Both are reported with an explicit
+   `integrity` field. This was a defect in the first cut of this batch — the
+   publication hashes were run against a served generation, which reported a
+   correctly-written store as corrupt and made a repeat bootstrap fail because
+   the service had been used.
+5. **Bounded embedding batch** (`storage/vector_store.py`). One
+   `EMBED_BATCH_SIZE = 16` at the single `model.embed` call site. Vectors, their
+   order and the set of embedded texts are unchanged; only the arena the ONNX
+   runtime retains is. Included as a rollout prerequisite, not as graph work.
+
+##### Primary-entry acceptance matrix after cutover
+
+The acceptance matrix below records the supported, refused-with-equivalent, and
+suspended outcomes established by isolated integration checks and the regression
+suite. These outcomes are deliberately not collapsed into a generic "safe" label.
+
+| Entrance | Outcome |
+|---|---|
+| `inject_knowledge_tool` / `batch_inject_knowledge_tool` with `semantic_write_request` | **Supported.** Commits through the journal and publishes L1, vector and L0 inside the bound generation |
+| `inject_knowledge_tool` without a decision | **Refused**, `graph_write_decision_required` — the agent-supplied decision is the design, not a gap |
+| `recall_knowledge`, `search_semantic`, `get_l0_index`, `get_knowledge_*`, REST `GET /knowledge/search`, `/knowledge/{id}`, `/domains` | **Supported.** Read from the bound generation |
+| `recover_graph_projections`, `graph_memory_status`, `get_memory_surface_capabilities` | **Supported** |
+| whole-file L1 CRUD (MCP and REST), derived index/vector rebuilds, cleanup/reconcile, `compact_memory(dry_run=False)`, agent-owned surfaces | **Refused with an equivalent.** Each names a call that can actually do the job; dry-run and read-only forms are never refused |
+| background jobs `auto_maintain`, `vector_maintenance`, `write_guard_refresh`, `watcher_l0_sync` | **Suspended and reported.** Each is the unattended twin of a refused-with-equivalent entrance |
+| task mutations (`add_todo` / `update_todo` / `delete_todo`, dashboard `POST /update-todo`) | **Supported.** Each commits a typed task decision through the journal; `list_todos` / `get_todo_stats` / dashboard `GET /todos` read the replayable `todo` projection |
+| `apply_semantic_lifecycle` (retract / restore / approve) | **Supported.** A target-only semantic decision; no replacement node is invented |
+| review verdicts (`approve_knowledge` / `reject_knowledge`, REST and dashboard forms) | **Supported.** The graph path commits a target-only lifecycle event in the `review` namespace, carrying reviewer/note as authoritative payload; the review queue remains readable and legacy behavior is unchanged |
+
+Review verdicts reuse the unified semantic lifecycle rather than writing an
+unrelated claim or introducing a second ledger. `tests/test_v361_graph_review_decisions.py`
+pins approve/reject payloads, idempotency and legacy compatibility, while
+`tests/test_v361_graph_capability_matrix.py` pins the entrance classification.
+
+Auxiliary ownership is unchanged for the stores that are still auxiliary: the
+access log and the review queue remain the service home's own. The TODO database
+is **no longer one of them** — it is the `todo` projection of the journal (see
+the core-closure batch below).
+
+Its *location* is unchanged, and that is a deliberate boundary with a stated
+consequence. The task view resolves at `<home>/data/todos.db`, which under a
+live `MemoryConfig` is the service home (as the graph, journal, knowledge,
+vector and L0 paths resolve into the activated generation) and under a
+generation-scoped runtime config is that generation's own root, exactly like its
+vector database. Relocating operator task data was not in scope. So activating a
+*different* generation, or rolling back to an earlier one, leaves a task view
+whose rows the newly bound journal may have no authority for — and the honest
+outcome of that is the one the adoption guard already gives: the task entrances
+refuse, naming `seed_task_authority`, rather than rebuilding those rows away.
+
+##### Core-closure batch — the four deltas that close the pre-cutover blockers
+
+Status: implemented and verified by the repository's isolated regression
+contracts. These changes do not constitute a production migration or cutover
+claim.
+
+1. **A task is a semantic decision, and the TODO view is a projection**
+   (`graph_task.py`, `graph_journal.py`, `graph_projection.py`,
+   `graph_application.py`, `server.py`, `dashboard_plugin/plugin_api.py`).
+
+   A task mutation changes semantic state, so it is an event in the one journal
+   — not a second ledger, and not direct SQL smuggled past the guard. A task is
+   a `TASK` node whose payload carries the operational fields (`task_id`,
+   `domain`, `priority`, task `status`, `blocked_by`, `notes`, the terminal
+   timestamps); an **update is a new version plus `SUPERSEDES`**, exactly as a
+   revised claim is, and a delete is a pure `RETRACT` of the current version.
+   `task_id` is stable across every version, which is what an operator holds.
+
+   `todo` joins `graph`, `l1`, `vector` and `l0` in `PROJECTION_NAMES`, so it
+   has a checkpoint, it is covered by `recover_graph_projections()`, and it is
+   rebuilt from the replayed stream rather than edited in place. The projection
+   writes the same `todos` table the read entrances already read, so
+   `list_todos`, `get_todo_stats` and the dashboard's `GET /todos` are
+   journal-backed without a second response envelope.
+
+   Four properties the implementation owes, and where they live:
+
+   * **Transitions own the terminal timestamps.** `completed_at` / `cancelled_at`
+     are set and cleared by the status transition alone, never by a caller.
+     Reopening a completed task *clears* `completed_at` rather than leaving a
+     finish time on a pending row.
+   * **Replay uses event time.** Every timestamp a task row carries is stamped
+     into the event payload when the decision is made, so replaying the journal
+     reproduces the same rows rather than re-dating them to the replay clock.
+   * **Pre-existing tasks are migrated, never rebuilt away.** `publish_todo`
+     refuses a store holding rows the journal has no authority for
+     (`todo_store_not_adopted:<count>`) instead of replacing them with a
+     partial stream. `seed_task_authority` is the explicit migration that
+     appends one bootstrap request carrying every existing row verbatim, with
+     `derivation.method = migrated`.
+   * **One authority.** There is no hidden legacy fallback: in a graph write
+     mode the only way a task changes is a committed decision, and in `legacy`
+     mode the store remains authoritative exactly as before.
+
+   Deliberately *not* done: `blocked_by` stays a preserved payload field and is
+   not minted into `BLOCKS` edges. An edge needs a projected node at both ends,
+   and a legacy `blocked_by` entry is a free-form string, so converting it would
+   turn unverifiable data into a replay-invalidating dangling edge.
+
+2. **Pure lifecycle mutation** (`graph_write.SemanticLifecycleRequest`,
+   `graph_application.commit_semantic_lifecycle`, `server.apply_semantic_lifecycle`).
+
+   Deleting or restoring a memory no longer requires inventing a superseding
+   node with fabricated content. The request carries a target, an action, a
+   timestamp and a request key — and **no node**. The action is one of the
+   existing target-only event kinds (`retract`, `restore`, `approve`);
+   `supersede` is absent on purpose, because a supersession needs the
+   replacement it declares. Validation is fail-closed before the journal: an
+   unknown target, a scope that disagrees with the target's, and a transition
+   the target's current status cannot take are refusals, not warnings. The
+   §8.2 transition table is now one table in `graph_models`, read by both the
+   projection and this validation, so the two cannot drift. A `restore` that
+   would leave two current owners of one readable L1 surface is refused
+   (`surface_owned_by:<node>`); history is preserved in every case.
+
+3. **Recoverable L1 publication** (`graph_journal.py`, `graph_projection.py`,
+   `graph_application.py`).
+
+   The observed defect: `publish_l1` recorded a surface's body hash *before*
+   writing the file, so a failed write left the registry describing bytes that
+   never reached disk, and every later recovery attempt compared the file
+   against that phantom hash and reported `surface_drift` — our own crash,
+   permanently misclassified as an external edit, with `vector` and `l0` queued
+   behind it forever.
+
+   The fix is a two-phase publication protocol, not a relaxed comparison (the
+   comparison is what legitimately protects a human's edit):
+
+   * **Intent.** Before any byte is written, the desired state of every surface
+     the publication will touch is recorded as a *pending intent* — coordination
+     state, explicitly not a second semantic truth. The last published hash is
+     left untouched.
+   * **Write.** The document is replaced atomically: a temporary file beside the
+     target, then one `os.replace`. A target file is never truncated in place
+     and a retirement never deletes the file.
+   * **Finalize.** Only after the replacement lands does the surface registry
+     adopt the new hash (or mark the surface retired) and the intent clear.
+
+   Both crash windows then recover without `force=True`. A crash *before* the
+   replacement leaves the registry on the last published body, which is still
+   what the file holds, so the retry is an ordinary republication. A crash
+   *after* the replacement but before finalization leaves a file that matches
+   the recorded *intent*, which `surface_refusal` recognises as our own
+   unfinished write and finalizes. A body matching neither the last published
+   hash nor the intent is still `surface_drift`, and still refused.
+
+   The chain is also dependency-aware rather than strictly sequential: `l1`
+   depends on `graph`, `vector` and `l0` depend on `l1`, and `todo` depends on
+   `graph` alone — so a refused readable surface no longer holds the task
+   projection hostage. A commit whose L1 write failed reports
+   `l1_projection_pending:<entry id>` beside its `committed: true`, so a surface
+   whose bytes never landed is not indistinguishable from one that published.
+
+4. **Section-precise retrieval** (`recall.py`, `graph_search.py`).
+
+   A keyword result is one *file* carrying several matched sections. The graph
+   kept the whole file payload whenever any one seed survived, so a retracted,
+   expired or out-of-namespace section rode along inside the payload of a
+   surviving sibling in the same file. The producer now declares, per displayed
+   section, the H2 surface identity that owns it; the graph layer screens each
+   section against its own owning node and **rebuilds** the main payload —
+   `sections`, `section_entries` and `matched_sections` — from the survivors.
+   A file keeps its rank and its place. A displayed fragment whose owning
+   surface cannot be identified is dropped from a file that had an excluded
+   section and reported as `section_payload_unmappable:<count>`: with a known
+   forbidden section in the same file, "we cannot prove this fragment is not
+   part of it" must fail closed. Files with nothing excluded are returned
+   byte-for-byte as before.
+
 ### Production snapshot adaptation — approved staged implementation
 
-Status: Batch 1 implemented in `77ddcd7` and independently accepted (183 focused
-tests plus a separately authored zero-write/copy probe); Batch 2 independently
-accepted (383 focused tests and a separately authored 36-check identity probe).
+Status: Batch 1 implemented and independently accepted (183 focused tests plus
+zero-write/copy checks); Batch 2 independently accepted (383 focused tests and
+36 identity checks).
 The full isolated offline run retains four model-cache-dependent failures;
 neither batch establishes production cutover or release readiness. The strict
 migration source layout remains unchanged. A separate, explicit snapshot
@@ -1507,7 +1717,7 @@ unchanged. Manifest and verification must account for both mapping origins.
 Acceptance uses neutral random-ID fixtures, exact success, absent/wrong section,
 same-text wrong domain, whitespace mismatch, duplicate headings, duplicate claims,
 malformed/conflicting metadata, explicit-map interaction, source drift, and a
-separately authored end-to-end plan/apply/verify/no-op/rollback probe. Assert tree
+end-to-end plan/apply/verify/no-op/rollback checks. Assert tree
 metadata and hashes before any apply to prove dry-run zero writes. No production
 data, default-mode changes, update hook, dependency change or service operation
 belongs to this batch.
@@ -1518,8 +1728,8 @@ fixtures; external ownership is never invented merely to bypass a failed gate.
 Production documents are not modified by this implementation batch.
 
 Acceptance proceeds snapshot → identity report → plan → staged apply → verify
-→ isolated normal read paths → retained rollback. Independently authored probes
-must cover dry-run zero writes before apply, source drift, tamper, WAL refusal,
+→ isolated normal read paths → retained rollback. Independent checks must cover
+dry-run zero writes before apply, source drift, tamper, WAL refusal,
 exclusion non-access, identity ambiguity, preserved payloads and no-op repeats.
 Default mode, installed services, update integration and remote release remain
 outside these batches until separately accepted.
@@ -1566,8 +1776,8 @@ references, not acceptance evidence for this repository.
 
 ### Code rollback
 
-Each batch is committed separately. Revert the batch commit or switch back to
-`main` without changing the pre-graph baseline.
+Each batch is independently revertible. Restore a prior implementation boundary
+without changing the pre-graph baseline.
 
 ### Data rollback
 

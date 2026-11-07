@@ -17,9 +17,11 @@ from typing import Any, Mapping, Sequence
 
 from .graph_generation_runtime import (
     FINDING_GENERATION_ROOT_REJECTED,
+    SERVING_STATUSES,
     STATUS_CUTOVER_REFUSED,
     STATUS_RUNTIME_ABSENT,
     activate_generation,
+    generation_is_served,
     status_generation,
 )
 from .graph_migration import (
@@ -35,6 +37,16 @@ from .graph_migration import (
     apply_migration,
     plan_migration,
     verify_migration,
+)
+from .graph_home_binding import (
+    STATUS_APPLIED as BINDING_APPLIED,
+    STATUS_PREPARED as BINDING_PREPARED,
+    STATUS_UNCHANGED as BINDING_UNCHANGED,
+    STATUS_VERIFIED as BINDING_VERIFIED,
+    apply_home_binding,
+    plan_home_binding,
+    plan_home_config,
+    verify_effective_binding,
 )
 from .graph_migration_generation import read_manifest
 from .graph_migration_inventory import read_source_snapshot
@@ -56,10 +68,15 @@ FINDING_HOME_PATH = "home_path_rejected"
 FINDING_CONTROL_PATH = "control_root_rejected"
 FINDING_SOURCE_PROVENANCE = "source_provenance_unproved"
 FINDING_TARGET_MISMATCH = "target_mismatch"
+FINDING_BINDING_FAILED = "home_binding_failed"
+FINDING_EFFECTIVE_FAILED = "effective_binding_failed"
 
 _SUCCESS_STATUSES = frozenset(
     {STATUS_PLANNED_UPDATE, STATUS_APPLIED_UPDATE, STATUS_UNCHANGED_UPDATE}
 )
+#: Pointer states in which a generation is actually being served, and therefore
+#: the only ones in which a home binding can be prepared against it.
+_SERVING_STATUSES = SERVING_STATUSES
 
 
 def _path(value: Any) -> Path:
@@ -103,6 +120,7 @@ def _report(
     activation: Mapping[str, Any] | None = None,
     status_preflight: Mapping[str, Any] | None = None,
     binding: Mapping[str, Any] | None = None,
+    effective: Mapping[str, Any] | None = None,
     findings: Sequence[str] = (),
     warnings: Sequence[str] = (),
     error: str | None = None,
@@ -126,6 +144,7 @@ def _report(
         "verification": dict(verification or {}),
         "activation": dict(activation or {}),
         "binding": dict(binding or {}),
+        "effective_binding": dict(effective or {}),
         "status_preflight": dict(status_preflight or {}),
         "preflight": {
             "binding": dict(binding or {}),
@@ -182,6 +201,60 @@ def _binding_preflight(
     return binding, sorted(set(findings))
 
 
+def _plan_binding(
+    *, home: Path, pointer: Path, pointer_resolves: bool
+) -> tuple[dict[str, Any], list[str]]:
+    """What the service home would have to change to select this pointer.
+
+    Zero writes, and no :class:`~layered_memory_mcp.config.MemoryConfig`: a
+    preview must not create the home's directories. A home this step cannot
+    rewrite safely — a malformed or duplicated ``graph:`` section, an unknown
+    key, a conflicting explicit target — is a refusal now rather than a
+    surprise after the pointer has moved.
+
+    On a *first* update the pointer is not activated yet, so only the
+    pointer-independent half can be planned. That is reported as pending, not
+    as success: the full preparation is re-planned inside the apply.
+    """
+    if not pointer_resolves:
+        report = plan_home_config(home=home)
+        payload = report.to_payload()
+        payload["status"] = (
+            report.status if report.findings else "home_binding_pending_activation"
+        )
+        if report.findings:
+            return payload, [FINDING_BINDING_FAILED, *report.findings]
+        return payload, []
+    report = plan_home_binding(home=home, pointer=pointer)
+    payload = report.to_payload()
+    if report.status not in {BINDING_PREPARED, BINDING_UNCHANGED}:
+        return payload, [FINDING_BINDING_FAILED, *report.findings]
+    return payload, []
+
+
+def _bind_home(*, home: Path, pointer: Path) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
+    """Write the home's binding, then prove the *effective* service config.
+
+    These are reported separately on purpose: the config file, the generation
+    and the pointer do not share a transaction, and the second step is the only
+    one that can say what a server launched against this home would actually
+    resolve. An unchanged binding writes nothing, which is what makes a repeat
+    update after accepted semantic writes a genuine no-op.
+    """
+    binding = apply_home_binding(home=home, pointer=pointer)
+    payload = binding.to_payload()
+    if binding.status not in {BINDING_APPLIED, BINDING_UNCHANGED}:
+        return payload, {}, [FINDING_BINDING_FAILED, *binding.findings]
+    effective = verify_effective_binding(home=home, pointer=pointer)
+    if effective.status != BINDING_VERIFIED:
+        return (
+            payload,
+            effective.to_payload(),
+            [FINDING_EFFECTIVE_FAILED, *effective.findings],
+        )
+    return payload, effective.to_payload(), []
+
+
 def _activation_preflight(
     *, pointer: Path, generation: Path
 ) -> tuple[dict[str, Any], list[str]]:
@@ -201,17 +274,9 @@ def _status_preflight(pointer: Path) -> tuple[dict[str, Any], list[str]]:
 
 
 def _same_target_is_served(pointer: Path, generation: Path) -> bool:
-    report = status_generation(pointer=pointer)
-    if report.get("status") not in {
-        "generation_runtime_active",
-        "generation_runtime_rollback_active",
-    }:
-        return False
-    resolution = report.get("resolution") or {}
-    relative = str(resolution.get("relative_generation") or "")
-    if not relative:
-        return False
-    return _path(pointer.parent / Path(relative)) == generation
+    """One shared seam decides this, so operators cannot answer it differently."""
+    served, _ = generation_is_served(pointer=pointer, generation=generation)
+    return served
 
 
 def _source_matches_target(source: Path, generation: Path) -> tuple[bool, list[str]]:
@@ -246,11 +311,25 @@ def _preflight(
     activation, activation_findings = _activation_preflight(
         pointer=pointer, generation=destination / GENERATION_DIR
     )
+    # The home's own binding is only preparable once the pointer resolves, so
+    # it is preflighted after the activation preview rather than beside the
+    # path checks. A not-yet-activated pointer is not a binding defect.
+    preparation: dict[str, Any] = {}
+    preparation_findings: list[str] = []
+    if not status_findings and not activation_findings:
+        preparation, preparation_findings = _plan_binding(
+            home=home,
+            pointer=pointer,
+            pointer_resolves=status.get("status") in _SERVING_STATUSES,
+        )
+    binding = {**binding, "preparation": preparation}
     return (
         binding,
         status,
         activation,
-        sorted(set([*status_findings, *activation_findings])),
+        sorted(
+            set([*status_findings, *activation_findings, *preparation_findings])
+        ),
     )
 
 
@@ -301,6 +380,30 @@ def run_update(
         unchanged = dict(activation_preflight)
         unchanged["status"] = "generation_cutover_unchanged"
         unchanged["dry_run"] = not apply
+        # A no-op repeat still has to prove the *home* selects this pointer:
+        # an unchanged generation whose service configuration never named it is
+        # not a usable no-op, it is a cutover that never reached the service.
+        # An already-correct binding writes nothing, so this stays zero-write.
+        effective: dict[str, Any] = {}
+        if apply:
+            binding_payload, effective, binding_findings = _bind_home(
+                home=home_path, pointer=pointer_path
+            )
+            binding = {**binding, "preparation": binding_payload}
+            if binding_findings:
+                return _report(
+                    status=STATUS_REFUSED_UPDATE,
+                    dry_run=False,
+                    home=home_path,
+                    source=source_path,
+                    destination=destination_path,
+                    pointer=pointer_path,
+                    activation=unchanged,
+                    status_preflight=status_preflight,
+                    binding=binding,
+                    effective=effective,
+                    findings=binding_findings,
+                )
         return _report(
             status=STATUS_UNCHANGED_UPDATE,
             dry_run=not apply,
@@ -311,6 +414,7 @@ def run_update(
             activation=unchanged,
             status_preflight=status_preflight,
             binding=binding,
+            effective=effective,
         )
 
     migration = plan_migration(source=source_path, destination=destination_path)
@@ -408,13 +512,10 @@ def run_update(
             ],
         )
 
-    readback = status_generation(pointer=pointer_path)
-    resolution = readback.get("resolution") or {}
-    actual_generation = _path(pointer_path.parent / Path(str(resolution.get("relative_generation") or "")))
-    if readback.get("status") not in {
-        "generation_runtime_active",
-        "generation_runtime_rollback_active",
-    } or actual_generation != generation_path:
+    serves_target, readback = generation_is_served(
+        pointer=pointer_path, generation=generation_path
+    )
+    if not serves_target:
         return _report(
             status=STATUS_REFUSED_UPDATE,
             dry_run=False,
@@ -436,6 +537,39 @@ def run_update(
             ],
         )
 
+    # The generation is published and the pointer names it. Neither fact is
+    # visible to a server until the home's configuration selects that pointer,
+    # so the binding is prepared and then *proved* through the complete
+    # configuration the normal startup path builds. Until that proof passes,
+    # this run is not a usable update, however healthy the generation is.
+    binding_payload, effective, binding_findings = _bind_home(
+        home=home_path, pointer=pointer_path
+    )
+    binding = {**binding, "preparation": binding_payload}
+    warnings = [
+        *migration.get("warnings", []),
+        *verification.get("warnings", []),
+        *activation.get("warnings", []),
+        *readback.get("warnings", []),
+    ]
+    if binding_findings:
+        return _report(
+            status=STATUS_REFUSED_UPDATE,
+            dry_run=False,
+            home=home_path,
+            source=source_path,
+            destination=destination_path,
+            pointer=pointer_path,
+            migration=migration,
+            verification=verification,
+            activation=activation,
+            status_preflight=readback,
+            binding=binding,
+            effective=effective,
+            findings=binding_findings,
+            warnings=warnings,
+        )
+
     return _report(
         status=STATUS_APPLIED_UPDATE,
         dry_run=False,
@@ -448,12 +582,8 @@ def run_update(
         activation=activation,
         status_preflight=readback,
         binding=binding,
-        warnings=[
-            *migration.get("warnings", []),
-            *verification.get("warnings", []),
-            *activation.get("warnings", []),
-            *readback.get("warnings", []),
-        ],
+        effective=effective,
+        warnings=warnings,
     )
 
 

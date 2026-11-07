@@ -396,6 +396,9 @@ class TestIntegrateAgentWiring:
         )
         return server, host_home
 
+    # ``integrate_agent`` writes into the agent product's own home, which the
+    # graph default refuses on external-ownership grounds.
+    @pytest.mark.usefixtures("legacy_graph_mode")
     @pytest.mark.asyncio
     async def test_install_guard_action(self, _fake_host):
         server, host_home = _fake_host
@@ -405,6 +408,7 @@ class TestIntegrateAgentWiring:
         assert payload["self_test"]["ok"] is True
         assert (plugin_dir(host_home) / "guard.py").exists()
 
+    @pytest.mark.usefixtures("legacy_graph_mode")
     @pytest.mark.asyncio
     async def test_guard_status_and_remove_actions(self, _fake_host):
         server, host_home = _fake_host

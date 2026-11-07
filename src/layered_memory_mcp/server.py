@@ -28,6 +28,7 @@ import logging
 import os
 import sys
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastmcp import FastMCP
@@ -104,12 +105,22 @@ _todo_store: TodoStore | None = None
 
 
 def _get_todo_store() -> TodoStore:
+    """The readable task view.
+
+    v3.6.1: in a graph write mode this store is the ``todo`` *projection* of the
+    semantic journal rather than an independent authority — the read entrances
+    below are unchanged precisely because the projection writes the same table.
+    The path comes from ``graph_task.task_store_path`` so the MCP entrances, the
+    dashboard and the projection cannot disagree about which file it is.
+    """
     global _todo_store
     if _todo_store is None:
+        from .graph_task import task_store_path
+
         config = _get_config()
-        data_dir = config.home / "data"
-        data_dir.mkdir(parents=True, exist_ok=True)
-        _todo_store = TodoStore(data_dir / "todos.db")
+        path = task_store_path(config)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _todo_store = TodoStore(path)
     return _todo_store
 
 
@@ -450,23 +461,78 @@ def _parse_semantic_write_request(payload):
         )
 
 
-def _semantic_write_error_labels(exc: Exception) -> list[str]:
+#: The ``apply_semantic_lifecycle`` argument carrying the target-only decision.
+SEMANTIC_LIFECYCLE_REQUEST_ARG = "semantic_lifecycle_request"
+
+#: An invalid lifecycle request is a *request* error: answered before the write,
+#: so nothing is committed and nothing about the malformed payload is repaired.
+SEMANTIC_LIFECYCLE_REQUEST_ERROR = "invalid_semantic_lifecycle_request"
+
+#: A lifecycle decision is committed to the journal, so it needs a mode in which
+#: the journal owns the write path. Refused by name rather than silently applied
+#: to the legacy stores, which have no lifecycle to apply it to.
+SEMANTIC_LIFECYCLE_REQUIRES_WRITE_MODE = "graph_lifecycle_requires_write_mode"
+
+
+def _parse_semantic_lifecycle_request(payload):
+    """Validate a target-only lifecycle request. Never guess one.
+
+    Returns ``(request, refusal)`` with at most one side set, mirroring
+    :func:`_parse_semantic_write_request`: the transport shape is the model's
+    own ``to_dict()``, an already-constructed request is accepted for an
+    in-process caller, and a malformed payload is refused rather than repaired —
+    no default action is assumed and no missing target is inferred.
+    """
+    if payload is None:
+        return None, None
+
+    from pydantic import TypeAdapter
+
+    from .graph_write import SemanticLifecycleRequest
+
+    if isinstance(payload, SemanticLifecycleRequest):
+        return payload, None
+    if not isinstance(payload, dict):
+        return None, {
+            "success": False,
+            "error": SEMANTIC_LIFECYCLE_REQUEST_ERROR,
+            "error_class": "TypeError",
+            f"{SEMANTIC_LIFECYCLE_REQUEST_ARG}_errors": [
+                f"{SEMANTIC_LIFECYCLE_REQUEST_ARG}:not_an_object"
+            ],
+        }
+    try:
+        return TypeAdapter(SemanticLifecycleRequest).validate_python(payload), None
+    except Exception as exc:  # noqa: BLE001 — any validation failure is a refusal
+        return None, {
+            "success": False,
+            "error": SEMANTIC_LIFECYCLE_REQUEST_ERROR,
+            "error_class": type(exc).__name__,
+            f"{SEMANTIC_LIFECYCLE_REQUEST_ARG}_errors": _semantic_write_error_labels(
+                exc, SEMANTIC_LIFECYCLE_REQUEST_ARG
+            ),
+        }
+
+
+def _semantic_write_error_labels(exc: Exception, argument: str | None = None) -> list[str]:
     """Bounded ``<field location>:<error type>`` labels for one refusal.
 
     Deliberately the *locations* and the pydantic error types only: a validation
     message echoes the input it rejected, and the input here is the caller's own
     node body (§15). A location is enough to fix the call.
+
+    ``argument`` names the refused argument for the labels that have no field
+    location of their own, so a lifecycle refusal does not report itself under
+    the write request's name.
     """
+    name = argument or SEMANTIC_WRITE_REQUEST_ARG
     errors = getattr(exc, "errors", None)
     if not callable(errors):
-        return [f"{SEMANTIC_WRITE_REQUEST_ARG}:{type(exc).__name__}"]
+        return [f"{name}:{type(exc).__name__}"]
     labels = set()
     for entry in errors():
         location = ".".join(str(part) for part in entry.get("loc", ()))
-        labels.add(
-            f"{location or SEMANTIC_WRITE_REQUEST_ARG}:"
-            f"{entry.get('type') or 'invalid'}"
-        )
+        labels.add(f"{location or name}:{entry.get('type') or 'invalid'}")
     return sorted(labels)[:_SEMANTIC_WRITE_ERROR_LIMIT]
 
 
@@ -698,6 +764,74 @@ def _graph_authority_write(
             "projections are still pending — call recover_graph_projections()"
         )
     return payload
+
+
+#: The write-mode action name for a task decision. Deliberately distinct from
+#: the knowledge write's ``graph_committed``: a consumer branching on ``action``
+#: must be able to tell a committed *task* from a committed claim.
+GRAPH_TASK_ACTION = "graph_task_committed"
+
+
+def _graph_task_write(config: MemoryConfig, mutation) -> dict:
+    """Commit one task decision through the authority and report it.
+
+    The whole task write in a graph write mode: the typed mutation is validated,
+    committed to the journal and projected into the readable TODO view. The
+    legacy store is never written directly here — it *is* the projection — so a
+    refusal means nothing changed anywhere, and a commit means the decision is
+    durable even if the projection still has to be recovered.
+
+    The response keeps the legacy ``id`` key and adds the explicit ``task_id``
+    beside it, so an existing caller reads the same field it always did.
+    """
+    from .graph_application import (
+        GRAPH_COMMIT_COMMITTED,
+        commit_payload,
+        commit_task_mutation,
+    )
+
+    commit, record = commit_task_mutation(config, mutation, store=_graph_store)
+    task_id = record.task_id if record is not None else mutation.task_id
+    payload = {
+        "success": commit.committed,
+        "action": GRAPH_TASK_ACTION if commit.committed else commit.status,
+        "id": task_id,
+        "task_id": task_id,
+        "graph": commit_payload(commit),
+    }
+    if not commit.committed:
+        payload["error"] = commit.status
+        payload["supported_alternative"] = _graph_task_remedy(commit.status)
+    elif commit.status != GRAPH_COMMIT_COMMITTED:
+        payload["warning"] = (
+            "the task decision is committed and durable; one or more managed "
+            "projections are still pending — call recover_graph_projections()"
+        )
+    elif record is not None:
+        payload["task"] = record.to_dict()
+    return payload
+
+
+def _graph_task_remedy(status: str) -> str:
+    """What an operator can actually do about a refused task decision."""
+    from .graph_application import GRAPH_TASK_AUTHORITY_UNSEEDED, GRAPH_TASK_UNKNOWN
+
+    if status == GRAPH_TASK_UNKNOWN:
+        return (
+            "call list_todos() for the ids the authority holds; a task that was "
+            "deleted stays in the journal as history and cannot be mutated again"
+        )
+    if status == GRAPH_TASK_AUTHORITY_UNSEEDED:
+        return (
+            "the readable TODO store holds tasks this journal has no authority "
+            "for; seed them first with layered_memory_mcp.graph_application."
+            "seed_task_authority(config, apply=True) — nothing was written, and "
+            "no existing task was rebuilt away"
+        )
+    return (
+        "fix the refused part of the decision and retry; nothing was written to "
+        "the journal, the graph or the readable task view"
+    )
 
 
 def _batch_item(item) -> dict | None:
@@ -2863,9 +2997,30 @@ async def approve_knowledge(
     Returns:
         JSON with approval result.
     """
-    refusal = _graph_mutation_refusal("approve_knowledge")
-    if refusal is not None:
-        return json.dumps(refusal, ensure_ascii=False, indent=2)
+    config = _get_config()
+    if config.graph_write_enabled:
+        from .graph_application import commit_payload, commit_semantic_lifecycle
+        from .graph_write import REVIEW_EVENT_NAMESPACE, SemanticLifecycleRequest
+
+        request = SemanticLifecycleRequest(
+            target_id=entry_id,
+            action="approve",
+            occurred_at=datetime.now(timezone.utc),
+            request_key=f"approve:{entry_id}",
+            event_namespace=REVIEW_EVENT_NAMESPACE,
+            reviewer=reviewer,
+            note=note,
+        )
+        commit = commit_semantic_lifecycle(config, request, store=_graph_store)
+        payload = {
+            "success": commit.committed,
+            "action": "approved" if commit.committed else "approve",
+            "id": entry_id,
+            "graph": commit_payload(commit),
+        }
+        if not commit.committed:
+            payload["error"] = commit.status
+        return json.dumps(payload, ensure_ascii=False, indent=2)
 
     stores = _get_v2_stores()
     result = stores["review"].approve(entry_id, reviewer=reviewer, note=note)
@@ -2906,9 +3061,30 @@ async def reject_knowledge(
     Returns:
         JSON with rejection result.
     """
-    refusal = _graph_mutation_refusal("reject_knowledge")
-    if refusal is not None:
-        return json.dumps(refusal, ensure_ascii=False, indent=2)
+    config = _get_config()
+    if config.graph_write_enabled:
+        from .graph_application import commit_payload, commit_semantic_lifecycle
+        from .graph_write import REVIEW_EVENT_NAMESPACE, SemanticLifecycleRequest
+
+        request = SemanticLifecycleRequest(
+            target_id=entry_id,
+            action="reject",
+            occurred_at=datetime.now(timezone.utc),
+            request_key=f"reject:{entry_id}",
+            event_namespace=REVIEW_EVENT_NAMESPACE,
+            reviewer=reviewer,
+            note=note,
+        )
+        commit = commit_semantic_lifecycle(config, request, store=_graph_store)
+        payload = {
+            "success": commit.committed,
+            "action": "rejected" if commit.committed else "reject",
+            "id": entry_id,
+            "graph": commit_payload(commit),
+        }
+        if not commit.committed:
+            payload["error"] = commit.status
+        return json.dumps(payload, ensure_ascii=False, indent=2)
 
     stores = _get_v2_stores()
     result = stores["review"].reject(entry_id, reviewer=reviewer, note=note)
@@ -3507,13 +3683,41 @@ async def integrate_agent(action: str = "status") -> str:
 
 @mcp.tool()
 async def add_todo(domain: str, content: str, title: str = "", blocked_by: str = "[]", priority: str = "medium", notes: str = "", source_session_id: str = "") -> str:
-    """Add a new TODO item."""
-    refusal = _graph_mutation_refusal("add_todo")
-    if refusal is not None:
-        return json.dumps(refusal, ensure_ascii=False, indent=2)
+    """Add a new TODO item.
 
+    v3.6.1: in a graph write mode this commits a typed task decision through the
+    semantic journal and the readable task view is republished from it. The
+    response keeps `id` and adds `task_id` beside it. In `legacy` mode the TODO
+    store remains authoritative and nothing here changes.
+    """
     import json as _json
     from datetime import datetime, timezone
+
+    config = _get_config()
+    if config.graph_write_enabled:
+        from .graph_task import TASK_ACTION_ADD, TaskMutation, new_task_id
+
+        try:
+            blocked = _json.loads(blocked_by) if isinstance(blocked_by, str) else blocked_by
+            mutation = TaskMutation(
+                action=TASK_ACTION_ADD,
+                task_id=new_task_id(),
+                domain=domain,
+                content=content,
+                title=title,
+                priority=priority,
+                blocked_by=list(blocked or []),
+                notes=notes,
+                source_session_id=source_session_id or None,
+                occurred_at=datetime.now(timezone.utc),
+            )
+        except Exception as exc:
+            return _json.dumps(
+                {"success": False, "error": str(exc)}, ensure_ascii=False, indent=2
+            )
+        committed = await asyncio.to_thread(_graph_task_write, config, mutation)
+        return _json.dumps(committed, ensure_ascii=False, indent=2)
+
     store = _get_todo_store()
     try:
         blocked = _json.loads(blocked_by) if isinstance(blocked_by, str) else blocked_by
@@ -3536,7 +3740,12 @@ async def add_todo(domain: str, content: str, title: str = "", blocked_by: str =
 
 @mcp.tool()
 async def list_todos(status: str = "", domain: str = "", priority: str = "", limit: int = 50) -> str:
-    """List TODOs with optional filtering by status, domain, priority."""
+    """List TODOs with optional filtering by status, domain, priority.
+
+    In a graph write mode this reads the journal-backed `todo` projection — the
+    same table, republished from the semantic journal — so a task added, changed
+    or deleted through a committed decision is what shows up here.
+    """
     store = _get_todo_store()
     todos = store.list(status=status or None, domain=domain or None, priority=priority or None, limit=limit)
     return json.dumps({"success": True, "count": len(todos), "todos": todos}, ensure_ascii=False, indent=2)
@@ -3544,12 +3753,46 @@ async def list_todos(status: str = "", domain: str = "", priority: str = "", lim
 
 @mcp.tool()
 async def update_todo(todo_id: str, status: str = "", priority: str = "", title: str = "", content: str = "", blocked_by: str = "", notes: str = "") -> str:
-    """Update a TODO item's status, priority, content, or notes."""
-    refusal = _graph_mutation_refusal("update_todo")
-    if refusal is not None:
-        return json.dumps(refusal, ensure_ascii=False, indent=2)
+    """Update a TODO item's status, priority, content, or notes.
 
+    v3.6.1: in a graph write mode this commits a new task *version* with a
+    SUPERSEDES decision, exactly as a revised claim is written, and the readable
+    view is republished from the journal. The terminal timestamps belong to the
+    transition: completing a task stamps `completed_at`, and reopening one
+    clears it. An unknown id is refused before the journal, so a mistyped id
+    leaves no event behind.
+    """
     import json as _json
+
+    config = _get_config()
+    if config.graph_write_enabled:
+        from datetime import datetime, timezone
+
+        from .graph_task import TASK_ACTION_UPDATE, TaskMutation
+
+        try:
+            mutation = TaskMutation(
+                action=TASK_ACTION_UPDATE,
+                task_id=todo_id,
+                status=status,
+                priority=priority,
+                title=title,
+                content=content,
+                blocked_by=(
+                    (_json.loads(blocked_by) if isinstance(blocked_by, str) else blocked_by)
+                    if blocked_by
+                    else None
+                ),
+                notes=notes if notes else None,
+                occurred_at=datetime.now(timezone.utc),
+            )
+        except Exception as exc:
+            return _json.dumps(
+                {"success": False, "error": str(exc)}, ensure_ascii=False, indent=2
+            )
+        committed = await asyncio.to_thread(_graph_task_write, config, mutation)
+        return _json.dumps(committed, ensure_ascii=False, indent=2)
+
     store = _get_todo_store()
     kwargs = {}
     if status:
@@ -3570,10 +3813,33 @@ async def update_todo(todo_id: str, status: str = "", priority: str = "", title:
 
 @mcp.tool()
 async def delete_todo(todo_id: str) -> str:
-    """Delete a TODO item by ID."""
-    refusal = _graph_mutation_refusal("delete_todo")
-    if refusal is not None:
-        return json.dumps(refusal, ensure_ascii=False, indent=2)
+    """Delete a TODO item by ID.
+
+    v3.6.1: in a graph write mode this retracts the task's current version — a
+    target-only lifecycle decision, so nothing is invented to express it — and
+    the readable view is republished without it. The task's history stays in the
+    journal; "deleted" means "no longer current", not "erased".
+    """
+    import json as _json
+
+    config = _get_config()
+    if config.graph_write_enabled:
+        from datetime import datetime, timezone
+
+        from .graph_task import TASK_ACTION_DELETE, TaskMutation
+
+        try:
+            mutation = TaskMutation(
+                action=TASK_ACTION_DELETE,
+                task_id=todo_id,
+                occurred_at=datetime.now(timezone.utc),
+            )
+        except Exception as exc:
+            return _json.dumps(
+                {"success": False, "error": str(exc)}, ensure_ascii=False, indent=2
+            )
+        committed = await asyncio.to_thread(_graph_task_write, config, mutation)
+        return _json.dumps(committed, ensure_ascii=False, indent=2)
 
     store = _get_todo_store()
     result = store.delete(todo_id)
@@ -3787,6 +4053,104 @@ async def graph_memory_status() -> str:
 
     result = await asyncio.to_thread(runtime_status, _get_config(), store=_graph_store)
     return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def apply_semantic_lifecycle(semantic_lifecycle_request: dict | None = None) -> str:
+    """Retract, restore or approve a memory that already exists.
+
+    The target-only semantic decision. Deleting a claim does **not** require
+    inventing a superseding node with content nobody decided: this request
+    carries a target, an action and a timestamp, and no node at all. The
+    readable consequences follow from the replay — the target stops being
+    current, so the L1 section it owns is retired and its vector row stops being
+    an answer — rather than from a fabricated replacement.
+
+    An *update* is deliberately not an action here: a changed memory is an
+    explicit new version plus a SUPERSEDES decision through
+    `inject_knowledge_tool`, so the old version is kept as history rather than
+    edited away.
+
+    Args:
+        semantic_lifecycle_request: The decision, as
+            `graph_write.SemanticLifecycleRequest(...).to_dict()`:
+            `{target_id, action, occurred_at, request_key, event_namespace,
+            scope}`. `action` is one of `retract`, `restore`, `approve`.
+
+    Returns:
+        JSON: {success, action, target_id, graph:{status, committed, …}}.
+        Refused — with nothing written anywhere — when the mode is not a graph
+        write mode, when the request is malformed, when the target is unknown,
+        when its scope disagrees with the decision's, when its current status
+        cannot take the transition, or when a restore would leave one readable
+        section with two current owners.
+    """
+    from .graph_application import (
+        GRAPH_COMMIT_COMMITTED,
+        commit_payload,
+        commit_semantic_lifecycle,
+    )
+
+    config = _get_config()
+    if not config.graph_write_enabled:
+        return json.dumps(
+            {
+                "success": False,
+                "error": SEMANTIC_LIFECYCLE_REQUIRES_WRITE_MODE,
+                "graph_mode": config.graph_mode,
+                "supported_alternative": (
+                    "a lifecycle decision is committed to the semantic journal, "
+                    "which only owns the write path in graph_write/graph mode; in "
+                    "legacy mode the L1 entrances remain authoritative"
+                ),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    request, refusal = _parse_semantic_lifecycle_request(semantic_lifecycle_request)
+    if refusal is not None:
+        return json.dumps(refusal, ensure_ascii=False, indent=2)
+    if request is None:
+        return json.dumps(
+            {
+                "success": False,
+                "error": SEMANTIC_LIFECYCLE_REQUEST_ERROR,
+                f"{SEMANTIC_LIFECYCLE_REQUEST_ARG}_errors": [
+                    f"{SEMANTIC_LIFECYCLE_REQUEST_ARG}:missing"
+                ],
+                "supported_alternative": (
+                    "pass semantic_lifecycle_request={target_id, action, "
+                    "occurred_at, request_key}: the framework never derives a "
+                    "retraction target from content"
+                ),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    commit = await asyncio.to_thread(
+        commit_semantic_lifecycle, config, request, store=_graph_store
+    )
+    payload = {
+        "success": commit.committed,
+        "action": request.action,
+        "target_id": request.target_id,
+        "graph": commit_payload(commit),
+    }
+    if not commit.committed:
+        payload["error"] = commit.status
+        payload["supported_alternative"] = (
+            "fix the refused part of the decision and retry with the same "
+            "request key; nothing was written to the journal, the graph, L1, "
+            "the vector rows or L0"
+        )
+    elif commit.status != GRAPH_COMMIT_COMMITTED:
+        payload["warning"] = (
+            "the decision is committed and durable; one or more managed "
+            "projections are still pending — call recover_graph_projections()"
+        )
+    return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()

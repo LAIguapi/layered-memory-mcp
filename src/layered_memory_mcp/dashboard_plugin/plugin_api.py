@@ -74,11 +74,41 @@ _todo_store: TodoStore | None = None
 def _get_todo_store() -> TodoStore:
     global _todo_store
     if _todo_store is None:
+        from layered_memory_mcp.graph_task import task_store_path
+
         config = _get_config()
-        data_dir = config.home / "data"
-        data_dir.mkdir(parents=True, exist_ok=True)
-        _todo_store = TodoStore(data_dir / "todos.db")
+        path = task_store_path(config)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _todo_store = TodoStore(path)
     return _todo_store
+
+
+def _commit_task_status(config, todo_id: str, status: str) -> dict:
+    """Commit one dashboard status change through the semantic authority.
+
+    The same typed decision the MCP entrance commits, through the same
+    application layer — not a second task write path. The verdict is returned as
+    the endpoint's own ``{"success", "error"}`` shape so its response contract
+    is unchanged; what changed is which authority answered.
+    """
+    from datetime import datetime, timezone
+
+    from layered_memory_mcp.graph_application import commit_task_mutation
+    from layered_memory_mcp.graph_task import TASK_ACTION_UPDATE, TaskMutation
+
+    try:
+        mutation = TaskMutation(
+            action=TASK_ACTION_UPDATE,
+            task_id=todo_id,
+            status=status,
+            occurred_at=datetime.now(timezone.utc),
+        )
+    except Exception as exc:  # noqa: BLE001 — a refused shape is a response
+        return {"success": False, "error": str(exc)}
+    commit, _record = commit_task_mutation(config, mutation)
+    if not commit.committed:
+        return {"success": False, "error": commit.status}
+    return {"success": True, "id": todo_id, "graph_status": commit.status}
 
 
 # ── Pydantic models ───────────────────────────────────────────────────
@@ -496,9 +526,14 @@ async def get_todos(
 
 @router.post("/update-todo")
 async def update_todo_endpoint(req: UpdateTodoRequest):
-    """Update a TODO item status. Supports dry-run preview."""
+    """Update a TODO item status. Supports dry-run preview.
+
+    v3.6.1: in a graph write mode this commits a typed task decision through the
+    semantic journal, exactly as the MCP entrance does, and the readable view is
+    republished from it. It is no longer refused — the capability exists — and
+    the dry-run preview still writes nothing in either mode.
+    """
     _check_imports()
-    _graph_mutation_guard("dashboard_update_todo", req.dry_run)
 
     if req.dry_run:
         return {
@@ -509,6 +544,9 @@ async def update_todo_endpoint(req: UpdateTodoRequest):
         }
 
     def _update():
+        config = _get_config()
+        if getattr(config, "graph_write_enabled", False):
+            return _commit_task_status(config, req.todo_id, req.status)
         todo_store = _get_todo_store()
         # Return the store's verdict instead of discarding it (v3.4.6): this endpoint
         # used to answer "TODO updated successfully." even when the id matched no row.

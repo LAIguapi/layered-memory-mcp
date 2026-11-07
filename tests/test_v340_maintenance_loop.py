@@ -139,7 +139,19 @@ class TestFactory:
             loop.stop()
 
 
+@pytest.mark.usefixtures("legacy_graph_mode")
 class TestTaskComposition:
+    """How the maintenance tick composes its jobs.
+
+    Legacy-contract: under the ``graph`` rollout default every job this tick
+    runs — ``auto_maintain``, ``vector_maintenance`` and
+    ``write_guard_refresh`` — is a *reported suspension* instead
+    (``graph_mutation_guard.MAINTENANCE_JOBS``), so there is no composition
+    left to observe. The suspended tick is covered by
+    ``test_v361_graph_maintenance_bypass.py``; the loop, factory and config
+    tests in this file stay on the default, because they are mode-independent.
+    """
+
     def test_runs_auto_maintain_and_refreshes_the_guard(self, tmp_path, monkeypatch):
         cfg = _mk_config(tmp_path, write_guard="auto")
         calls = {}

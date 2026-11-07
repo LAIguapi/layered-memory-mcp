@@ -219,6 +219,38 @@ HISTORICAL_NODE_STATUSES: tuple[NodeStatus, ...] = (
     NodeStatus.ARCHIVED,
 )
 
+#: The §8.2 lifecycle table, as data: event kind -> (resulting node status, the
+#: statuses it may be applied from). Vocabulary rather than one store's policy,
+#: and deliberately a *single* table: the projection applies it
+#: (:mod:`~layered_memory_mcp.graph_fixture_store`, which every backend stages
+#: through) and the write seam validates a target-only request against it
+#: (:func:`~layered_memory_mcp.graph_write.plan_semantic_lifecycle`). A second
+#: copy is exactly how "the planner accepted a transition the projection then
+#: ignored" becomes possible.
+#:
+#: A transition that does not apply is *reported*, never forced, so a replayed
+#: ledger cannot quietly invent a state the original transitions never produced.
+#: ``RETRACT`` is the only kind that also applies to an edge (§6.2: an edge is
+#: asserted or withdrawn), which the projection handles separately.
+#:
+#: ``SUPERSEDE`` is here because a replay must apply it, and it is still not an
+#: action a target-only request may ask for: a supersession without the
+#: replacement it declares would retire a memory with nothing taking its place.
+NODE_LIFECYCLE_TRANSITIONS: dict[
+    MemoryEventKind, tuple[NodeStatus, tuple[NodeStatus, ...]]
+] = {
+    MemoryEventKind.APPROVE: (NodeStatus.ACTIVE, (NodeStatus.PENDING,)),
+    MemoryEventKind.SUPERSEDE: (
+        NodeStatus.SUPERSEDED,
+        (NodeStatus.ACTIVE, NodeStatus.PENDING),
+    ),
+    MemoryEventKind.RETRACT: (
+        NodeStatus.RETRACTED,
+        tuple(s for s in NodeStatus if s is not NodeStatus.RETRACTED),
+    ),
+    MemoryEventKind.RESTORE: (NodeStatus.ACTIVE, tuple(HISTORICAL_NODE_STATUSES)),
+}
+
 #: The :class:`SourceRef` fields that actually say *where* the evidence is. A
 #: quote hash proves integrity but locates nothing, so it is not on this list.
 SOURCE_LOCATOR_FIELDS: tuple[str, ...] = (

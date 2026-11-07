@@ -96,6 +96,9 @@ class TestBackups:
         assert dedup_l1_file(fp, cfg)["action"] == "deduped"
         assert _bak_siblings(cfg.knowledge_dir) == []
 
+    # ``update_knowledge_file`` is refused by the graph default (L1 is a
+    # projection there), so its out-of-tree backup is a legacy-mode contract.
+    @pytest.mark.usefixtures("legacy_graph_mode")
     @pytest.mark.asyncio
     async def test_update_knowledge_file_backs_up_out_of_tree(self, tmp_path, monkeypatch):
         import layered_memory_mcp.server as srv
@@ -213,6 +216,8 @@ class TestPostWriteGovernance:
         gov = post_write_governance(cfg, "ghost", cfg.knowledge_dir / "ghost.md")
         assert "error" in gov
 
+    # Same reason: the governance payload rides on a legacy whole-file create.
+    @pytest.mark.usefixtures("legacy_graph_mode")
     @pytest.mark.asyncio
     async def test_create_attaches_governance(self, tmp_path, monkeypatch):
         import layered_memory_mcp.server as srv

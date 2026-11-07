@@ -238,25 +238,42 @@ def _extract_heading_title(line: str) -> str:
 
 
 def extract_relevant_sections(keyword: str, content: str, max_sections: int = 3) -> list[dict]:
-    """Extract markdown sections (any heading level) containing the keyword."""
+    """Extract markdown sections (any heading level) containing the keyword.
+
+    Each returned fragment also declares which H2 surface *owns* it, under
+    ``owner_section``/``owner_occurrence`` (v3.6.1). This split on any heading
+    level — plus the synthetic "Overview"/"Untitled" titles — is a display
+    shape, so it cannot carry a projection identity of its own; what it *can*
+    say truthfully is which H2 block it was found inside. That is what lets the
+    graph layer drop a fragment belonging to a retracted, expired or
+    out-of-namespace section while keeping its surviving siblings in the same
+    file (see ``graph_search``). A fragment above the first H2 belongs to no H2
+    and says so with ``owner_section = None``.
+    """
     sections: list[dict] = []
+    owners = _h2_owner_by_line(content)
     current_title = None
     current_lines: list[str] = []
     current_matched = False
+    current_line_no = 0
 
     def flush():
         if current_matched and current_lines:
+            owner, occurrence = owners[current_line_no] if current_line_no < len(owners) else (None, 0)
             sections.append({
                 "title": current_title or "Untitled",
                 "content": "\n".join(current_lines).strip(),
+                "owner_section": owner,
+                "owner_occurrence": occurrence,
             })
 
-    for line in content.split("\n"):
+    for line_no, line in enumerate(content.split("\n")):
         if line.startswith("#") and _HEADING_RE.match(line):
             flush()
             current_title = _extract_heading_title(line)
             current_lines = [line]
             current_matched = False
+            current_line_no = line_no
         else:
             if current_title is None and line.strip() and not line.startswith("#"):
                 current_title = "Overview"
@@ -267,6 +284,36 @@ def extract_relevant_sections(keyword: str, content: str, max_sections: int = 3)
 
     flush()
     return sections[:max_sections]
+
+
+def _h2_owner_by_line(content: str) -> list[tuple[str | None, int]]:
+    """Per line, the ``(H2 label, occurrence)`` that owns it — or ``(None, 0)``.
+
+    Occurrence counts *bodyful* H2 blocks with the same label, which is the
+    canonical projection rule (``injector._bodyful_sections``, and therefore
+    ``graph_search.keyword_section_seeds``): a bodyless heading mints no entry
+    identity, so it must not consume an occurrence either, or every later
+    section with the same label would be attributed to the wrong entry.
+    """
+    lines = content.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    starts = [
+        index
+        for index, line in enumerate(lines)
+        if line.startswith("## ")
+    ]
+    owners: list[tuple[str | None, int]] = [(None, 0)] * len(lines)
+    seen: dict[str, int] = {}
+    for position, start in enumerate(starts):
+        end = starts[position + 1] if position + 1 < len(starts) else len(lines)
+        label = lines[start].lstrip("#").strip()
+        bodyful = bool("\n".join(lines[start + 1 : end]).strip())
+        if not label or not bodyful:
+            continue
+        occurrence = seen.get(label, 0)
+        seen[label] = occurrence + 1
+        for index in range(start, end):
+            owners[index] = (label, occurrence)
+    return owners
 
 
 # ---------------------------------------------------------------------------

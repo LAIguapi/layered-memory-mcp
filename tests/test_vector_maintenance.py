@@ -1,4 +1,22 @@
-"""Derived-vector consistency, failure preservation and maintenance regressions."""
+"""Derived-vector consistency, failure preservation and maintenance regressions.
+
+Most of this file is mode-independent: projection identity, locking, source
+validation and store lifecycle behave the same whoever owns the write path, and
+those tests run under the ``graph`` rollout default.
+
+Two groups do not, and each one asks for ``legacy_graph_mode`` by name:
+
+* ``maintenance.maintain_vectors`` — the unattended twin of
+  ``reindex_vector_store_tool``. Under the graph default it is a *reported
+  suspension* (``graph_mutation_guard.MAINTENANCE_JOBS``), because rebuilding
+  the vector rows from the L1 files they were projected onto would overwrite a
+  projection the semantic journal owns;
+* the whole-file MCP writers ``create_knowledge_file`` / ``update_knowledge_file``,
+  which the graph default refuses before mutating.
+
+Both suspensions/refusals are covered in graph mode by
+``test_v361_graph_maintenance_bypass.py`` and ``test_v361_graph_entrances.py``.
+"""
 
 import json
 import sqlite3
@@ -247,6 +265,7 @@ def test_existing_reader_sees_replacement_from_another_store(cfg):
     assert "size=24" in reader.search("pool")[0]["text"]
 
 
+@pytest.mark.usefixtures("legacy_graph_mode")  # whole-file writers; see module docstring
 @pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ["create", "update", "inject"])
 async def test_mcp_writers_pass_current_source_to_sync(cfg, monkeypatch, operation):
@@ -275,6 +294,7 @@ async def test_mcp_writers_pass_current_source_to_sync(cfg, monkeypatch, operati
     assert injector.vector_store_needs_reindex(cfg) is False
 
 
+@pytest.mark.usefixtures("legacy_graph_mode")  # maintain_vectors; see module docstring
 def test_maintenance_repairs_once_then_healthy_ticks_do_not_embed(cfg, monkeypatch):
     from layered_memory_mcp import maintenance, memory_compactor
 
@@ -292,6 +312,7 @@ def test_maintenance_repairs_once_then_healthy_ticks_do_not_embed(cfg, monkeypat
     assert maintenance.maintenance_task(cfg)["vector_maintenance"]["status"] == "healthy"
 
 
+@pytest.mark.usefixtures("legacy_graph_mode")  # maintain_vectors; see module docstring
 def test_maintenance_failure_backoff_and_retry_preserve_old_rows(cfg, monkeypatch):
     from layered_memory_mcp import maintenance, memory_compactor
 
@@ -323,6 +344,7 @@ def test_maintenance_failure_backoff_and_retry_preserve_old_rows(cfg, monkeypatc
     assert injector.vector_store_needs_reindex(cfg) is False
 
 
+@pytest.mark.usefixtures("legacy_graph_mode")  # maintain_vectors; see module docstring
 def test_maintenance_inspection_error_is_explicit_and_disabled_is_noop(cfg, monkeypatch):
     from layered_memory_mcp import maintenance, memory_compactor
 
@@ -339,6 +361,7 @@ def test_maintenance_inspection_error_is_explicit_and_disabled_is_noop(cfg, monk
     assert maintenance.maintenance_task(cfg)["vector_maintenance"]["status"] == "disabled"
 
 
+@pytest.mark.usefixtures("legacy_graph_mode")  # maintain_vectors; see module docstring
 def test_maintenance_overlap_is_deferred(cfg, monkeypatch):
     from filelock import FileLock
     from layered_memory_mcp import maintenance, memory_compactor
@@ -421,6 +444,7 @@ def test_arbitrary_domain_pull_scan_does_not_expand_write_scan(cfg, monkeypatch)
     assert promotion.detect_promotion_candidate(cfg, "project-zeta", path) is None
 
 
+@pytest.mark.usefixtures("legacy_graph_mode")  # maintain_vectors; see module docstring
 @pytest.mark.parametrize("interval,expected", [(0, 1800), (1, 30), (120, 120),
                                                (float("nan"), 1800), (float("inf"), 1800)])
 def test_loop_and_vector_retry_share_interval_resolution(cfg, monkeypatch, interval, expected):
@@ -435,6 +459,7 @@ def test_loop_and_vector_retry_share_interval_resolution(cfg, monkeypatch, inter
     assert report["next_attempt"] == 1000 + expected
 
 
+@pytest.mark.usefixtures("legacy_graph_mode")  # maintain_vectors; see module docstring
 def test_maintenance_projects_changes_from_same_tick_compaction(cfg, monkeypatch):
     from layered_memory_mcp import maintenance, memory_compactor
 
@@ -451,6 +476,7 @@ def test_maintenance_projects_changes_from_same_tick_compaction(cfg, monkeypatch
     assert injector.vector_store_needs_reindex(cfg) is False
 
 
+@pytest.mark.usefixtures("legacy_graph_mode")  # whole-file writers; see module docstring
 @pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ["create", "update"])
 async def test_mcp_file_writes_surface_vector_failure(cfg, monkeypatch, operation):
@@ -603,6 +629,7 @@ def test_add_validates_source_even_before_newer_vectors_exist(cfg, monkeypatch, 
         assert injector.vector_store_needs_reindex(cfg) is False
 
 
+@pytest.mark.usefixtures("legacy_graph_mode")  # maintain_vectors; see module docstring
 @pytest.mark.parametrize("frontmatter", [False, True])
 def test_stable_frontmatter_id_drift_is_repaired_without_random_h2_false_alarm(cfg, frontmatter):
     from layered_memory_mcp import maintenance

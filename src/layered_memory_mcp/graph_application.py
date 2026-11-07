@@ -63,7 +63,9 @@ from .graph_journal import (
     PROJECTION_L0,
     PROJECTION_L1,
     PROJECTION_NAMES,
+    PROJECTION_TODO,
     PROJECTION_VECTOR,
+    REQUEST_KIND_BOOTSTRAP,
     REQUEST_KIND_SEMANTIC_WRITE,
     JournalConflictError,
     MemoryEventJournal,
@@ -83,7 +85,15 @@ from .graph_runtime_assembly import (
     resolve_journal_database_path,
 )
 from .graph_store import missing_graph_store_operations
-from .graph_write import SUPERSEDABLE_STATUSES, SemanticWriteRequest, plan_semantic_write
+from .graph_task import TaskMutation, TaskRecord
+from .graph_write import (
+    SUPERSEDABLE_STATUSES,
+    REVIEW_EVENT_NAMESPACE,
+    SemanticLifecycleRequest,
+    SemanticWriteRequest,
+    plan_semantic_lifecycle,
+    plan_semantic_write,
+)
 
 __all__ = [
     "GRAPH_COMMIT_COMMITTED",
@@ -97,20 +107,32 @@ __all__ = [
     "GRAPH_COMMIT_REJECTED_REQUEST",
     "GRAPH_COMMIT_REJECTED_SURFACE",
     "GRAPH_COMMIT_REJECTED_UNSUPPORTED_SURFACE",
+    "GRAPH_TASK_AUTHORITY_UNSEEDED",
+    "GRAPH_TASK_UNKNOWN",
+    "PROJECTION_DEPENDENCIES",
     "PROJECTION_STORE_ABSENT",
     "RECOVERY_INCOMPLETE",
     "RECOVERY_NOTHING_PENDING",
     "RECOVERY_NOT_CONFIGURED",
     "RECOVERY_OK",
+    "TASK_SEED_APPLIED",
+    "TASK_SEED_NOTHING_TO_DO",
+    "TASK_SEED_PREVIEW",
     "ProjectionBinding",
     "RecoveryReport",
     "SemanticCommit",
+    "TaskAuthority",
+    "TaskSeedReport",
+    "commit_semantic_lifecycle",
     "commit_semantic_write",
+    "commit_task_mutation",
     "commit_payload",
     "pending_surface_entry_ids",
     "recover_projections",
     "runtime_status",
+    "seed_task_authority",
     "stale_surface_entry_ids",
+    "task_authority",
 ]
 
 # ---------------------------------------------------------------------------
@@ -160,10 +182,24 @@ GRAPH_COMMIT_REJECTED_DRIFT = "graph_write_rejected_surface_drift"
 #: A graph exists that this journal never produced. Refused, never erased.
 GRAPH_COMMIT_REJECTED_ADOPTION = "graph_write_rejected_unknown_graph"
 
+#: The task a mutation names is not one the authority holds. A refusal before
+#: the journal: nothing is appended, so a mistyped id leaves no partial event.
+GRAPH_TASK_UNKNOWN = "graph_task_unknown"
+
+#: The readable TODO store holds tasks this journal has no authority for. The
+#: mutation is refused *before* the journal rather than committed into a
+#: projection that would then refuse to publish — the operator's next step is
+#: the explicit seed, not a retry.
+GRAPH_TASK_AUTHORITY_UNSEEDED = "graph_task_authority_not_seeded"
+
 RECOVERY_OK = "graph_recovery_complete"
 RECOVERY_INCOMPLETE = "graph_recovery_incomplete"
 RECOVERY_NOTHING_PENDING = "graph_recovery_nothing_pending"
 RECOVERY_NOT_CONFIGURED = "graph_recovery_not_configured"
+
+TASK_SEED_APPLIED = "graph_task_seed_applied"
+TASK_SEED_PREVIEW = "graph_task_seed_preview"
+TASK_SEED_NOTHING_TO_DO = "graph_task_seed_nothing_to_do"
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +229,12 @@ class SemanticCommit(GraphModel):
     superseded_ids: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
+    #: Whether the readable L1 surface this decision publishes to actually
+    #: carries it now. Separate from ``committed`` on purpose: a commit whose
+    #: file write failed is durable and *not* readable, and a response in which
+    #: those two were one field is exactly how a surface whose bytes never
+    #: landed became indistinguishable from one that published cleanly.
+    surface_published: bool = False
 
     @property
     def ok(self) -> bool:
@@ -218,6 +260,7 @@ def commit_payload(commit: SemanticCommit) -> dict[str, Any]:
         "duplicate": commit.duplicate,
         "node_id": commit.node_id,
         "entry_id": commit.entry_id,
+        "surface_published": commit.surface_published,
         "event_ids": list(commit.event_ids),
         "superseded_ids": list(commit.superseded_ids),
         "head_position": commit.head_position,
@@ -299,7 +342,7 @@ def _rejected(status: str, *, errors: Sequence[str] = (), **fields: Any) -> Sema
 def commit_semantic_write(
     config: Any,
     request: SemanticWriteRequest,
-    binding: ProjectionBinding,
+    binding: ProjectionBinding | None,
     *,
     request_id: str = "",
     store: Any | None = None,
@@ -313,7 +356,11 @@ def commit_semantic_write(
         request: The caller's already-decided
             :class:`~layered_memory_mcp.graph_write.SemanticWriteRequest`.
         binding: Which readable L1 section this decision publishes, and the
-            exact body being published.
+            exact body being published. ``None`` for a node kind that has no
+            readable L1 surface — today a ``TASK``, whose readable form is the
+            ``todo`` projection — in which case the surface binding, ownership
+            and body-agreement checks are inapplicable rather than skipped.
+            Every entrance that writes knowledge passes one.
         request_id: The stable retry identity. Defaults to
             ``<event namespace>:<request key>``, which is stable for one
             decision and different for a different one.
@@ -354,40 +401,43 @@ def commit_semantic_write(
             errors=["graph_journal_not_configured"],
         )
 
-    # 2. Purely local validation, before anything is opened or touched.
-    try:
-        binding.entry_id
-    except ProjectionIdentityError as exc:
-        # A blank, multi-line or non-string domain/section cannot name a
-        # surface. Refused by name rather than trimmed into an identity the
-        # source never had.
-        return _rejected(
-            GRAPH_COMMIT_REJECTED_BINDING,
-            request_id=identity,
-            node_id=request.node.id,
-            errors=[f"binding_identity_invalid:{exc}"],
-        )
+    # 2. Purely local validation, before anything is opened or touched. All of
+    #    it is about the readable surface, so a decision that publishes to none
+    #    has nothing to validate here.
+    if binding is not None:
+        try:
+            binding.entry_id
+        except ProjectionIdentityError as exc:
+            # A blank, multi-line or non-string domain/section cannot name a
+            # surface. Refused by name rather than trimmed into an identity the
+            # source never had.
+            return _rejected(
+                GRAPH_COMMIT_REJECTED_BINDING,
+                request_id=identity,
+                node_id=request.node.id,
+                errors=[f"binding_identity_invalid:{exc}"],
+            )
 
-    if request.node.content.strip() != binding.normalized_body:
-        return _rejected(
-            GRAPH_COMMIT_REJECTED_BINDING,
-            request_id=identity,
-            node_id=request.node.id,
-            entry_id=binding.entry_id,
-            errors=[f"binding_body_mismatch:{binding.entry_id}"],
-        )
+        if request.node.content.strip() != binding.normalized_body:
+            return _rejected(
+                GRAPH_COMMIT_REJECTED_BINDING,
+                request_id=identity,
+                node_id=request.node.id,
+                entry_id=binding.entry_id,
+                errors=[f"binding_body_mismatch:{binding.entry_id}"],
+            )
 
-    path = graph_projection.domain_path(config, binding.domain)
-    if path.exists() and graph_projection.has_frontmatter_entry(
-        path.read_text(encoding="utf-8")
-    ):
-        return _rejected(
-            GRAPH_COMMIT_REJECTED_UNSUPPORTED_SURFACE,
-            request_id=identity,
-            node_id=request.node.id,
-            entry_id=binding.entry_id,
-            errors=[f"{graph_projection.SURFACE_UNSUPPORTED}:{binding.entry_id}"],
-        )
+        path = graph_projection.domain_path(config, binding.domain)
+        if path.exists() and graph_projection.has_frontmatter_entry(
+            path.read_text(encoding="utf-8")
+        ):
+            return _rejected(
+                GRAPH_COMMIT_REJECTED_UNSUPPORTED_SURFACE,
+                request_id=identity,
+                node_id=request.node.id,
+                entry_id=binding.entry_id,
+                errors=[f"{graph_projection.SURFACE_UNSUPPORTED}:{binding.entry_id}"],
+            )
 
     with _handles(config, store) as (journal, graph_store):
         if journal is None or graph_store is None:
@@ -395,7 +445,7 @@ def commit_semantic_write(
                 GRAPH_COMMIT_NOT_CONFIGURED,
                 request_id=identity,
                 node_id=request.node.id,
-                entry_id=binding.entry_id,
+                entry_id="" if binding is None else binding.entry_id,
                 errors=[
                     "graph_journal_not_configured"
                     if journal is None
@@ -410,9 +460,20 @@ def _commit(
     journal: MemoryEventJournal,
     store: Any,
     request: SemanticWriteRequest,
-    binding: ProjectionBinding,
+    binding: ProjectionBinding | None,
     identity: str,
 ) -> SemanticCommit:
+    """Validate, append and publish one node-carrying decision.
+
+    ``binding`` of ``None`` means this decision publishes to **no** readable L1
+    surface, which is true of exactly one node kind today: a ``TASK``, whose
+    readable projection is the TODO view rather than a Markdown section. The
+    surface checks are then not relaxed, they are *inapplicable* — there is no
+    section to own, drift from or conflict over — and every other check in this
+    function still runs unchanged.
+    """
+    entry_id = "" if binding is None else binding.entry_id
+
     # 3. The store must actually implement the contract. An injected handle is
     #    the caller's, and a handle that cannot answer ``health`` or ``rebuild``
     #    is a configuration fault reported by name — never an AttributeError
@@ -423,7 +484,7 @@ def _commit(
             GRAPH_COMMIT_NOT_CONFIGURED,
             request_id=identity,
             node_id=request.node.id,
-            entry_id=binding.entry_id,
+            entry_id=entry_id,
             errors=[f"graph_store_incomplete:{','.join(incomplete)}"],
         )
 
@@ -438,7 +499,7 @@ def _commit(
             GRAPH_COMMIT_REJECTED_ADOPTION,
             request_id=identity,
             node_id=request.node.id,
-            entry_id=binding.entry_id,
+            entry_id=entry_id,
             errors=[f"unknown_graph_nodes:{health.node_count}"],
         )
 
@@ -456,11 +517,15 @@ def _commit(
             GRAPH_COMMIT_REJECTED_INVALID,
             request_id=identity,
             node_id=request.node.id,
-            entry_id=binding.entry_id,
+            entry_id=entry_id,
             errors=[f"invalid_decision:{type(exc).__name__}"],
         )
 
-    bound_events = _bind_events(plan.events, request.node.id, binding)
+    bound_events = (
+        plan.events
+        if binding is None
+        else _bind_events(plan.events, request.node.id, binding)
+    )
     request_hash = canonical_request_hash(bound_events)
 
     # 6. Retry identity, before the semantic checks: an identical retry must
@@ -471,7 +536,7 @@ def _commit(
             GRAPH_COMMIT_REJECTED_REQUEST,
             request_id=identity,
             node_id=request.node.id,
-            entry_id=binding.entry_id,
+            entry_id=entry_id,
             errors=[f"request_payload_changed:{identity}"],
         )
     if stored is not None:
@@ -481,7 +546,7 @@ def _commit(
             store,
             identity=identity,
             node_id=request.node.id,
-            entry_id=binding.entry_id,
+            entry_id=entry_id,
             event_ids=[event.id for event in bound_events],
             superseded_ids=list(plan.superseded_ids),
             duplicate=True,
@@ -490,15 +555,19 @@ def _commit(
 
     # 7. Surface ownership. One current owner per readable surface, and taking
     #    one over is a supersession the caller declared, never an overwrite.
-    surface_error = _surface_conflict(
-        events, existing_nodes, binding, request, plan.superseded_ids
+    surface_error = (
+        None
+        if binding is None
+        else _surface_conflict(
+            events, existing_nodes, binding, request.node.id, plan.superseded_ids
+        )
     )
     if surface_error is not None:
         return _rejected(
             GRAPH_COMMIT_REJECTED_SURFACE,
             request_id=identity,
             node_id=request.node.id,
-            entry_id=binding.entry_id,
+            entry_id=entry_id,
             errors=[surface_error],
         )
 
@@ -509,7 +578,7 @@ def _commit(
             GRAPH_COMMIT_REJECTED_INVALID,
             request_id=identity,
             node_id=request.node.id,
-            entry_id=binding.entry_id,
+            entry_id=entry_id,
             errors=lifecycle_errors,
         )
 
@@ -522,7 +591,7 @@ def _commit(
             GRAPH_COMMIT_REJECTED_INVALID,
             request_id=identity,
             node_id=request.node.id,
-            entry_id=binding.entry_id,
+            entry_id=entry_id,
             errors=new_errors or sorted(candidate_report.errors),
         )
 
@@ -533,7 +602,7 @@ def _commit(
             GRAPH_COMMIT_REJECTED_DRIFT,
             request_id=identity,
             node_id=request.node.id,
-            entry_id=binding.entry_id,
+            entry_id=entry_id,
             errors=drift,
         )
 
@@ -547,7 +616,7 @@ def _commit(
             GRAPH_COMMIT_REJECTED_REQUEST,
             request_id=identity,
             node_id=request.node.id,
-            entry_id=binding.entry_id,
+            entry_id=entry_id,
             errors=[f"journal_conflict:{type(exc).__name__}"],
         )
 
@@ -557,12 +626,556 @@ def _commit(
         store,
         identity=identity,
         node_id=request.node.id,
-        entry_id=binding.entry_id,
+        entry_id=entry_id,
         event_ids=list(append.event_ids),
         superseded_ids=list(plan.superseded_ids),
         duplicate=append.duplicate,
         warnings=plan.warnings,
     )
+
+
+def _commit_lifecycle(
+    config: Any,
+    journal: MemoryEventJournal,
+    store: Any,
+    request: SemanticLifecycleRequest,
+    identity: str,
+) -> SemanticCommit:
+    """Validate, append and publish one target-only lifecycle decision.
+
+    The same sequence :func:`_commit` runs, minus the parts that only mean
+    something for a *new* node: there is no binding to validate, no body to
+    compare and no surface to take ownership of. What a retraction does to a
+    readable surface is decided by the replay — the target stops being current,
+    so its surface is retired by the L1 projection — which is why the drift
+    check still runs here: retiring a section somebody else has edited would
+    destroy their edit just as surely as republishing over it would.
+    """
+    incomplete = missing_graph_store_operations(store)
+    if incomplete:
+        return _rejected(
+            GRAPH_COMMIT_NOT_CONFIGURED,
+            request_id=identity,
+            node_id=request.target_id,
+            errors=[f"graph_store_incomplete:{','.join(incomplete)}"],
+        )
+
+    records = journal.read_records()
+    events = [event for _position, event in records]
+
+    health = store.health()
+    if not events and health.node_count:
+        return _rejected(
+            GRAPH_COMMIT_REJECTED_ADOPTION,
+            request_id=identity,
+            node_id=request.target_id,
+            errors=[f"unknown_graph_nodes:{health.node_count}"],
+        )
+
+    existing = InMemoryGraphStore()
+    existing_report = existing.rebuild(events)
+    existing_nodes, _existing_edges = _materialize(existing)
+
+    stored = journal.request_hash(identity)
+    if stored is not None:
+        prior_events = journal.read_request_events(identity)
+        if len(prior_events) != 1:
+            return _rejected(
+                GRAPH_COMMIT_REJECTED_REQUEST,
+                request_id=identity,
+                node_id=request.target_id,
+                errors=[f"request_event_count:{identity}"],
+            )
+        prior = prior_events[0]
+        try:
+            retry_event = plan_semantic_lifecycle(request, existing_nodes=None).events[0]
+        except ValueError:
+            return _rejected(
+                GRAPH_COMMIT_REJECTED_REQUEST,
+                request_id=identity,
+                node_id=request.target_id,
+                errors=[f"request_payload_changed:{identity}"],
+            )
+        if (
+            retry_event.occurred_at != prior.occurred_at
+            and request.event_namespace != REVIEW_EVENT_NAMESPACE
+        ):
+            return _rejected(
+                GRAPH_COMMIT_REJECTED_REQUEST,
+                request_id=identity,
+                node_id=request.target_id,
+                errors=[f"request_payload_changed:{identity}"],
+            )
+        prior_scope = None if prior.scope is None else prior.scope.to_json()
+        if request.scope is not None and request.scope.to_json() != prior_scope:
+            return _rejected(
+                GRAPH_COMMIT_REJECTED_REQUEST,
+                request_id=identity,
+                node_id=request.target_id,
+                errors=[f"request_payload_changed:{identity}"],
+            )
+        retry_event = retry_event.model_copy(
+            update={"occurred_at": prior.occurred_at, "scope": prior.scope}
+        )
+        if canonical_request_hash([retry_event]) != stored:
+            return _rejected(
+                GRAPH_COMMIT_REJECTED_REQUEST,
+                request_id=identity,
+                node_id=request.target_id,
+                errors=[f"request_payload_changed:{identity}"],
+            )
+        return _finish(
+            config,
+            journal,
+            store,
+            identity=identity,
+            node_id=request.target_id,
+            entry_id="",
+            event_ids=[event.id for event in prior_events],
+            superseded_ids=[],
+            duplicate=True,
+            warnings=(),
+        )
+
+    try:
+        plan = plan_semantic_lifecycle(request, existing_nodes=existing_nodes)
+    except ValueError as exc:
+        return _rejected(
+            GRAPH_COMMIT_REJECTED_INVALID,
+            request_id=identity,
+            node_id=request.target_id,
+            errors=[f"invalid_lifecycle_decision:{exc}"],
+        )
+
+    candidate = InMemoryGraphStore()
+    candidate_report = candidate.rebuild([*events, *plan.events])
+    if not candidate_report.ok:
+        new_errors = sorted(set(candidate_report.errors) - set(existing_report.errors))
+        return _rejected(
+            GRAPH_COMMIT_REJECTED_INVALID,
+            request_id=identity,
+            node_id=request.target_id,
+            errors=new_errors or sorted(candidate_report.errors),
+        )
+
+    # A restore may not hand one readable surface two current owners. Refused
+    # with the owner named, rather than resolved by guesswork: which of the two
+    # should keep the section is a decision, and this request does not carry it.
+    conflict = _restored_surface_conflict(events, candidate, request)
+    if conflict is not None:
+        return _rejected(
+            GRAPH_COMMIT_REJECTED_SURFACE,
+            request_id=identity,
+            node_id=request.target_id,
+            errors=[conflict],
+        )
+
+    drift = _drift_errors(config, journal, candidate, [*events, *plan.events])
+    if drift:
+        return _rejected(
+            GRAPH_COMMIT_REJECTED_DRIFT,
+            request_id=identity,
+            node_id=request.target_id,
+            errors=drift,
+        )
+
+    try:
+        append = journal.append(identity, plan.events, kind=REQUEST_KIND_SEMANTIC_WRITE)
+    except JournalConflictError as exc:
+        return _rejected(
+            GRAPH_COMMIT_REJECTED_REQUEST,
+            request_id=identity,
+            node_id=request.target_id,
+            errors=[f"journal_conflict:{type(exc).__name__}"],
+        )
+
+    return _finish(
+        config,
+        journal,
+        store,
+        identity=identity,
+        node_id=request.target_id,
+        entry_id="",
+        event_ids=list(append.event_ids),
+        superseded_ids=[],
+        duplicate=append.duplicate,
+        warnings=plan.warnings,
+    )
+
+
+def _restored_surface_conflict(
+    events: Sequence[MemoryEvent],
+    candidate: InMemoryGraphStore,
+    request: SemanticLifecycleRequest,
+) -> str | None:
+    """Whether this decision leaves one readable surface with two owners.
+
+    Only a ``restore`` can: a retraction removes a current owner and an approval
+    promotes a node that had none. The check is run over the *proposed* replay,
+    so it answers the question that actually matters — after this decision, is
+    any surface owned by two current nodes — rather than guessing from the
+    request alone.
+    """
+    if request.action != "restore":
+        return None
+    nodes, _edges = _materialize(candidate)
+    bindings = graph_projection.bindings_from_events(events)
+    target_binding = bindings.get(request.target_id)
+    if target_binding is None:
+        return None
+    for owner_id, owned in bindings.items():
+        if owner_id == request.target_id:
+            continue
+        if owned.entry_id != target_binding.entry_id:
+            continue
+        owner = nodes.get(owner_id)
+        if owner is not None and owner.is_current():
+            return f"surface_owned_by:{owner_id}"
+    return None
+
+
+# ---------------------------------------------------------------------------
+# The target-only lifecycle entrance
+# ---------------------------------------------------------------------------
+
+def commit_semantic_lifecycle(
+    config: Any,
+    request: SemanticLifecycleRequest,
+    *,
+    request_id: str = "",
+    store: Any | None = None,
+) -> SemanticCommit:
+    """Validate, commit and publish one target-only lifecycle decision.
+
+    The first-class way to retract, restore or approve an existing memory. It
+    carries no node, so nothing is invented: the readable consequences — a
+    retired L1 section, a vector row that stops being current — are decided by
+    the replay of the event this commits, not by a replacement payload the
+    caller had to fabricate.
+
+    Args:
+        config: The configuration declaring the journal and graph paths.
+        request: The caller's already-decided
+            :class:`~layered_memory_mcp.graph_write.SemanticLifecycleRequest`.
+        request_id: The stable retry identity. Defaults to
+            ``<event namespace>:<request key>``.
+        store: An optional caller-owned graph store, used and left open.
+
+    Returns:
+        A :class:`SemanticCommit`. Every refusal is a status with bounded
+        ``errors``; nothing raises for a refusable condition.
+    """
+    identity = request_id.strip() or f"{request.event_namespace}:{request.request_key}"
+
+    missing = sorted(
+        name
+        for name, declared in (
+            ("graph_journal_not_configured", resolve_journal_database_path(config)),
+            ("graph_store_not_configured", resolve_graph_database_path(config)),
+        )
+        if declared is None
+    )
+    if missing and store is None:
+        return _rejected(
+            GRAPH_COMMIT_NOT_CONFIGURED,
+            request_id=identity,
+            node_id=request.target_id,
+            errors=missing,
+        )
+    if "graph_journal_not_configured" in missing:
+        return _rejected(
+            GRAPH_COMMIT_NOT_CONFIGURED,
+            request_id=identity,
+            node_id=request.target_id,
+            errors=["graph_journal_not_configured"],
+        )
+
+    with _handles(config, store) as (journal, graph_store):
+        if journal is None or graph_store is None:
+            return _rejected(
+                GRAPH_COMMIT_NOT_CONFIGURED,
+                request_id=identity,
+                node_id=request.target_id,
+                errors=[
+                    "graph_journal_not_configured"
+                    if journal is None
+                    else "graph_store_not_configured"
+                ],
+            )
+        return _commit_lifecycle(config, journal, graph_store, request, identity)
+
+
+# ---------------------------------------------------------------------------
+# Tasks: one typed decision, one projection
+# ---------------------------------------------------------------------------
+
+class TaskAuthority(GraphModel):
+    """What the journal says about tasks right now, read without writing.
+
+    ``unseeded`` is the honest answer to "is the readable store mine": task ids
+    present in the TODO database that this journal has no authority for. They
+    are somebody's real tasks — the pre-journal ones — and until
+    :func:`seed_task_authority` has brought them in, a mutation is refused
+    rather than committed into a projection that would then refuse to publish
+    over them.
+    """
+
+    available: bool = False
+    records: dict[str, TaskRecord] = Field(default_factory=dict)
+    known_ids: list[str] = Field(default_factory=list)
+    unseeded: list[str] = Field(default_factory=list)
+
+
+class TaskSeedReport(GraphModel):
+    """What the explicit task migration found, and what it did about it."""
+
+    status: str = TASK_SEED_NOTHING_TO_DO
+    stored_tasks: int = Field(default=0, ge=0)
+    already_known: int = Field(default=0, ge=0)
+    seeded: int = Field(default=0, ge=0)
+    head_position: int = Field(default=0, ge=0)
+    checkpoints: dict[str, int] = Field(default_factory=dict)
+    projections_pending: list[str] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return self.status in (TASK_SEED_APPLIED, TASK_SEED_NOTHING_TO_DO)
+
+
+def task_authority(config: Any) -> TaskAuthority:
+    """The current task state, read through the inspection entrances only.
+
+    Opens the journal read-only and the TODO store read-only, so asking "what
+    tasks are there, and is this store the journal's?" creates nothing — not the
+    journal, not the store, not a schema and not a lock. A reader must not be
+    the thing that establishes the authority it is asking about.
+    """
+    from . import graph_task
+
+    records: dict[str, TaskRecord] = {}
+    known: set[str] = set()
+    available = False
+    try:
+        with journal_readonly_session(config, require=True) as assembly:
+            if assembly.journal is not None:
+                available = True
+                events = assembly.journal.read_events()
+                projection = InMemoryGraphStore()
+                projection.rebuild(events)
+                nodes, _edges = _materialize(projection)
+                records = graph_task.task_records(nodes.values())
+                known = graph_task.task_authority_ids(nodes.values())
+    except Exception:  # noqa: BLE001 — an unreadable journal holds no tasks
+        return TaskAuthority()
+    stored = graph_task.stored_task_ids(config)
+    return TaskAuthority(
+        available=available,
+        records=records,
+        known_ids=sorted(known),
+        unseeded=sorted(stored - known),
+    )
+
+
+def commit_task_mutation(
+    config: Any,
+    mutation: TaskMutation,
+    *,
+    store: Any | None = None,
+) -> tuple[SemanticCommit, TaskRecord | None]:
+    """Commit one task decision through the authority, and say what it became.
+
+    Three refusals before the journal, each leaving it byte-for-byte untouched:
+    a task the authority does not hold, an ``add`` for a task id it already
+    holds, and a readable store carrying tasks that were never seeded. The
+    returned record is the state the decision produced — for a delete, the state
+    it removed — so the caller can report what changed without re-reading.
+    """
+    from . import graph_task
+
+    authority = task_authority(config)
+    if authority.unseeded:
+        return (
+            _rejected(
+                GRAPH_TASK_AUTHORITY_UNSEEDED,
+                node_id="",
+                errors=[f"todo_store_not_adopted:{len(authority.unseeded)}"],
+            ),
+            None,
+        )
+
+    task_id = mutation.task_id.strip()
+    current = authority.records.get(task_id) if task_id else None
+    if mutation.action == graph_task.TASK_ACTION_ADD:
+        if current is not None:
+            return (
+                _rejected(
+                    GRAPH_COMMIT_REJECTED_REQUEST,
+                    node_id=current.node_id,
+                    errors=[f"task_already_exists:{task_id}"],
+                ),
+                None,
+            )
+    elif current is None:
+        return (
+            _rejected(GRAPH_TASK_UNKNOWN, errors=[f"task_unknown:{task_id}"]),
+            None,
+        )
+
+    try:
+        request, record = graph_task.mutation_request(mutation, current)
+    except ValueError as exc:
+        return (
+            _rejected(
+                GRAPH_COMMIT_REJECTED_INVALID,
+                errors=[f"invalid_task_decision:{exc}"],
+            ),
+            None,
+        )
+
+    if isinstance(request, SemanticLifecycleRequest):
+        return commit_semantic_lifecycle(config, request, store=store), record
+    return commit_semantic_write(config, request, None, store=store), record
+
+
+def seed_task_authority(
+    config: Any,
+    *,
+    rows: Sequence[Mapping[str, Any]] | None = None,
+    occurred_at: Any = None,
+    apply: bool = False,
+    store: Any | None = None,
+) -> TaskSeedReport:
+    """Make the pre-existing tasks the journal's, explicitly. Preview by default.
+
+    The migration the adoption guard exists to require. Every row in the
+    readable TODO store that the journal has no authority for is appended as one
+    bootstrap request carrying it **verbatim** — same id, same timestamps, same
+    priority, same status, same ``blocked_by`` — with
+    ``derivation.method = migrated``, so nothing the original row did not say is
+    invented and nothing is re-dated.
+
+    ``apply=False`` (the default) inspects and writes nothing at all: no
+    journal, no lock file, no store. ``apply=True`` appends once and then
+    publishes, so the readable view is the journal's projection from that point
+    on. Running it twice is a no-op for tasks already seeded: a task's seed
+    event identity is derived from its own id, so re-appending it is a replay.
+
+    Args:
+        config: The configuration declaring the journal, graph and home.
+        rows: The task rows to seed. Defaults to reading them from the
+            configured TODO store, read-only.
+        occurred_at: The migration's own instant, used only as the events'
+            ledger position. Defaults to now.
+        apply: Whether to commit. ``False`` previews.
+        store: An optional caller-owned graph store.
+    """
+    from datetime import datetime, timezone
+
+    from . import graph_task
+
+    authority = task_authority(config)
+    stored = (
+        list(rows) if rows is not None else graph_task.stored_task_rows(config)
+    )
+    known = set(authority.known_ids)
+    pending = [row for row in stored if str(row.get("id") or "") not in known]
+    report = TaskSeedReport(
+        stored_tasks=len(stored),
+        already_known=len(stored) - len(pending),
+    )
+    if not pending:
+        return report.model_copy(update={"status": TASK_SEED_NOTHING_TO_DO})
+    if not apply:
+        return report.model_copy(
+            update={"status": TASK_SEED_PREVIEW, "seeded": len(pending)}
+        )
+
+    moment = occurred_at or datetime.now(timezone.utc)
+    try:
+        events: list[MemoryEvent] = []
+        for request in graph_task.seed_requests(pending, occurred_at=moment):
+            events.extend(plan_semantic_write(request).events)
+    except ValueError as exc:
+        return report.model_copy(
+            update={
+                "status": GRAPH_COMMIT_REJECTED_INVALID,
+                "errors": [f"invalid_task_row:{exc}"],
+            }
+        )
+
+    identity = (
+        f"{graph_task.TASK_SEED_NAMESPACE}:"
+        f"{_seed_identity(sorted(str(row.get('id')) for row in pending))}"
+    )
+    with _handles(config, store) as (journal, graph_store):
+        if journal is None or graph_store is None:
+            return report.model_copy(
+                update={
+                    "status": GRAPH_COMMIT_NOT_CONFIGURED,
+                    "errors": [
+                        "graph_journal_not_configured"
+                        if journal is None
+                        else "graph_store_not_configured"
+                    ],
+                }
+            )
+        candidate = InMemoryGraphStore()
+        existing = journal.read_events()
+        candidate_report = candidate.rebuild([*existing, *events])
+        if not candidate_report.ok:
+            return report.model_copy(
+                update={
+                    "status": GRAPH_COMMIT_REJECTED_INVALID,
+                    "errors": sorted(candidate_report.errors)[:10],
+                }
+            )
+        try:
+            append = journal.append(identity, events, kind=REQUEST_KIND_BOOTSTRAP)
+        except JournalConflictError as exc:
+            return report.model_copy(
+                update={
+                    "status": GRAPH_COMMIT_REJECTED_REQUEST,
+                    "errors": [f"journal_conflict:{type(exc).__name__}"],
+                }
+            )
+        commit = _finish(
+            config,
+            journal,
+            graph_store,
+            identity=identity,
+            node_id="",
+            entry_id="",
+            event_ids=list(append.event_ids),
+            superseded_ids=[],
+            duplicate=append.duplicate,
+            warnings=[],
+        )
+    return report.model_copy(
+        update={
+            "status": TASK_SEED_APPLIED,
+            "seeded": len(pending),
+            "head_position": commit.head_position,
+            "checkpoints": dict(commit.checkpoints),
+            "projections_pending": list(commit.projections_pending),
+            "errors": list(commit.errors),
+        }
+    )
+
+
+def _seed_identity(task_ids: Sequence[str]) -> str:
+    """A stable identity for one seeding run, from the ids it carries.
+
+    Hashed rather than listed: a request identity is a key, not a payload, and
+    106 task ids in one is neither readable nor bounded. The same set of rows
+    therefore seeds under the same identity — so a repeated run is a journal
+    duplicate rather than a second authority — and a *larger* set is a new
+    identity whose already-recorded events are skipped as the replay they are.
+    """
+    import hashlib
+
+    digest = hashlib.sha256("\x1f".join(task_ids).encode("utf-8")).hexdigest()
+    return digest[:16]
 
 
 def _materialize(
@@ -620,7 +1233,7 @@ def _surface_conflict(
     events: Sequence[MemoryEvent],
     nodes: Mapping[str, GraphNode],
     binding: ProjectionBinding,
-    request: SemanticWriteRequest,
+    node_id: str,
     superseded_ids: Sequence[str],
 ) -> str | None:
     """Whether some other current node already owns this readable surface."""
@@ -629,7 +1242,7 @@ def _surface_conflict(
     for owner_id, owned in bindings.items():
         if owned.entry_id != binding.entry_id:
             continue
-        if owner_id == request.node.id or owner_id in retired:
+        if owner_id == node_id or owner_id in retired:
             continue
         owner = nodes.get(owner_id)
         if owner is not None and owner.is_current():
@@ -687,6 +1300,25 @@ def _drift_errors(
 # Publication and recovery — one implementation, two entry points
 # ---------------------------------------------------------------------------
 
+#: What each managed projection is derived *from*. A projection may not publish
+#: over an unpublished dependency: the vector rows come from the L1 files and L0
+#: from the files as a whole, so publishing either over an unpublished L1 would
+#: record a reader-visible state the authority never reached.
+#:
+#: The readable TODO view depends on the **graph alone** — a task is not a
+#: Markdown section — which is the whole reason this is a table rather than a
+#: single "stop at the first failure" flag. A refused readable surface used to
+#: hold every later projection hostage, including ones that had nothing to do
+#: with it.
+PROJECTION_DEPENDENCIES: dict[str, tuple[str, ...]] = {
+    PROJECTION_GRAPH: (),
+    PROJECTION_L1: (PROJECTION_GRAPH,),
+    PROJECTION_VECTOR: (PROJECTION_L1,),
+    PROJECTION_L0: (PROJECTION_L1,),
+    PROJECTION_TODO: (PROJECTION_GRAPH,),
+}
+
+
 def _publish(
     config: Any,
     journal: MemoryEventJournal,
@@ -696,10 +1328,12 @@ def _publish(
 ) -> tuple[list[str], list[str], list[str]]:
     """Publish the managed projections. Returns ``(published, pending, errors)``.
 
-    Published in dependency order, and a failure stops the chain: the vector
-    rows are derived from the L1 files and L0 from the files as a whole, so
-    publishing them over an unpublished L1 would record a reader-visible state
-    the authority never reached.
+    Published in dependency order (:data:`PROJECTION_DEPENDENCIES`), and a
+    failure blocks exactly what is *derived from* the thing that failed —
+    transitively, because the steps run in topological order and a blocked step
+    blocks its own dependents in turn. Everything independent of the failure
+    still publishes, so one refused section no longer leaves a committed task
+    decision unreadable.
     """
     wanted = list(PROJECTION_NAMES if only is None else only)
     records = journal.read_records()
@@ -730,14 +1364,19 @@ def _publish(
         ),
         (PROJECTION_VECTOR, lambda: graph_projection.publish_vector(config, domains)),
         (PROJECTION_L0, lambda: graph_projection.publish_l0(config)),
+        (
+            PROJECTION_TODO,
+            lambda: graph_projection.publish_todo(config, nodes.values()),
+        ),
     )
 
-    failed = False
+    blocked: set[str] = set()
     for name, run in steps:
         if name not in wanted:
             continue
-        if failed:
+        if blocked.intersection(PROJECTION_DEPENDENCIES[name]):
             pending.append(name)
+            blocked.add(name)
             continue
         try:
             run()
@@ -750,7 +1389,7 @@ def _publish(
             journal.record_projection_failure(name, label[:200])
             errors.append(f"{name}:{label[:200]}")
             pending.append(name)
-            failed = True
+            blocked.add(name)
             continue
         journal.set_checkpoint(name, head)
         published.append(name)
@@ -781,6 +1420,14 @@ def _finish(
 
     head = journal.head_position()
     checkpoints = {name: journal.checkpoint(name).position for name in PROJECTION_NAMES}
+    # Whether a reader can see this decision's readable surface, as its own
+    # fact. A commit whose L1 write failed is durable and unreadable, and the
+    # entry ID is named in the errors so "which surface did not land" does not
+    # have to be inferred from a projection name.
+    surface_pending = PROJECTION_L1 in outstanding
+    reported = list(errors)
+    if surface_pending and entry_id:
+        reported.append(f"l1_projection_pending:{entry_id}")
     return SemanticCommit(
         status=(
             GRAPH_COMMIT_PENDING_PROJECTIONS
@@ -792,13 +1439,14 @@ def _finish(
         request_id=identity,
         node_id=node_id,
         entry_id=entry_id,
+        surface_published=bool(entry_id) and not surface_pending,
         event_ids=list(event_ids),
         head_position=head,
         checkpoints=checkpoints,
         projections_pending=sorted(outstanding),
         superseded_ids=list(superseded_ids),
         warnings=sorted(set(warnings)),
-        errors=sorted(set(errors)),
+        errors=sorted(set(reported)),
     )
 
 

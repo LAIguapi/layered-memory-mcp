@@ -18,7 +18,10 @@ It answers four questions and no others:
   only when a caller says a projection actually succeeded;
 * **which readable surface does a managed node own** — the surface registry,
   which is what lets a projection republish idempotently, detect external drift
-  and retire a replaced surface.
+  and retire a replaced surface;
+* **what is a publication in the middle of doing** — the surface *intent*
+  registry, which is how a crash of our own write is told apart from a human's
+  edit. See "A PUBLICATION IS TWO PHASES" below.
 
 WHAT IT IS NOT
 --------------
@@ -55,6 +58,29 @@ that is not a journal of this layout is
 :class:`JournalNotInitializedError`, and every mutating method on such a handle
 refuses with :class:`JournalReadOnlyError` rather than discovering the problem
 in SQLite.
+
+A PUBLICATION IS TWO PHASES
+---------------------------
+``projection_surfaces`` records what a surface *last published*; it is the whole
+drift test, and it may therefore only ever describe bytes that actually reached
+disk. Recording it before the write was a real defect: a failed file write left
+the row describing a body that never landed, and every later recovery attempt
+compared the file against that phantom hash and reported ``surface_drift``
+forever — our own crash, permanently misclassified as somebody else's edit.
+
+So a publication declares its *intent* first, in ``projection_surface_intents``,
+writes the file, and only then finalizes the registry and clears the intent.
+That makes both crash windows recoverable without a forced republication:
+
+* crashed **before** the file was replaced — the registry still describes the
+  body the file still holds, so the retry is an ordinary republication;
+* crashed **after** the replacement, before finalization — the file matches the
+  recorded intent, which is recognizable as our own unfinished write.
+
+An intent is *coordination* state, not a second semantic truth: it says what a
+projection was about to do, never what was decided. The events stay the
+authority, an intent is derivable from them plus a checkpoint, and nothing reads
+an intent to answer a question about memory content.
 
 THE PROPERTIES IT GUARANTEES
 ----------------------------
@@ -99,9 +125,12 @@ __all__ = [
     "PROJECTION_L0",
     "PROJECTION_L1",
     "PROJECTION_NAMES",
+    "PROJECTION_TODO",
     "PROJECTION_VECTOR",
     "REQUEST_KIND_BOOTSTRAP",
     "REQUEST_KIND_SEMANTIC_WRITE",
+    "SURFACE_INTENT_PUBLISH",
+    "SURFACE_INTENT_RETIRE",
     "AppendResult",
     "Checkpoint",
     "JournalClosedError",
@@ -114,6 +143,7 @@ __all__ = [
     "JournalSchemaError",
     "JournalUnavailableError",
     "MemoryEventJournal",
+    "SurfaceIntent",
     "SurfaceRecord",
     "canonical_request_hash",
 ]
@@ -124,17 +154,26 @@ JOURNAL_SCHEMA_VERSION = 1
 #: The managed projections, in publication order. The order matters: the graph
 #: is the semantic projection every other one is derived from, the readable L1
 #: surface is derived from the graph, the vector rows are derived from L1, and
-#: L0 is derived from the L1 files as a whole.
+#: L0 is derived from the L1 files as a whole. The readable TODO view is derived
+#: from the graph and from nothing else, which is why a refused readable surface
+#: does not hold it up — see ``graph_application`` for the dependency table.
 PROJECTION_GRAPH = "graph"
 PROJECTION_L1 = "l1"
 PROJECTION_VECTOR = "vector"
 PROJECTION_L0 = "l0"
+PROJECTION_TODO = "todo"
 PROJECTION_NAMES: tuple[str, ...] = (
     PROJECTION_GRAPH,
     PROJECTION_L1,
     PROJECTION_VECTOR,
     PROJECTION_L0,
+    PROJECTION_TODO,
 )
+
+#: What a declared surface intent is about to do. ``publish`` renders the
+#: section with the declared body; ``retire`` removes it from the rendering.
+SURFACE_INTENT_PUBLISH = "publish"
+SURFACE_INTENT_RETIRE = "retire"
 
 #: The two kinds of commit this journal records. A bootstrap import is part of
 #: the same replayed stream — an imported snapshot that is *not* represented
@@ -200,6 +239,19 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         updated_at  TEXT NOT NULL
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS projection_surface_intents (
+        entry_id    TEXT PRIMARY KEY,
+        domain      TEXT NOT NULL,
+        section     TEXT NOT NULL,
+        occurrence  INTEGER NOT NULL,
+        node_id     TEXT NOT NULL,
+        body_sha256 TEXT NOT NULL,
+        action      TEXT NOT NULL,
+        position    INTEGER NOT NULL,
+        updated_at  TEXT NOT NULL
+    )
+    """,
     "CREATE INDEX IF NOT EXISTS memory_events_request ON memory_events (request_id)",
     "CREATE INDEX IF NOT EXISTS projection_surfaces_node ON projection_surfaces (node_id)",
 )
@@ -214,6 +266,15 @@ _REQUIRED_TABLES: tuple[str, ...] = (
     "projection_checkpoints",
     "projection_surfaces",
 )
+
+#: Tables added to this layout *after* the first journals were written. They are
+#: created by the writable path like every other table, and their absence is
+#: deliberately **not** an uninitialized journal: an older journal holds no
+#: publication intents, and "no publication was in flight" is the complete and
+#: truthful answer for one, not a missing capability. So the readers below report
+#: an absent table as an empty result instead of raising, and the read-only
+#: inspection path keeps working on a journal written before they existed.
+_OPTIONAL_TABLES: tuple[str, ...] = ("projection_surface_intents",)
 
 
 # ---------------------------------------------------------------------------
@@ -321,6 +382,34 @@ class SurfaceRecord(GraphModel):
     position: int = Field(default=0, ge=0)
 
 
+class SurfaceIntent(GraphModel):
+    """What one publication is *about* to do to one readable surface.
+
+    The missing half of the drift test. :class:`SurfaceRecord` answers "what did
+    we last publish here", which may only ever describe bytes that landed;
+    this answers "what were we in the middle of writing", which is the only way
+    a crash of our own write can be told apart from an external edit.
+
+    ``body_sha256`` is the fingerprint of the body the publication *intends* to
+    write (empty for a retirement, which intends the section's absence).
+    ``action`` is :data:`SURFACE_INTENT_PUBLISH` or
+    :data:`SURFACE_INTENT_RETIRE`.
+
+    An intent is cleared the moment its publication finalizes, so a surface with
+    an intent recorded is, by construction, one whose last publication did not
+    finish. It carries no decision, and nothing projects memory content from it.
+    """
+
+    entry_id: str
+    domain: str
+    section: str
+    occurrence: int = Field(default=0, ge=0)
+    node_id: str
+    body_sha256: str = ""
+    action: str = SURFACE_INTENT_PUBLISH
+    position: int = Field(default=0, ge=0)
+
+
 class JournalHealth(GraphModel):
     """Bounded state of the journal: counts, positions, checkpoints, errors."""
 
@@ -329,6 +418,11 @@ class JournalHealth(GraphModel):
     request_count: int = Field(default=0, ge=0)
     head_position: int = Field(default=0, ge=0)
     surface_count: int = Field(default=0, ge=0)
+    #: Surfaces whose last publication declared an intent and never finalized
+    #: it. Normally zero; a nonzero count is a publication that was interrupted,
+    #: which :func:`~layered_memory_mcp.graph_application.recover_projections`
+    #: finishes.
+    unfinished_surface_count: int = Field(default=0, ge=0)
     checkpoints: dict[str, int] = Field(default_factory=dict)
     checkpoint_statuses: dict[str, str] = Field(default_factory=dict)
     pending_projections: list[str] = Field(default_factory=list)
@@ -782,6 +876,22 @@ class MemoryEventJournal:
             ).fetchall()
         ]
 
+    def read_request_events(self, request_id: str) -> list[MemoryEvent]:
+        """Read the events committed under one request identity."""
+        connection = self._require_connection()
+        return [
+            self._decode(str(event_id), str(payload))
+            for event_id, payload in connection.execute(
+                """
+                SELECT id, payload
+                FROM memory_events
+                WHERE request_id = ?
+                ORDER BY position
+                """,
+                (request_id.strip(),),
+            ).fetchall()
+        ]
+
     # -- read ----------------------------------------------------------------
 
     def read_records(self, *, upto: int | None = None) -> list[tuple[int, MemoryEvent]]:
@@ -1035,6 +1145,107 @@ class MemoryEventJournal:
         query += " ORDER BY entry_id"
         return [_surface_from_row(row) for row in connection.execute(query).fetchall()]
 
+    # -- publication intents -------------------------------------------------
+
+    def record_surface_intent(self, intent: SurfaceIntent) -> SurfaceIntent:
+        """Declare what a publication is about to write to one surface.
+
+        Recorded *before* the bytes exist, which is exactly what distinguishes
+        it from :meth:`record_surface`: an intent is allowed to describe a body
+        that is not on disk yet, and the published record is not.
+        """
+        with self._transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO projection_surface_intents
+                    (entry_id, domain, section, occurrence, node_id, body_sha256,
+                     action, position, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(entry_id) DO UPDATE SET
+                    domain = excluded.domain,
+                    section = excluded.section,
+                    occurrence = excluded.occurrence,
+                    node_id = excluded.node_id,
+                    body_sha256 = excluded.body_sha256,
+                    action = excluded.action,
+                    position = excluded.position,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    intent.entry_id,
+                    intent.domain,
+                    intent.section,
+                    int(intent.occurrence),
+                    intent.node_id,
+                    intent.body_sha256,
+                    intent.action,
+                    int(intent.position),
+                    _now(),
+                ),
+            )
+        return intent
+
+    def clear_surface_intent(self, entry_id: str) -> None:
+        """Forget one declared intent, because its publication finalized.
+
+        A delete rather than a status, and the one deletion in this module: an
+        intent is coordination state with no historical meaning, and keeping
+        every finished one would turn "a publication is unfinished" — a question
+        answered by a row's *existence* — into a scan.
+        """
+        with self._transaction() as connection:
+            connection.execute(
+                "DELETE FROM projection_surface_intents WHERE entry_id = ?",
+                (entry_id,),
+            )
+
+    def surface_intent(self, entry_id: str) -> SurfaceIntent | None:
+        """The unfinished intent for ``entry_id``, or ``None``."""
+        connection = self._require_connection()
+        if not self._has_table(connection, "projection_surface_intents"):
+            return None
+        row = connection.execute(
+            """
+            SELECT entry_id, domain, section, occurrence, node_id, body_sha256,
+                   action, position
+            FROM projection_surface_intents WHERE entry_id = ?
+            """,
+            (entry_id,),
+        ).fetchone()
+        return None if row is None else _intent_from_row(row)
+
+    def surface_intents(self) -> list[SurfaceIntent]:
+        """Every unfinished publication intent, by entry ID."""
+        connection = self._require_connection()
+        if not self._has_table(connection, "projection_surface_intents"):
+            return []
+        return [
+            _intent_from_row(row)
+            for row in connection.execute(
+                """
+                SELECT entry_id, domain, section, occurrence, node_id, body_sha256,
+                       action, position
+                FROM projection_surface_intents ORDER BY entry_id
+                """
+            ).fetchall()
+        ]
+
+    @staticmethod
+    def _has_table(connection: sqlite3.Connection, name: str) -> bool:
+        """Whether ``name`` is present. Only asked about :data:`_OPTIONAL_TABLES`.
+
+        A journal written before a table existed holds no rows for it, and that
+        is an answer rather than a fault — see :data:`_OPTIONAL_TABLES`. Asked
+        with a ``SELECT``, so a read-only handle can ask it too.
+        """
+        if name not in _OPTIONAL_TABLES:  # pragma: no cover - guards a typo
+            return True
+        row = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (name,),
+        ).fetchone()
+        return row is not None
+
     def surface_node_ids(self) -> dict[str, str]:
         """``entry_id -> node_id`` for every *published* managed surface.
 
@@ -1068,6 +1279,7 @@ class MemoryEventJournal:
                 request_count=self.request_count(),
                 head_position=head,
                 surface_count=len(self.surfaces()),
+                unfinished_surface_count=len(self.surface_intents()),
                 checkpoints={
                     name: point.position for name, point in checkpoints.items()
                 },
@@ -1082,6 +1294,19 @@ class MemoryEventJournal:
             )
         except Exception as exc:  # pragma: no cover - defensive, must not raise
             return JournalHealth(errors=[f"journal_check_failed:{type(exc).__name__}"])
+
+
+def _intent_from_row(row: Sequence[Any]) -> SurfaceIntent:
+    return SurfaceIntent(
+        entry_id=str(row[0]),
+        domain=str(row[1]),
+        section=str(row[2]),
+        occurrence=int(row[3]),
+        node_id=str(row[4]),
+        body_sha256=str(row[5]),
+        action=str(row[6]),
+        position=int(row[7]),
+    )
 
 
 def _surface_from_row(row: Sequence[Any]) -> SurfaceRecord:

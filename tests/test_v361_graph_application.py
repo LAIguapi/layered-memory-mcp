@@ -582,11 +582,22 @@ def test_a_failed_projection_commits_honestly_and_recovery_converges(
 
     assert commit.committed is True
     assert commit.status == GRAPH_COMMIT_PENDING_PROJECTIONS
-    assert commit.projections_pending == sorted([PROJECTION_VECTOR, PROJECTION_L0])
+    # Only the projection that actually failed is pending. L0 used to be
+    # pending beside it, because publication was one sequential chain that
+    # stopped at the first failure — but L0 is regenerated from the *L1 files*
+    # and has no dependency on the vector rows at all, so holding it back was
+    # incidental to the loop rather than a property anything needed. The
+    # dependency table (``PROJECTION_DEPENDENCIES``) now says what derives from
+    # what, which is also what stops a refused L1 section from holding the task
+    # projection hostage. The guarantee this test exists for is unchanged and
+    # still asserted: the failed projection's checkpoint does not move, its
+    # rows are absent, and recovery converges.
+    assert commit.projections_pending == [PROJECTION_VECTOR]
     with _journal(config) as journal:
         head = journal.head_position()
         assert journal.checkpoint(PROJECTION_GRAPH).position == head
         assert journal.checkpoint(PROJECTION_L1).position == head
+        assert journal.checkpoint(PROJECTION_L0).position == head
         assert journal.checkpoint(PROJECTION_VECTOR).position == 0
     assert _vector_rows(config) == []
 
@@ -594,7 +605,7 @@ def test_a_failed_projection_commits_honestly_and_recovery_converges(
     report = recover_projections(config)
 
     assert report.projections_pending == []
-    assert sorted(report.recovered) == sorted([PROJECTION_VECTOR, PROJECTION_L0])
+    assert sorted(report.recovered) == [PROJECTION_VECTOR]
     assert [row[0] for row in _vector_rows(config)] == [commit.entry_id]
 
 

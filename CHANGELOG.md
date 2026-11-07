@@ -5,9 +5,127 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [3.6.0] - 2026-10-28
+## [3.6.0] - 2026-11-05
+
+Graph architecture completion. The release includes the local implementation and
+verification described below; production migration, installed-service activation,
+package publication and runtime cutover remain separately gated operational steps.
 
 ### Added
+
+- **Tasks are semantic decisions, and the TODO view is a projection of them.**
+  `add_todo`, `update_todo`, `delete_todo` and the dashboard's `POST
+  /update-todo` commit a typed task decision through the semantic journal in a
+  graph write mode; `list_todos`, `get_todo_stats` and `GET /todos` read the
+  replayable `todo` projection, which joins `graph`, `l1`, `vector` and `l0` as
+  a managed projection with its own checkpoint and recovery. An update is a new
+  task version with a `SUPERSEDES` decision, a delete is a retraction, and a
+  task's history stays queryable. The transition owns the terminal timestamps,
+  so reopening a completed task clears `completed_at` instead of leaving a
+  finish time on an open row, and a replay reproduces the recorded times rather
+  than re-dating them. In `legacy` mode the TODO store remains authoritative
+  and nothing changes.
+- Add `layered-memory-seed-tasks`
+  (`python -m layered_memory_mcp.graph_task`), the explicit migration that makes
+  the tasks a service home already holds the journal's own. Preview is the
+  default; every field, id and timestamp is carried across verbatim with
+  `derivation.method = migrated`. Until it has run, the task projection refuses
+  to publish over rows it has no authority for and the task entrances refuse
+  before the journal — a pre-existing task is never rebuilt away from a partial
+  stream.
+- **`apply_semantic_lifecycle`** — retract, restore or approve a memory that
+  already exists. The request carries a target, an action and a timestamp and
+  **no node**, so deleting a claim no longer requires inventing a superseding
+  node with content nobody decided. Validation is fail-closed before the
+  journal: an unknown target, a scope that disagrees with the target's, and a
+  transition the target's status cannot take are refusals, and a restore that
+  would leave one readable section with two current owners is refused by name.
+  An update remains an explicit new version plus `SUPERSEDES`.
+- Add `layered-memory-bootstrap`
+  (`python -m layered_memory_mcp.graph_bootstrap`), the explicit fresh-start
+  operator. Preview is the default; service home, destination and pointer are
+  all required and never discovered. Any existing memory under the home —
+  knowledge Markdown, a vector database, an L0 index, a graph or journal file —
+  blocks it, and all of them are named rather than just the first. Fresh
+  initialisation is deliberately separate from migration: switching the default
+  to `graph` must never turn an un-migrated store into an empty one.
+- Distinguish fresh and migration generations in the manifest
+  (`generation_type`) and in verification. Zero events, a zero head and zero
+  checkpoints are a fresh generation's complete and valid authority; for a
+  migration they are now an explicit failure rather than a vacuously satisfied
+  manifest. A manifest without a declared type is read as a migration, the
+  stricter of the two contracts.
+- Add an explicit service-home binding step to the update operator. `--home` now
+  prepares and proves a binding instead of being informational: preview writes
+  nothing, apply rewrites only the `graph:` block while preserving every other
+  line byte-for-byte and retaining a recoverable original, and the run is
+  reported as applied only after the complete configuration the normal startup
+  path builds has been shown to resolve that exact pointer and mode. A
+  duplicated or malformed graph section, an unknown graph key, a conflicting
+  explicit target or a `LAYERED_MEMORY_GRAPH_*` environment override is a
+  refusal, not a fallback.
+- Accept an explicit, per-run `--exclude ROOT_MEMBER` declaration in the
+  snapshot adapter for root members this project does not own. Each name must be
+  one literal, non-reserved, non-patterned member that is actually present; a
+  declaration matching nothing is refused, so a stale list cannot pre-authorise
+  an unclassified member. Excluded members are never opened or traversed, and a
+  declaration cannot launder a symlink or special file.
+
+### Changed
+
+- Classify the operational state this project writes under a memory home —
+  `.gitignore`, `.last_auto_compact`, `.last_auto_compact_attempt`,
+  `.last_l1_dedup`, `write_guard_state.json` — as typed known exclusions in the
+  snapshot adapter's single policy, decided from metadata alone. Legitimate
+  stores are no longer unsnapshottable because of their own maintenance files.
+- Accept an empty knowledge namespace subdirectory once it has been *proved*
+  empty by listing its names, and record it in the report and manifest as
+  `empty_namespaces`. A nonempty namespace remains a coverage blocker and is
+  still never traversed or read; a directory named like a document remains a
+  wrong-type refusal.
+- Route review-queue verdicts under the graph default through the same semantic
+  lifecycle as other authoritative decisions. `approve_knowledge` and
+  `reject_knowledge` carry the reviewer and note as event payload, use the
+  `review` event namespace, and publish through the graph journal; legacy mode
+  retains its existing behavior. The review queue remains readable, while the
+  graph path no longer writes an unrelated claim or maintains a second ledger.
+- Bound every embedding call to one batch of 16 at the single call site. Vectors,
+  their order and the set of embedded texts are unchanged; only the arena the
+  ONNX runtime retains for the life of the process is.
+
+### Fixed
+
+- **A failed L1 publication is recoverable instead of permanently misread as
+  someone else's edit.** The readable projection recorded a section's body hash
+  *before* writing the file, so a failed write left the registry describing
+  bytes that never reached disk — and every later recovery attempt compared the
+  file against that hash, reported `surface_drift`, and left `vector` and `l0`
+  queued behind it forever. Publication is now two phases: the intended state of
+  every surface is declared first, the document is replaced atomically through a
+  temporary sibling (so a target file is never truncated), and only then does the
+  registry adopt the new body. Both crash windows — before the replacement and
+  after it, before finalization — converge through
+  `recover_graph_projections()` without `force=True`. A genuine external edit is
+  still refused and still preserved: the comparison was not relaxed. A commit
+  whose file write failed now also reports *which* surface did not land, so it
+  is distinguishable from one that published cleanly.
+- **A retracted, expired or out-of-namespace section no longer rides along in a
+  surviving sibling's payload.** A keyword result is one file carrying several
+  sections, and the graph kept the whole payload whenever any one seed survived.
+  Each matched section is now screened against its own owning node and the main
+  payload is rebuilt from the survivors — `sections`, `section_entries` and
+  `matched_sections` — with the file keeping its rank. A displayed fragment
+  whose owning surface cannot be identified is dropped from a file that had an
+  excluded section and reported as `section_payload_unmappable:<count>`.
+- Publish the managed projections by dependency rather than as one sequential
+  chain. `vector` and `l0` are derived from the L1 files and still wait for
+  them; `todo` is derived from the graph alone, so a refused readable section no
+  longer leaves a committed task decision unreadable. A failure still blocks
+  everything derived from it.
+
+### Baseline graph additions (2026-10-28)
+
+#### Added
 
 - Introduce the Layered Memory Graph v1 domain contracts, deterministic fixture
   store, embedded SQLite adapter, legacy identity backfill seam, graph-assisted
@@ -23,7 +141,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retaining caller-owned injected-store precedence, legacy zero-open behavior,
   and bounded fallback diagnostics. Graphs are not automatically populated.
 
-### Changed
+#### Changed
 
 - Derive ordinary-Markdown H2 vector row identities deterministically from the
   exact domain, section label, and occurrence among identical labels. Preserve

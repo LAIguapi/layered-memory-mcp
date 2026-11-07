@@ -21,6 +21,7 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
+    "fastapi>=0.115.0",
     "fastmcp>=2.0.0",
     "filelock>=3.0,<4.0",
     "fastembed>=0.8.0",
@@ -35,6 +36,14 @@ dependencies = [
 layered-memory-mcp = "layered_memory_mcp.server:main"
 layered-memory-migrate = "layered_memory_mcp.migrate:main"
 layered-memory-update = "layered_memory_mcp.graph_update:main"
+# Fresh initialisation is a separate, explicit operation from migration: it
+# refuses any home that already holds memory, so the two can never be confused
+# at the command line either.
+layered-memory-bootstrap = "layered_memory_mcp.graph_bootstrap:main"
+# Seeding the task authority is its own explicit step, for the same reason: the
+# tasks a home already holds are real work, and a projection may not rebuild
+# them away from a journal that never saw them. Preview by default.
+layered-memory-seed-tasks = "layered_memory_mcp.graph_task:main"
 
 [project.optional-dependencies]
 dev = [

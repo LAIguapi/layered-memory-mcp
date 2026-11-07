@@ -202,10 +202,12 @@ def test_checkpoints_start_at_zero_and_only_move_when_told(journal):
     journal.set_checkpoint(PROJECTION_GRAPH, 1)
     assert journal.checkpoint(PROJECTION_GRAPH).position == 1
     assert PROJECTION_GRAPH not in journal.pending_projections()
-    assert set(journal.pending_projections()) == {
-        PROJECTION_L1,
-        PROJECTION_VECTOR,
-        PROJECTION_L0,
+    # Everything except the one that was advanced, derived from the constant
+    # rather than restated: the guarantee is "only what was told moves", and
+    # listing the other names was a copy of ``PROJECTION_NAMES`` that had to be
+    # edited whenever a managed projection was added (``todo``, v3.6.1).
+    assert set(journal.pending_projections()) == set(PROJECTION_NAMES) - {
+        PROJECTION_GRAPH
     }
 
 
@@ -379,11 +381,10 @@ def test_health_reports_counts_and_checkpoints_and_leaks_nothing(tmp_path):
     assert health.request_count == 1
     assert health.head_position == 1
     assert health.checkpoints[PROJECTION_GRAPH] == 1
-    assert set(health.pending_projections) == {
-        PROJECTION_L1,
-        PROJECTION_VECTOR,
-        PROJECTION_L0,
+    assert set(health.pending_projections) == set(PROJECTION_NAMES) - {
+        PROJECTION_GRAPH
     }
+    assert health.unfinished_surface_count == 0
     assert health.healthy is True
     assert str(database) not in payload
     assert "The index rebuild runs nightly." not in payload

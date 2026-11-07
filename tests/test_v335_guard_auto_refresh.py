@@ -199,6 +199,9 @@ class TestGetL0IndexRideAlong:
         )
         return server, host_home, pdir, fake_config
 
+    # The ``get_l0_index`` guard-refresh ride-along is a suspended maintenance
+    # job under the graph default (``MAINTENANCE_JOBS['write_guard_refresh']``).
+    @pytest.mark.usefixtures("legacy_graph_mode")
     @pytest.mark.asyncio
     async def test_read_path_refreshes_a_stale_guard(self, _fake_host, monkeypatch):
         server, host_home, pdir, fake_config = _fake_host

@@ -46,6 +46,12 @@ MODEL_CACHE_DIR = os.environ.get(
 # HuggingFace when it is not yet cached (e.g. on networks where HF is
 # unreachable). Unset by default — set LAYERED_MEMORY_HF_PROXY to enable.
 PROXY_URL = os.environ.get("LAYERED_MEMORY_HF_PROXY", "")
+# One bounded batch for every embedding call in the process. fastembed's default
+# (256) makes ONNX Runtime retain an arena sized for the largest batch it ever
+# saw: an isolated measurement showed ~6.6GB resident at 256 against ~650MB at
+# 16. The batch only groups the forward passes, so vectors, their order and the
+# set of embedded texts are identical at any size.
+EMBED_BATCH_SIZE = 16
 
 # Module-level singleton embedder (heavy to construct; share across stores).
 _embedder = None
@@ -126,7 +132,7 @@ def _embed_texts(texts: list[str]) -> np.ndarray:
     if not texts:
         return np.zeros((0, EMBED_DIM), dtype=np.float32)
     model = _get_embedder()
-    vecs = list(model.embed(texts))
+    vecs = list(model.embed(texts, batch_size=EMBED_BATCH_SIZE))
     return np.array(vecs, dtype=np.float32)
 
 

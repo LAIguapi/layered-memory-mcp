@@ -43,6 +43,7 @@ from .graph_models import (
     CURRENT_NODE_STATUSES,
     GRAPH_SCHEMA_VERSION,
     HISTORICAL_NODE_STATUSES,
+    NODE_LIFECYCLE_TRANSITIONS,
     EdgeStatus,
     GraphEdge,
     GraphNode,
@@ -94,25 +95,13 @@ _ABOUTNESS_RELATIONS: tuple[RelationType, ...] = (
     RelationType.APPLIES_TO,
 )
 
-#: The §8.2 lifecycle table, as data: event kind -> (resulting node status, the
-#: statuses it may be applied from). A transition that does not apply is
-#: *reported*, never forced, so a replayed ledger cannot quietly invent a state
-#: the original transitions never produced. ``retract`` is the only kind that
-#: also applies to an edge (§6.2: an edge is asserted or withdrawn).
-_NODE_TRANSITIONS: dict[
-    MemoryEventKind, tuple[NodeStatus, tuple[NodeStatus, ...]]
-] = {
-    MemoryEventKind.APPROVE: (NodeStatus.ACTIVE, (NodeStatus.PENDING,)),
-    MemoryEventKind.SUPERSEDE: (
-        NodeStatus.SUPERSEDED,
-        (NodeStatus.ACTIVE, NodeStatus.PENDING),
-    ),
-    MemoryEventKind.RETRACT: (
-        NodeStatus.RETRACTED,
-        tuple(s for s in NodeStatus if s is not NodeStatus.RETRACTED),
-    ),
-    MemoryEventKind.RESTORE: (NodeStatus.ACTIVE, tuple(HISTORICAL_NODE_STATUSES)),
-}
+#: The §8.2 lifecycle table this projection applies, which is
+#: :data:`~layered_memory_mcp.graph_models.NODE_LIFECYCLE_TRANSITIONS` itself
+#: rather than a copy of it. It used to be declared here; it moved to the
+#: vocabulary module when the target-only lifecycle request started validating
+#: against it, because a planner and a projection reading two separately
+#: maintained tables is how one accepts a transition the other ignores.
+_NODE_TRANSITIONS = NODE_LIFECYCLE_TRANSITIONS
 
 #: What :meth:`InMemoryGraphStore.health` says about itself. A caller comparing
 #: backends should not have to read code to learn this one is volatile.

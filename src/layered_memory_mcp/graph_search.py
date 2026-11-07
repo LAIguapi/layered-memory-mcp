@@ -69,6 +69,9 @@ __all__ = [
     "GRAPH_EXCLUDED_PENDING",
     "GRAPH_EXCLUDED_SCOPE",
     "KEYWORD_SECTION_KEY",
+    "KEYWORD_SECTION_OWNER_KEY",
+    "KEYWORD_SECTION_OWNER_OCCURRENCE_KEY",
+    "SECTION_UNMAPPABLE_PREFIX",
     "SHARED_NAMESPACE",
     "GraphSearchOutcome",
     "RecallPolicy",
@@ -94,6 +97,22 @@ GRAPH_EXCLUDED_PENDING = "graph_excluded_pending_projection"
 #: The key a keyword recall result carries its exact matched-section identities
 #: under. Produced by ``recall.recall``; read here and nowhere else.
 KEYWORD_SECTION_KEY = "section_entries"
+
+#: The keys a *displayed* fragment carries its owning H2 surface under. The
+#: display list splits on any heading level and invents titles, so a fragment
+#: cannot carry a projection identity of its own; what it can say truthfully is
+#: which H2 block it came from, which is what makes the per-section screen below
+#: exact rather than a title match.
+KEYWORD_SECTION_OWNER_KEY = "owner_section"
+KEYWORD_SECTION_OWNER_OCCURRENCE_KEY = "owner_occurrence"
+
+#: How many displayed fragments were dropped from a file that *did* have an
+#: excluded section because their owning surface could not be identified. A
+#: count, in the block's warnings. With a known-forbidden section in the same
+#: file, "we cannot prove this fragment is not part of it" has to fail closed —
+#: and saying how often that happened is the difference between failing closed
+#: and quietly losing material.
+SECTION_UNMAPPABLE_PREFIX = "section_payload_unmappable:"
 
 #: ``config.namespace``'s own name for "no isolation". ``MemoryConfig`` treats
 #: it as the legacy single-tenant mode — the knowledge root itself rather than a
@@ -254,7 +273,7 @@ class ResultBinding:
     payload, which is not data to be serialized into a report.
     """
 
-    __slots__ = ("identity", "entry_ids", "node_ids", "result")
+    __slots__ = ("identity", "entry_ids", "node_ids", "result", "sections", "derivable")
 
     def __init__(
         self,
@@ -262,14 +281,32 @@ class ResultBinding:
         result: Mapping[str, Any],
         entry_ids: Sequence[str],
         node_ids: Sequence[str],
+        *,
+        derivable: bool = False,
+        sections: Mapping[str, Sequence[str]] | None = None,
     ) -> None:
         self.identity = identity
         self.result = result
         self.entry_ids = list(entry_ids)
         self.node_ids = list(node_ids)
+        #: Whether this producer handed over exact source identities of its own,
+        #: which is also what makes a *per-section* verdict possible: one file
+        #: result carries several surfaces, and each one has its own owner.
+        self.derivable = derivable
+        #: ``entry_id -> owning node IDs``, so a per-section verdict does not
+        #: have to re-derive what the row-level mapping already resolved.
+        self.sections = {key: list(value) for key, value in (sections or {}).items()}
 
     @property
     def mapped(self) -> bool:
+        """Whether the graph owns *any* of this row's surfaces.
+
+        Kept as the row-level question it always was, for the traversal seeds
+        and for a caller asking about a whole result. The *verdict* is no longer
+        taken from it: an answer about a file was never an answer about each of
+        its sections, which is what let an excluded section ride along inside a
+        surviving one. See :func:`_entry_exclusion_reason`.
+        """
         return bool(self.node_ids)
 
 
@@ -379,17 +416,26 @@ def result_bindings(
             # metadata stays the producer's statement about its graph identity.
             entry_ids = [identity]
 
+        metadata = result.get("metadata")
         bindings.append(
             ResultBinding(
                 identity,
                 result,
                 entry_ids,
                 _node_ids_for(
-                    entry_ids,
-                    result.get("metadata"),
-                    surface_node_ids,
-                    derivable=derivable,
+                    entry_ids, metadata, surface_node_ids, derivable=derivable
                 ),
+                derivable=derivable,
+                # Per surface, resolved by the same rule and the same order of
+                # authority as the row as a whole. One file result is several
+                # surfaces, and a verdict about the file cannot be a verdict
+                # about each of them.
+                sections={
+                    entry_id: _node_ids_for(
+                        [entry_id], metadata, surface_node_ids, derivable=derivable
+                    )
+                    for entry_id in entry_ids
+                },
             )
         )
     return bindings, without_identity
@@ -477,34 +523,56 @@ def apply_graph_recall(
     kept: list[Any] = []
     reasons: set[str] = set()
     excluded = 0
+    excluded_sections = 0
+    unmappable = 0
     for result, binding in zip(results or (), bindings):
         if binding is None:
             # No usable identity: the graph has nothing to say about this row,
             # so it keeps its legacy place in the answer.
             kept.append(result)
             continue
-        if pending and any(entry_id in pending for entry_id in binding.entry_ids):
-            reasons.add(GRAPH_EXCLUDED_PENDING)
+
+        # Per surface, not per row. A file result carries several sections, and
+        # one surviving section used to keep the *whole* file payload — which
+        # meant a retracted, expired or out-of-namespace section rode along
+        # inside the body of a sibling that was still current.
+        dropped: set[str] = set()
+        for entry_id in binding.entry_ids:
+            reason = _entry_exclusion_reason(
+                binding,
+                entry_id,
+                pending=pending,
+                governs=governs,
+                surviving=surviving,
+                filtered_out=filtered_out,
+                out_of_namespace=out_of_namespace,
+            )
+            if reason is not None:
+                dropped.add(entry_id)
+                reasons.add(reason)
+
+        if dropped and len(dropped) == len(binding.entry_ids):
             excluded += 1
             continue
-        reason = (
-            _exclusion_reason(binding, surviving, filtered_out, out_of_namespace)
-            if governs and binding.mapped
-            else None
-        )
-        if reason is not None:
-            reasons.add(reason)
-            excluded += 1
+        if dropped:
+            rebuilt, unidentified = _without_sections(binding, dropped)
+            excluded_sections += len(dropped)
+            unmappable += unidentified
+            kept.append(rebuilt)
             continue
         kept.append(binding.result)
 
     block = graph_runtime.graph_recall_payload(report)
     block["excluded_results"] = excluded
+    block["excluded_sections"] = excluded_sections
     block["exclusion_reasons"] = sorted(reasons)
+    warnings = set(block.get("warnings", ()))
     if without_identity:
-        block["warnings"] = sorted(
-            {*block.get("warnings", ()), f"results_without_identity:{without_identity}"}
-        )
+        warnings.add(f"results_without_identity:{without_identity}")
+    if unmappable:
+        warnings.add(f"{SECTION_UNMAPPABLE_PREFIX}{unmappable}")
+    if warnings:
+        block["warnings"] = sorted(warnings)
     if mode.shadow_enabled:
         block["comparison"] = graph_runtime.compare_recall_results(
             seed_rows, report
@@ -550,23 +618,36 @@ def _seed_verdicts(report: Any) -> tuple[dict[str, set[str]], dict[str, set[str]
     return surviving, filtered_out
 
 
-def _exclusion_reason(
+def _entry_exclusion_reason(
     binding: ResultBinding,
+    entry_id: str,
+    *,
+    pending: set[str],
+    governs: bool,
     surviving: Mapping[str, set[str]],
     filtered_out: Mapping[str, set[str]],
     out_of_namespace: Mapping[str, set[str]],
 ) -> str | None:
-    """Why this row is not current, or ``None`` when it is.
+    """Why *this surface* may not be answered with, or ``None`` when it may.
 
-    One surviving node is enough to keep the row: a file whose matched sections
-    include a current one is still a current answer.
+    One verdict per surface, which is the whole correction: the row-level
+    version asked "did any of this file's nodes survive" and kept the entire
+    payload when one did.
 
-    The two exclusion reasons are disjoint by construction — a node the store's
-    own filters removed never reaches the namespace screen, because the screen
-    only ever sees nodes the traversal returned — so the reported reason is the
-    thing that actually removed the row rather than a guess between them.
+    An unmapped surface keeps its place — the graph has never heard of it and
+    therefore has nothing to say — exactly as an unmapped row always did. A
+    surface the graph *knows* and deliberately filtered out is excluded. The two
+    filter reasons stay disjoint by construction: a node the store's own filters
+    removed never reaches the namespace screen, because the screen only sees
+    nodes the traversal returned.
     """
-    wanted = set(binding.node_ids)
+    if pending and entry_id in pending:
+        return GRAPH_EXCLUDED_PENDING
+    if not governs:
+        return None
+    wanted = set(binding.sections.get(entry_id, ()))
+    if not wanted:
+        return None
     if wanted & surviving.get(binding.identity, set()):
         return None
     if wanted & out_of_namespace.get(binding.identity, set()):
@@ -574,6 +655,75 @@ def _exclusion_reason(
     if wanted & filtered_out.get(binding.identity, set()):
         return GRAPH_EXCLUDED_LIFECYCLE
     return None
+
+
+def _without_sections(
+    binding: ResultBinding, dropped: set[str]
+) -> tuple[dict[str, Any], int]:
+    """One result rebuilt without the surfaces the graph excluded.
+
+    Returns the new payload and how many displayed fragments had to be dropped
+    for want of an identifiable owner. The main payload is *rebuilt*, not
+    annotated: ``section_entries``, the displayed ``sections`` and
+    ``matched_sections`` all describe the survivors, so nothing downstream has
+    to know that a filter ran. The file keeps its rank and its score, because
+    its surviving sections are still a real answer.
+
+    A fragment is matched to a surface by the owning H2 it declares — exact
+    label and occurrence, the same pair the entry identity was minted from — not
+    by its displayed title, which may be a deeper heading or a synthesized
+    "Overview". A fragment whose owner is one of the ``dropped`` surfaces is an
+    intended removal. A fragment whose owner cannot be resolved at all is
+    *also* removed, and counted: this file demonstrably contains a forbidden
+    section, so "this fragment might be part of it" must fail closed.
+    """
+    result = dict(binding.result)
+    entries = [
+        entry
+        for entry in (result.get(KEYWORD_SECTION_KEY) or ())
+        if isinstance(entry, Mapping)
+    ]
+    surviving_owners: set[tuple[str, int]] = set()
+    dropped_owners: set[tuple[str, int]] = set()
+    kept_entries: list[Any] = []
+    for entry in entries:
+        entry_id = entry.get("entry_id")
+        owner = (str(entry.get("section")), _occurrence(entry.get("occurrence")))
+        if isinstance(entry_id, str) and entry_id in dropped:
+            dropped_owners.add(owner)
+            continue
+        surviving_owners.add(owner)
+        kept_entries.append(entry)
+
+    kept_sections: list[Any] = []
+    unidentified = 0
+    for fragment in result.get("sections") or ():
+        if not isinstance(fragment, Mapping):
+            unidentified += 1
+            continue
+        label = fragment.get(KEYWORD_SECTION_OWNER_KEY)
+        owner = (
+            str(label),
+            _occurrence(fragment.get(KEYWORD_SECTION_OWNER_OCCURRENCE_KEY)),
+        )
+        if isinstance(label, str) and owner in surviving_owners:
+            kept_sections.append(fragment)
+            continue
+        if isinstance(label, str) and owner in dropped_owners:
+            continue
+        unidentified += 1
+
+    result[KEYWORD_SECTION_KEY] = kept_entries
+    result["sections"] = kept_sections
+    result["matched_sections"] = len(kept_sections)
+    return result, unidentified
+
+
+def _occurrence(value: Any) -> int:
+    """A declared occurrence as an int, or ``0``. Never a guess at another one."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    return value if value >= 0 else 0
 
 
 #: One per-result warning label, carrying how many nodes the namespace screen
@@ -588,7 +738,7 @@ def _screen_namespaces(
     """Remove out-of-namespace material from a graph answer, seeds and expansions.
 
     Returns the screened report and ``identity -> removed node IDs``, which is
-    what lets :func:`_exclusion_reason` tell "out of your namespace" apart from
+    what lets :func:`_entry_exclusion_reason` tell "out of your namespace" from
     "the graph never heard of it" — the second must keep its legacy row.
 
     The whole per-result subgraph goes with a removed node, not just the node:

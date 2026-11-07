@@ -25,6 +25,8 @@ import json
 from contextlib import contextmanager
 from pathlib import Path
 
+import pytest
+
 from layered_memory_mcp.adapters import apply_agent_action, registry, resolve_adapter
 from layered_memory_mcp.config import MemoryConfig
 from layered_memory_mcp.injector import inject_knowledge
@@ -584,7 +586,16 @@ class TestAdvisoryInject:
         assert res == {"success": False, "error": "Content is empty"}
 
 
+@pytest.mark.usefixtures("legacy_graph_mode")
 class TestBatchInjectPropagatesRouting:
+    """Batch injection must not be a quieter write path than the single one.
+
+    Legacy-contract: both calls here omit a ``semantic_write_request``, which
+    is the non-semantic shape the graph default no longer accepts. The graph
+    default's own batch behaviour is covered by
+    ``test_v361_graph_entrances.py``.
+    """
+
     def test_each_item_carries_its_own_routing(self, tmp_path):
         import asyncio
 

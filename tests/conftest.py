@@ -84,6 +84,33 @@ def _isolate_memory_home(tmp_path, monkeypatch):
     yield sandbox
 
 
+@pytest.fixture
+def legacy_graph_mode(monkeypatch):
+    """Opt in, explicitly, to the ``legacy`` rollback mode for one test.
+
+    WHY THIS IS NOT AUTOUSE
+    -----------------------
+    The rollout default is ``graph`` (``config.DEFAULT_GRAPH_MODE``). Under that
+    default the semantic journal owns the write path, so the whole-file L1 CRUD
+    tools, the review lifecycle, the derived index/vector maintenance jobs and
+    agent-memory compaction all *refuse before mutating* and name the semantic
+    call to use instead — see ``graph_mutation_guard.REFUSED_OPERATIONS`` and
+    ``MAINTENANCE_JOBS``.
+
+    A suite-wide legacy fixture would make the default untested: every test
+    would silently exercise the rollback mode, and the refusals that make the
+    graph default safe would have no coverage at all. So this fixture is
+    requested, one test or one feature at a time, and only where the test is
+    *about* the legacy contract that ``legacy`` exists to keep working. Tests of
+    the default must never request it.
+
+    Requesting it is also the honest label: it says "this behaviour is what
+    explicit rollback preserves", which is exactly what those tests pin.
+    """
+    monkeypatch.setenv("LAYERED_MEMORY_GRAPH_MODE", "legacy")
+    return "legacy"
+
+
 @pytest.fixture(autouse=True)
 def _guard_host_paths(monkeypatch):
     """Hard stop: make writes to host-managed memory dirs raise instead of land.

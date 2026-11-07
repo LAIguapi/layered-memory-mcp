@@ -169,6 +169,55 @@ class TodoStore:
             return {"success": False, "error": f"TODO not found: {todo_id}"}
         return {"success": True, "id": todo_id}
 
+    def ids(self) -> set[str]:
+        """Every task id currently held. Used by the journal's adoption guard.
+
+        v3.6.1: in a graph write mode this table is a *projection* of the
+        semantic journal, and a projection may not overwrite rows the journal
+        has no authority for. The publisher asks this first and refuses rather
+        than replacing somebody's real tasks with a partial stream.
+        """
+        with sqlite3.connect(str(self.db_path)) as conn:
+            return {str(r[0]) for r in conn.execute("SELECT id FROM todos")}
+
+    # ``rows`` is annotated as a string because ``list`` is the name of a method
+    # on this class, and a class body resolves it to that method.
+    def project(self, rows: "list[dict]") -> dict:
+        """Replace the whole table with ``rows``, in one transaction.
+
+        The projection write (v3.6.1). Deliberately a replacement rather than a
+        merge: the rows are a complete projection of the replayed task state, so
+        anything already here that is not in them is state the authority no
+        longer has — and anything *this* method is allowed to delete has already
+        been proved to be the journal's own by the caller's adoption guard.
+
+        One transaction, so a reader never sees a half-applied task view.
+        Timestamps are written as given: they are event times from the journal,
+        and re-stamping them here would make a replay re-date history.
+        """
+        with sqlite3.connect(str(self.db_path)) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("DELETE FROM todos")
+            conn.executemany(
+                """INSERT INTO todos
+                (id, domain, title, content, blocked_by, priority, status,
+                 source_session_id, notes, created_at, updated_at, completed_at,
+                 cancelled_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                [
+                    (
+                        row["id"], row["domain"], row.get("title", ""),
+                        row["content"], json.dumps(row.get("blocked_by") or []),
+                        row["priority"], row["status"],
+                        row.get("source_session_id"), row.get("notes", ""),
+                        row["created_at"], row["updated_at"],
+                        row.get("completed_at"), row.get("cancelled_at"),
+                    )
+                    for row in rows
+                ],
+            )
+        return {"success": True, "rows": len(rows)}
+
     def stats(self) -> dict:
         with sqlite3.connect(str(self.db_path)) as conn:
             conn.row_factory = sqlite3.Row
