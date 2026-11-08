@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.6.4] - 2026-11-08
+
+### Security
+
+- Apply session exclusions before summarization and limits across database,
+  directory and fallback scans; count withheld sessions without exporting them.
+- Remove unowned content mirrors and links when graph sections are excluded;
+  screen namespace node identities and diagnostics while retaining a content-free
+  unresolved-conflict signal and tolerating malformed optional ID lists.
+- Share confined no-follow knowledge reads across retrieval and file readers,
+  including the exported cached-read helper, with descriptor validation against
+  replacement races where supported; mtime-only cache hits do not bypass reads.
+- Default access-log query recording off; retain sensitive explicit opt-in.
+- Report incomplete legacy deletion when derived cleanup fails, without
+  claiming atomic deletion or erasure of backups, journals or history.
+- Use content-free diagnostics at selected privacy-sensitive entry paths and
+  enforce explicit offline model loading without online or proxy retries.
+- Bound create/update pointer reports to status/categories/counters; keyword
+  directory fallback retains excluded database session identities.
+- Strengthen disposable test isolation without changing the graph default.
+
 ## [3.6.3] - 2026-11-08
 
 Improve unified retrieval L0 routing for contiguous CJK queries.

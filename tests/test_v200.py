@@ -132,7 +132,7 @@ class TestL1Store:
 
 
 class TestVectorStore:
-    def test_add_and_search(self):
+    def test_add_and_search(self, synthetic_embeddings):
         with tempfile.TemporaryDirectory() as tmp:
             vs = VectorStore(Path(tmp) / "vectors.db")
             entry = KnowledgeEntry(

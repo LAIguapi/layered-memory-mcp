@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Iterable
 
 from .heading import heading_skeleton
+from .privacy import diagnostic
 
 if TYPE_CHECKING:
     from .config import MemoryConfig
@@ -552,9 +553,8 @@ def post_write_governance(
             },
             "suggestions": suggestions,
         }
-    except Exception as e:  # noqa: BLE001 — governance is advisory only
-        logger.warning("post-write governance failed for %s: %s", filepath, e)
-        return {"error": str(e)}
+    except Exception:
+        return {"error": diagnostic(logger, "post_write_governance_failed")}
 
 
 def build_validation_extras(config: "MemoryConfig", max_findings: int = 10) -> dict:

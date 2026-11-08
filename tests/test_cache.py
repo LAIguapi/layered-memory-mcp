@@ -1,6 +1,7 @@
 """Tests for the cache module."""
 
 import time
+import os
 from pathlib import Path
 
 import pytest
@@ -152,7 +153,7 @@ class TestCachedReadText:
         content1 = cached_read_text(str(test_file))
         assert content1 == "cached content"
 
-        # Second read → cache
+        # Second read validates the file again before refreshing the cache.
         content2 = cached_read_text(str(test_file))
         assert content2 == "cached content"
 
@@ -175,3 +176,38 @@ class TestInvalidateAllCaches:
         # Caches should be empty
         from layered_memory_mcp.cache import get_content_cache
         assert len(get_content_cache().stats()["paths"]) == 0
+
+
+@pytest.mark.parametrize("warm", [False, True])
+@pytest.mark.parametrize("linked", [False, True])
+def test_cached_reader_validates_current_file_even_with_same_mtime(tmp_path, warm, linked):
+    from layered_memory_mcp.cache import get_content_cache
+
+    target = tmp_path / "neutral.md"
+    target.write_text("ALLOWED 中性", encoding="utf-8")
+    original = target.stat()
+    if warm:
+        assert cached_read_text(str(target)) == "ALLOWED 中性"
+        assert get_content_cache().get(str(target)) == "ALLOWED 中性"
+    decoy = tmp_path / "decoy.md"
+    decoy.write_text("FORBIDDEN" if linked else "NEW 中性", encoding="utf-8")
+    os.utime(decoy, ns=(original.st_atime_ns, original.st_mtime_ns))
+    target.unlink()
+    if linked:
+        target.symlink_to(decoy)
+    else:
+        os.replace(decoy, target)
+    assert target.stat().st_mtime_ns == original.st_mtime_ns
+    result = cached_read_text(str(target))
+    assert result is None if linked else result == "NEW 中性"
+
+
+def test_cached_reader_encoding_compatibility_and_content_free_failure(tmp_path, caplog):
+    target = tmp_path / "neutral.md"
+    target.write_bytes(b"caf\xe9")
+    assert cached_read_text(str(target), encoding="latin-1") == "café"
+    assert cached_read_text(str(target)) == "caf�"
+    caplog.set_level("DEBUG", logger="layered_memory_mcp.cache")
+    assert cached_read_text(str(target), encoding="synthetic-invalid-codec") is None
+    assert "synthetic-invalid-codec" not in caplog.text
+    assert str(target) not in caplog.text

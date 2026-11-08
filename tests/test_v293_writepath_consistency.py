@@ -41,7 +41,7 @@ def _mk_config(tmp_path):
 
 # --- Root cause 1+2: whole-file vector rebuild (replace_domain) -------------
 
-def test_replace_domain_rebuilds_one_vector_per_section(tmp_path):
+def test_replace_domain_rebuilds_one_vector_per_section(tmp_path, synthetic_embeddings):
     """A whole-file write rebuilds vectors per-section, no orphans left."""
     cfg = _mk_config(tmp_path)
     data_dir = Path(cfg.home) / "data"
@@ -70,7 +70,7 @@ def test_replace_domain_rebuilds_one_vector_per_section(tmp_path):
     assert "sec_c" in joined and "sec_b" not in joined
 
 
-def test_replace_domain_skips_header_and_blockquote(tmp_path):
+def test_replace_domain_skips_header_and_blockquote(tmp_path, synthetic_embeddings):
     """The file-level '# title' and '> intro' must not become vectors."""
     cfg = _mk_config(tmp_path)
     data_dir = Path(cfg.home) / "data"

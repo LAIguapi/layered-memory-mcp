@@ -1844,7 +1844,118 @@ These references do not override this repository's requirements for a single
 semantic write path, source-backed state, rebuildability, local fallback, and
 privacy boundaries.
 
-## 18. References
+## 18. Privacy boundaries (3.6.4)
+
+Session scans apply the configured literal, case-insensitive marker substrings and
+source exclusions to all decoded raw message fields (including system/tool
+messages and optional database `tool_calls` columns) and source
+metadata before sampling, truncation or `max_sessions`. `total_sessions` counts
+the source candidates in the time window, `scanned` counts returned summaries,
+and marker/source counters cover all candidates, not just the returned prefix.
+Directory fallback uses the same policy, including known excluded database
+session identities; missing/empty databases still allow neutral session files.
+A database read/schema failure is an error, not permission to bypass filters.
+Keyword search with no database hit explicitly searches the filtered directory,
+carrying excluded database identities so aliases cannot bypass that exclusion.
+
+Graph-enabled reads remove excluded sections from primary results and remove
+unowned `wiki_links` and whole-file text mirrors when a section is removed.
+Namespace screening retains own, shared and legacy unscoped nodes, screens seed
+IDs, rebuilds edges/paths/provenance/conflicts from surviving nodes even when
+excluded seeds were already absent, and replaces unsafe diagnostic aggregates
+at all three warning layers with content-free counts. Lifecycle decisions are
+captured before those diagnostics are replaced. Ordering stays deterministic.
+An unresolved conflict whose counterpart is absent or screened still emits the
+constant `unresolved_conflict` category, without counterpart IDs, group or detail.
+Malformed optional ID lists are ignored/cleared; valid scalar bindings remain.
+Shadow leaves the original legacy primary rows unchanged and sanitizes only
+its graph side block; only graph-authoritative reads filter primary content.
+Legacy semantics and unified retrieval's explicit opt-in are unchanged.
+Domains and namespaces are retrieval filters,
+not caller authentication or an authorization boundary.
+
+Knowledge reads use `storage.knowledge_reader.read_knowledge_text`. Configured
+roots confine the path; every component, including root ancestors and final
+files, must be non-symlink. On supported POSIX systems the reader pins directory
+descriptors, opens no-follow, checks regular-file type/size and validates inode
+identity and file metadata before returning UTF-8 text. Unsupported secure-open
+platforms fail closed. Normal Unicode/nested files remain readable; existing
+flat-domain filename restrictions remain. This does not defend against hard
+links, privileged/in-place writers, or turn the write paths into a sandbox.
+
+Affected read entrances (no content-cache bypass):
+
+- `storage.l1_store`: standalone/frontmatter reads, `L1Store.read` and backup reads.
+- Exported `cache.cached_read_text`: always performs a fresh central secure read;
+  same-mtime cache entries cannot authorize a return. Its optional encoding and
+  replacement decoding remain supported; knowledge readers still default to
+  strict UTF-8. Generic `ContentCache.get` remains an mtime/TTL cache, **not** a
+  secure reader or confinement boundary.
+- `recall`: keyword/fuzzy/BM25/hybrid corpus reads, L0 generation, similarity and health reads.
+- `unified_recall.L1StoreHydrator`: delegates to the same `L1Store.read` boundary.
+- `unified_recall.L0RouteAdapter.route`: the configured L0 index uses the same no-follow reader.
+- MCP `get_knowledge_file`, knowledge-list title hints, update/delete outgoing-content reads and approval reads.
+- REST get/update/approve/reject secondary Markdown reads.
+- REST `search_knowledge(unified=true)`: L0 routing and L1 hydration use those readers;
+  legacy semantic search still returns persisted vector payloads, not a fresh file hydration.
+- `backups.backup_knowledge_file` when outgoing content was not supplied.
+
+Access-log query recording defaults **off** in the store, config and server
+fallback. Sensitive opt-in: `access_log.log_query: true` in the framework's
+configuration or `LAYERED_MEMORY_LOG_QUERY=true` (environment wins), or an
+explicit `AccessLogStore(log_query=True)`. Domain/type/rank/score/time telemetry
+remains; disabling query recording does not delete historical records. No new
+query fingerprint ledger is maintained.
+
+Legacy whole-file deletion reports `file_deleted`, `cleanup_pending` and per-step
+states for the file, index (`skipped` when disabled), vector rows, adjacent legacy backup and optional
+agent-memory pointer. Cleanup failure after unlink is incomplete, not success;
+missing vector databases/rows are benign. Graph-managed projection refusal still
+precedes every effect. Backups, journals and historical telemetry are retained:
+this is neither atomic deletion nor irreversible forgetting/privacy erasure.
+
+Any of `LAYERED_MEMORY_OFFLINE`, `HF_HUB_OFFLINE`, `TRANSFORMERS_OFFLINE` set to a
+truthy boolean enables offline mode. Local model construction uses
+`local_files_only=True`; a miss returns `model_cache_miss_offline` with no direct
+or proxy retry. A singleton created through online bootstrap cannot bypass a
+later offline request. When all offline switches are disabled, online bootstrap
+and an explicitly configured proxy remain available. Tests inject models, never
+download or load a real one.
+
+Unexpected errors at selected scan, recall, whole-file CRUD, vector cleanup and
+access-log paths, and the touched HTTP read/update/review-read entrances, use
+constant codes, not exception strings, raw queries,
+payloads, credential material or tracebacks. Expected validation categories
+remain actionable. This is **not** a whole-framework error audit: legacy
+inject/maintenance/migration, adapter, review, dashboard and other REST error
+surfaces still require independent review. The separate structured
+`SessionReader` extraction path is not covered by the scanner exclusion policy.
+Create/update pointer dual-write reports expose only allowlisted actions,
+content-free categories and nonnegative integer counters. Read/write failures
+remain explicit even when the primary knowledge write succeeded; raw helper
+reasons, pointer text and detected paths are not returned at these boundaries.
+
+Test isolation redirects independent memory, session, model, config, graph,
+journal and generation-pointer resolution before application imports. The
+Python guard uses component-based protected paths and intercepts Python open,
+SQLite and filesystem mutation entrances (directory FDs where supported).
+Tests prove blocked mutations against synthetic protected roots, not host data.
+This is defense in depth, **not an OS sandbox**: native extensions, subprocesses,
+preopened handles, unpatched APIs, symlink aliases and hostile races can bypass
+Python patches. Protected-root matching is lexical/component-based and does
+not inspect host targets to prove protection.
+Subprocess tests inherit isolated paths; real model/network calls are forbidden.
+Explicit default-graph tests are retained, not globally forced into legacy mode.
+
+Rollback: use the existing explicit `graph.mode: legacy` only when legacy
+projection writes are intended; unified retrieval remains opt-in. Query logging
+can be deliberately re-enabled with the sensitive option above, and online
+bootstrap with all offline switches disabled. Do not disable the no-follow read
+boundary to recover symlink layouts: relocate/copy regular knowledge files into
+the configured root instead. No production verification, migration, reindex or
+data cleanup is implied by these fixture-only tests.
+
+## 19. References
 
 - Graphiti: https://github.com/getzep/graphiti
 - Graphiti episode/provenance concepts:

@@ -63,7 +63,7 @@ The L0 index, the vector store and the search index are **derived** from the L1 
 - **Space Analysis** — Monitor memory usage and get optimization suggestions
 - **Agent-Neutral** — Works with any MCP-compatible agent (Hermes, Claude, Cursor, etc.)
 - **Zero Dependencies** — Core engine uses Python stdlib only; only `fastmcp` for MCP transport
-- **Privacy First** — All data stored locally, no external API calls
+- **Local Retrieval** — Knowledge stays local; embedding bootstrap can download a model unless offline mode is enabled. Query logging defaults off; see the privacy boundaries in `ARCHITECTURE_v2.md`.
 
 > **Design Note:** The hybrid search ranking is inspired by [Semble](https://github.com/MinishLab/semble), a fast code search library for agents. We adapted their RRF (Reciprocal Rank Fusion) approach — with multi-signal boosting and query-aware alpha detection — for markdown knowledge retrieval.
 

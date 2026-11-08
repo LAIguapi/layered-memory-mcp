@@ -23,6 +23,8 @@ import sqlite3
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+from ..privacy import diagnostic
+
 logger = logging.getLogger("layered_memory.access_log")
 
 _BEIJING_TZ = timezone(timedelta(hours=8))
@@ -35,7 +37,7 @@ ZOMBIE_GRACE_DAYS = 30
 class AccessLogStore:
     """SQLite-backed recall telemetry. All writes are best-effort."""
 
-    def __init__(self, db_path: Path, retention_days: int = 90, log_query: bool = True):
+    def __init__(self, db_path: Path, retention_days: int = 90, log_query: bool = False):
         self.db_path = db_path
         self.retention_days = retention_days
         self.log_query = log_query
@@ -56,8 +58,8 @@ class AccessLogStore:
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_al_domain ON access_log(domain)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_al_time ON access_log(accessed_at)")
                 conn.commit()
-        except Exception as exc:
-            logger.debug("access_log init failed: %s", exc)
+        except Exception:
+            diagnostic(logger, "access_log_init_failed", level=logging.DEBUG)
 
     # ── Write path (best-effort) ────────────────────────────────────────
 
@@ -78,8 +80,8 @@ class AccessLogStore:
                     (domain, access_type, q, rank, score, now),
                 )
                 conn.commit()
-        except Exception as exc:
-            logger.debug("access_log record failed (domain=%s): %s", domain, exc)
+        except Exception:
+            diagnostic(logger, "access_log_record_failed", level=logging.DEBUG)
 
     def record_batch(self, events: list[dict]) -> None:
         """Record multiple events in one transaction. Never raises.
@@ -111,8 +113,8 @@ class AccessLogStore:
                     rows,
                 )
                 conn.commit()
-        except Exception as exc:
-            logger.debug("access_log record_batch failed: %s", exc)
+        except Exception:
+            diagnostic(logger, "access_log_record_batch_failed", level=logging.DEBUG)
 
     def prune(self) -> int:
         """Delete events older than retention_days. Returns rows deleted."""
@@ -122,8 +124,8 @@ class AccessLogStore:
                 cur = conn.execute("DELETE FROM access_log WHERE accessed_at < ?", (cutoff,))
                 conn.commit()
                 return cur.rowcount
-        except Exception as exc:
-            logger.debug("access_log prune failed: %s", exc)
+        except Exception:
+            diagnostic(logger, "access_log_prune_failed", level=logging.DEBUG)
             return 0
 
     # ── Read / aggregation path (off the hot path) ──────────────────────
@@ -145,8 +147,8 @@ class AccessLogStore:
                     (since, limit),
                 ).fetchall()
             return [self._fmt_row(r) for r in rows]
-        except Exception as exc:
-            logger.debug("top_recalled failed: %s", exc)
+        except Exception:
+            diagnostic(logger, "access_log_top_recalled_failed", level=logging.DEBUG)
             return []
 
     def domain_stats(self, domain: str, days: int = 30) -> dict:
@@ -173,8 +175,8 @@ class AccessLogStore:
                 "first_access_in_window": _to_local(row["first_access"]) if row and row["first_access"] else None,
                 "avg_score": round(row["avg_score"], 4) if row and row["avg_score"] is not None else None,
             }
-        except Exception as exc:
-            logger.debug("domain_stats failed: %s", exc)
+        except Exception:
+            diagnostic(logger, "access_log_domain_stats_failed", level=logging.DEBUG)
             return {"domain": domain, "hits_in_window": 0, "total_hits": 0}
 
     def trend(self, domain: str, days: int = 30) -> list[dict]:
@@ -190,8 +192,8 @@ class AccessLogStore:
                     (domain, since),
                 ).fetchall()
             return [{"day": r["day"], "hits": r["hits"]} for r in rows]
-        except Exception as exc:
-            logger.debug("trend failed: %s", exc)
+        except Exception:
+            diagnostic(logger, "access_log_trend_failed", level=logging.DEBUG)
             return []
 
     def recalled_domains(self) -> set[str]:
@@ -200,8 +202,8 @@ class AccessLogStore:
             with sqlite3.connect(str(self.db_path)) as conn:
                 rows = conn.execute("SELECT DISTINCT domain FROM access_log").fetchall()
             return {r[0] for r in rows if r[0]}
-        except Exception as exc:
-            logger.debug("recalled_domains failed: %s", exc)
+        except Exception:
+            diagnostic(logger, "access_log_recalled_domains_failed", level=logging.DEBUG)
             return set()
 
     def first_seen_map(self) -> dict[str, str]:
@@ -212,8 +214,8 @@ class AccessLogStore:
                     "SELECT domain, MIN(accessed_at) AS first FROM access_log GROUP BY domain"
                 ).fetchall()
             return {r[0]: r[1] for r in rows if r[0]}
-        except Exception as exc:
-            logger.debug("first_seen_map failed: %s", exc)
+        except Exception:
+            diagnostic(logger, "access_log_first_seen_failed", level=logging.DEBUG)
             return {}
 
     def overview(self, days: int = 30) -> dict:
@@ -238,8 +240,8 @@ class AccessLogStore:
                 "active_domains": row["domains"] if row else 0,
                 "by_type": {r["access_type"]: r["c"] for r in by_type},
             }
-        except Exception as exc:
-            logger.debug("overview failed: %s", exc)
+        except Exception:
+            diagnostic(logger, "access_log_overview_failed", level=logging.DEBUG)
             return {"window_days": days, "total_events": 0, "active_domains": 0, "by_type": {}}
 
     @staticmethod

@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Callable
 
 from .memory_changelog import hash_text, record as record_memory_change
 from .recall import generate_l0_index, invalidate_scan_cache, scan_knowledge_files
+from .privacy import diagnostic
 
 if TYPE_CHECKING:
     from .config import MemoryConfig
@@ -112,8 +113,8 @@ def sync_l0_index(
         try:
             existing_text = l0_file.read_text(encoding="utf-8")
             existing_entries = _parse_entry_domains(existing_text, effective_format, config)
-        except Exception as e:
-            logger.warning("Failed to read existing L0: %s", e)
+        except Exception:
+            diagnostic(logger, "l0_existing_read_failed")
 
     # Compute diff
     new_domains = _parse_entry_domains(new_content, effective_format, config)
@@ -143,15 +144,15 @@ def sync_l0_index(
         try:
             if new_content:
                 l0_file.write_text(new_content, encoding="utf-8")
-                logger.info("Synced L0 index: %d entries → %s", len(new_domains), l0_file)
+                logger.info("l0_index_synced:%d", len(new_domains))
             else:
                 # No L1 files at all — write empty marker
                 l0_file.write_text("# L0 Index (empty — no L1 knowledge files)\n", encoding="utf-8")
             report["bytes_written"] = len(new_content.encode("utf-8")) if new_content else 0
-        except Exception as e:
-            logger.error("Failed to write L0 index: %s", e)
+        except Exception:
+            diagnostic(logger, "l0_index_write_failed")
             report["success"] = False
-            report["error"] = str(e)
+            report["error"] = "l0_index_write_failed"
     else:
         report["l0_file"] = None
         report["note"] = "L0 index file not configured — sync skipped (L1 files are up to date)"
@@ -218,8 +219,8 @@ def _record_l0_entry_changes(
                         "entries_removed": len(removed),
                     },
                 )
-    except Exception as e:  # noqa: BLE001 — provenance never breaks a sync
-        logger.warning("memory changelog record failed (non-critical): %s", e)
+    except Exception:
+        diagnostic(logger, "l0_changelog_record_failed")
 
 
 

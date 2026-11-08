@@ -302,3 +302,16 @@ backend:
 # get_memory_surface_capabilities() reports both switches, and the
 # l1_knowledge note says which one you are living under.
 # =============================================================================
+
+# Sensitive opt-in: query text is NOT recorded by default. Metadata (domain,
+# access type, rank, score and time) is still recorded when access logging is on.
+# LAYERED_MEMORY_LOG_QUERY=true overrides this setting. Historical rows are not
+# deleted by changing it; retention is separate from privacy erasure.
+access_log:
+  log_query: false
+
+# Offline model use: set LAYERED_MEMORY_OFFLINE=1, HF_HUB_OFFLINE=1 or
+# TRANSFORMERS_OFFLINE=1 in the process environment. Cache loading uses
+# local_files_only=True and a cache miss returns model_cache_miss_offline.
+# With all offline switches disabled, online bootstrap remains available;
+# LAYERED_MEMORY_HF_PROXY is an explicit optional online download proxy.

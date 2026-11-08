@@ -12,6 +12,8 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
+from .storage.knowledge_reader import KnowledgeReadError, read_knowledge_text
+
 
 @dataclass
 class _Candidate:
@@ -504,9 +506,12 @@ class L0RouteAdapter:
         self.index_file = index_file
 
     def route(self, query: str) -> list[dict[str, Any]]:
-        if self.index_file is None or not self.index_file.exists():
+        if self.index_file is None:
             return []
-        content = self.index_file.read_text(encoding="utf-8")
+        try:
+            content = read_knowledge_text(self.index_file)
+        except (KnowledgeReadError, OSError):
+            return []
         query_tokens = {
             token.casefold()
             for token in self._tokens(str(query))

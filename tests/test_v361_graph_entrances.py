@@ -552,10 +552,14 @@ AUTHORITY_TOOLS = frozenset({
 
 
 def _mcp_tool_names() -> set[str]:
-    import re
+    import ast
 
     source = Path(server.__file__).read_text(encoding="utf-8")
-    return set(re.findall(r"@mcp\.tool\(\)\s*\nasync def (\w+)", source))
+    return {
+        node.name for node in ast.parse(source).body if isinstance(node, ast.AsyncFunctionDef)
+        and any(isinstance(decorator, ast.Call) and ast.unparse(decorator.func) == "mcp.tool"
+                for decorator in node.decorator_list)
+    }
 
 
 def _guarded_tool_names() -> set[str]:

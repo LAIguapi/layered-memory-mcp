@@ -33,6 +33,8 @@ from ..models import (
     SourceType,
 )
 from ..storage import L1Store, ReviewQueue, VectorStore
+from ..storage.knowledge_reader import read_knowledge_text
+from ..privacy import private_http
 
 if TYPE_CHECKING:
     from ..config import MemoryConfig
@@ -267,6 +269,7 @@ def create_app() -> FastAPI:
     # included — is never reached. A literal path segment cannot be expressed as
     # a constraint on ``entry_id``, so order is the whole mechanism here.
     @app.get("/knowledge/search", response_model=None)
+    @private_http("knowledge_search_failed")
     async def search_knowledge(
         q: str = Query(..., min_length=1),
         top_n: int = Query(5, ge=1, le=20),
@@ -316,6 +319,7 @@ def create_app() -> FastAPI:
         ]
 
     @app.get("/knowledge/{entry_id}", response_model=KnowledgeResponse)
+    @private_http("knowledge_read_failed")
     async def get_knowledge(entry_id: str) -> dict:
         """Get a knowledge entry by ID."""
         # Search all domains
@@ -323,7 +327,7 @@ def create_app() -> FastAPI:
             meta, content = stores["l1"].read(domain)
             if meta and meta.get("id") == entry_id:
                 entry = KnowledgeEntry.from_markdown(
-                    stores["l1"]._resolve_path(domain).read_text(),
+                    read_knowledge_text(stores["l1"]._resolve_path(domain), stores["l1"].knowledge_dir),
                     domain=domain,
                 )
                 return _entry_to_response(entry)
@@ -331,6 +335,7 @@ def create_app() -> FastAPI:
         raise HTTPException(status_code=404, detail="Entry not found")
 
     @app.put("/knowledge/{entry_id}", response_model=KnowledgeResponse)
+    @private_http("knowledge_update_failed")
     async def update_knowledge(entry_id: str, req: UpdateKnowledgeRequest) -> dict:
         """Update a knowledge entry."""
         _graph_refusal("rest_update_knowledge")
@@ -341,7 +346,7 @@ def create_app() -> FastAPI:
             meta, content = stores["l1"].read(domain)
             if meta and meta.get("id") == entry_id:
                 entry = KnowledgeEntry.from_markdown(
-                    stores["l1"]._resolve_path(domain).read_text(),
+                    read_knowledge_text(stores["l1"]._resolve_path(domain), stores["l1"].knowledge_dir),
                     domain=domain,
                 )
                 entry_domain = domain
@@ -422,6 +427,7 @@ def create_app() -> FastAPI:
         ]
 
     @app.post("/review/{item_id}/approve")
+    @private_http("knowledge_review_read_failed")
     async def approve_review(item_id: str, req: ReviewActionRequest) -> dict:
         """Approve a pending review item."""
         _graph_refusal("rest_approve_review")
@@ -436,7 +442,7 @@ def create_app() -> FastAPI:
             meta, content = stores["l1"].read(domain)
             if meta and meta.get("id") == item_id:
                 entry = KnowledgeEntry.from_markdown(
-                    stores["l1"]._resolve_path(domain).read_text(),
+                    read_knowledge_text(stores["l1"]._resolve_path(domain), stores["l1"].knowledge_dir),
                     domain=domain,
                 )
                 entry.review_status = ReviewStatus.APPROVED
@@ -447,6 +453,7 @@ def create_app() -> FastAPI:
         return result
 
     @app.post("/review/{item_id}/reject")
+    @private_http("knowledge_review_read_failed")
     async def reject_review(item_id: str, req: ReviewActionRequest) -> dict:
         """Reject a pending review item."""
         _graph_refusal("rest_reject_review")
@@ -459,7 +466,7 @@ def create_app() -> FastAPI:
             meta, content = stores["l1"].read(domain)
             if meta and meta.get("id") == item_id:
                 entry = KnowledgeEntry.from_markdown(
-                    stores["l1"]._resolve_path(domain).read_text(),
+                    read_knowledge_text(stores["l1"]._resolve_path(domain), stores["l1"].knowledge_dir),
                     domain=domain,
                 )
                 entry.review_status = ReviewStatus.REJECTED

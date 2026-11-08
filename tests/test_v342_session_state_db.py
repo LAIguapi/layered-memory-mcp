@@ -234,7 +234,8 @@ class TestConfigDefaults:
         assert cfg.session_exclude_markers == []
         assert cfg.session_exclude_sources == ["cron"]
 
-    def test_markers_read_from_config_yaml(self, tmp_path):
+    def test_markers_read_from_config_yaml(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("LAYERED_MEMORY_HERMES_DB", raising=False)
         home = tmp_path / "home"
         home.mkdir()
         (home / "config.yaml").write_text(

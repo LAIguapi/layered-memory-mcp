@@ -1,4 +1,4 @@
-"""Global test isolation — keeps the suite from ever touching host data.
+"""Global test path isolation with a defense-in-depth Python mutation guard.
 
 WHY THIS FILE EXISTS
 --------------------
@@ -11,8 +11,10 @@ The side effect: a test that set only ``LAYERED_MEMORY_HOME`` could still
 resolve a host-managed memory path, so a test exercising the dual-write path
 could escape the sandbox. The fixtures below close that escape hatch.
 
-The autouse fixture below closes every escape hatch at once, so isolation is
-the default and no future test has to remember to opt in.
+The runner must isolate HOME, config/memory/graph paths and cache roots before
+collection imports. Fixtures then give each test disposable paths. This guard
+is not an OS sandbox: native code, subprocesses, preopened descriptors,
+unpatched APIs, symlink aliases and hostile races remain outside its guarantee.
 """
 
 from __future__ import annotations
@@ -24,6 +26,9 @@ import pytest
 # The host home, captured at import time — before any fixture redirects HOME —
 # so the host-path guard cannot be fooled by ordering.
 _REAL_HOME = os.path.expanduser("~")
+_HOST_HOMES = {_REAL_HOME, "/root"}
+if os.environ.get("USERPROFILE"):
+    _HOST_HOMES.add(os.environ["USERPROFILE"])
 
 # Every env var that can steer a write at host-managed data.
 _REDIRECTED_ENV_VARS = (
@@ -32,7 +37,40 @@ _REDIRECTED_ENV_VARS = (
     "LAYERED_MEMORY_L0_INDEX_FILE",
     "LAYERED_MEMORY_SESSIONS_DIR",
     "LAYERED_MEMORY_COMPACT_DOMAIN_RULES_FILE",
+    "LAYERED_MEMORY_HERMES_DB",
+    "LAYERED_MEMORY_MODEL_DIR",
+    "LAYERED_MEMORY_CHANGELOG_PATH",
+    "LAYERED_MEMORY_GRAPH_DB_PATH",
+    "LAYERED_MEMORY_GRAPH_JOURNAL_PATH",
+    "LAYERED_MEMORY_GRAPH_ACTIVE_POINTER",
+    "LAYERED_MEMORY_AGENT_EXTENSIONS_ROOT",
 )
+_INHERITED_PROTECTED_PATHS = [
+    os.environ[name] if name.endswith(("HOME", "DIR", "ROOT")) else os.path.dirname(os.environ[name])
+    for name in _REDIRECTED_ENV_VARS if os.environ.get(name) and os.path.isabs(os.environ[name])
+]
+_INHERITED_PROTECTED_PATHS.extend(
+    os.environ[name] for name in (
+        "HF_HOME", "TRANSFORMERS_CACHE", "TORCH_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME",
+    ) if os.environ.get(name) and os.path.isabs(os.environ[name])
+)
+
+
+def pytest_configure(config):
+    """Block model construction even in legacy collection-time model probes."""
+    import fastembed
+
+    def forbidden_model(*args, **kwargs):
+        raise RuntimeError("test_model_loading_forbidden")
+
+    config._privacy_model_guard = pytest.MonkeyPatch()
+    config._privacy_model_guard.setattr(fastembed, "TextEmbedding", forbidden_model)
+
+
+def pytest_unconfigure(config):
+    guard = getattr(config, "_privacy_model_guard", None)
+    if guard is not None:
+        guard.undo()
 
 
 @pytest.fixture(autouse=True)
@@ -67,19 +105,16 @@ def _isolate_memory_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(fake_home))
     monkeypatch.setenv("USERPROFILE", str(fake_home))  # Windows equivalent
 
-    # Vector models are read-only large artifacts, not writable test data.
-    # Keep an existing model cache visible after HOME is redirected so vector tests
-    # do not try to bootstrap-download the embedding model in offline CI/dev.
-    real_model_dir = os.path.join(_REAL_HOME, ".layered-memory", "models")
-    if os.path.exists(real_model_dir):
-        monkeypatch.setenv("LAYERED_MEMORY_MODEL_DIR", real_model_dir)
-
     # Drop inherited overrides so the caller's shell env can't leak in and
     # re-point a write at real data.
     for var in _REDIRECTED_ENV_VARS:
         if var in ("LAYERED_MEMORY_HOME", "LAYERED_MEMORY_AGENT_MEMORY_PATH"):
             continue  # set explicitly above
         monkeypatch.delenv(var, raising=False)
+
+    monkeypatch.setenv("LAYERED_MEMORY_HERMES_DB", str(sandbox / "sessions.db"))
+    monkeypatch.setenv("LAYERED_MEMORY_SESSIONS_DIR", str(sandbox / "sessions"))
+    monkeypatch.setenv("LAYERED_MEMORY_MODEL_DIR", str(sandbox / "models"))
 
     yield sandbox
 
@@ -111,6 +146,19 @@ def legacy_graph_mode(monkeypatch):
     return "legacy"
 
 
+@pytest.fixture
+def synthetic_embeddings(monkeypatch):
+    """Explicit model-free vectors for storage/persistence tests, not semantics."""
+    import numpy as np
+    from layered_memory_mcp.storage import vector_store
+
+    def embed(texts):
+        return np.ones((len(texts), vector_store.EMBED_DIM), dtype=np.float32) / np.sqrt(vector_store.EMBED_DIM)
+
+    monkeypatch.setattr(vector_store, "_embed_texts", embed)
+    return embed
+
+
 @pytest.fixture(autouse=True)
 def _guard_host_paths(monkeypatch):
     """Hard stop: make writes to host-managed memory dirs raise instead of land.
@@ -131,45 +179,92 @@ def _guard_host_paths(monkeypatch):
     backstop.
     """
     import builtins
-    import pathlib
+    import io
+    import sqlite3
+    from urllib.parse import unquote, urlsplit
 
     real_open = builtins.open
-    real_path_open = pathlib.Path.open
+    real_io_open = io.open
+    real_os_open = os.open
+    real_connect = sqlite3.connect
     # Resolved once, from the real environment, before HOME is redirected.
     # Snapshotting at import time keeps this independent of fixture ordering.
-    forbidden = tuple(
-        os.path.join(_REAL_HOME, part)
+    forbidden = list(
+        os.path.join(home, part)
+        for home in _HOST_HOMES
         for part in (
             ".hermes/memories",
             ".layered-memory",
+            ".layered-memory-graph",
             ".hermes/plugins",
             ".hermes/config.yaml",
+            ".hermes/sessions",
+            ".hermes/state.db",
+            ".claude",
+            ".cursor",
+            ".cline",
         )
     )
+    forbidden.extend(_INHERITED_PROTECTED_PATHS)
 
-    def _check(file, mode):
-        if not any(w in str(mode) for w in ("w", "a", "x", "+")):
+    def _check(file, writing=True, dir_fd=None):
+        if not writing:
             return
-        target = os.path.abspath(str(file))
+        if isinstance(file, int):
+            file = os.readlink(f"/proc/self/fd/{file}")
+        target = os.fsdecode(file)
+        if dir_fd is not None and not os.path.isabs(target):
+            try:
+                target = os.path.join(os.readlink(f"/proc/self/fd/{dir_fd}"), target)
+            except OSError:
+                raise AssertionError("TEST ISOLATION VIOLATION: unresolved directory descriptor") from None
+        target = os.path.abspath(target)
         for bad in forbidden:
-            if target.startswith(bad):
-                raise AssertionError(
-                    "TEST ISOLATION VIOLATION: attempted write to "
-                    f"host-managed path {target!r}. Use the sandbox from "
-                    "the _isolate_memory_home fixture instead."
-                )
+            if os.path.commonpath((target, os.path.abspath(bad))) == os.path.abspath(bad):
+                raise AssertionError("TEST ISOLATION VIOLATION: protected mutation")
+
+    def _writing(mode):
+        return any(flag in str(mode) for flag in ("w", "a", "x", "+"))
 
     def guarded_open(file, mode="r", *args, **kwargs):
-        _check(file, mode)
+        _check(file, _writing(mode))
         return real_open(file, mode, *args, **kwargs)
 
-    def guarded_path_open(self, mode="r", *args, **kwargs):
-        _check(self, mode)
-        return real_path_open(self, mode, *args, **kwargs)
+    def guarded_io_open(file, mode="r", *args, **kwargs):
+        _check(file, _writing(mode))
+        return real_io_open(file, mode, *args, **kwargs)
+
+    def guarded_os_open(file, flags, *args, **kwargs):
+        _check(file, bool(flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND)),
+               kwargs.get("dir_fd"))
+        return real_os_open(file, flags, *args, **kwargs)
+
+    def guarded_connect(database, *args, **kwargs):
+        target = os.fsdecode(database)
+        if target != ":memory:":
+            if kwargs.get("uri") and target.startswith("file:"):
+                target = unquote(urlsplit(target).path)
+            _check(target)
+        return real_connect(database, *args, **kwargs)
+
+    def mutation_guard(original, two_paths=False):
+        def guarded(source, *args, **kwargs):
+            _check(source, dir_fd=kwargs.get("src_dir_fd") if two_paths else kwargs.get("dir_fd"))
+            if two_paths:
+                destination = args[0] if args else kwargs["dst"]
+                _check(destination, dir_fd=kwargs.get("dst_dir_fd"))
+            return original(source, *args, **kwargs)
+        return guarded
 
     monkeypatch.setattr(builtins, "open", guarded_open)
-    monkeypatch.setattr(pathlib.Path, "open", guarded_path_open)
-    yield
+    monkeypatch.setattr(io, "open", guarded_io_open)
+    monkeypatch.setattr(os, "open", guarded_os_open)
+    monkeypatch.setattr(sqlite3, "connect", guarded_connect)
+    for name in ("replace", "rename", "link", "symlink"):
+        monkeypatch.setattr(os, name, mutation_guard(getattr(os, name), two_paths=True))
+    for name in ("unlink", "remove", "mkdir", "rmdir", "truncate", "chmod", "utime"):
+        monkeypatch.setattr(os, name, mutation_guard(getattr(os, name)))
+    yield forbidden
 
 
 @pytest.fixture(autouse=True)
@@ -188,3 +283,31 @@ def _isolate_server_config():
     sentinel = getattr(server, "_config", None)
     yield
     server._config = sentinel
+
+
+@pytest.fixture(autouse=True)
+def _forbid_real_models_and_network(monkeypatch):
+    """Tests must inject models; this is not a replacement embedding model."""
+    import fastembed
+    import socket
+
+    def forbidden_model(*args, **kwargs):
+        raise RuntimeError("test_model_loading_forbidden")
+
+    real_connect = socket.socket.connect
+    real_connect_ex = socket.socket.connect_ex
+
+    def guarded_connect(self, address):
+        if self.family != socket.AF_UNIX:
+            raise AssertionError("TEST ISOLATION VIOLATION: network connection")
+        return real_connect(self, address)
+
+    def guarded_connect_ex(self, address):
+        if self.family != socket.AF_UNIX:
+            raise AssertionError("TEST ISOLATION VIOLATION: network connection")
+        return real_connect_ex(self, address)
+
+    monkeypatch.setattr(fastembed, "TextEmbedding", forbidden_model)
+    monkeypatch.setattr(socket.socket, "connect", guarded_connect)
+    monkeypatch.setattr(socket.socket, "connect_ex", guarded_connect_ex)
+    yield

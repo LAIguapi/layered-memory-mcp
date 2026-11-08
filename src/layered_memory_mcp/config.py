@@ -676,7 +676,10 @@ class MemoryConfig:
         # blocks retrieval.
         self.access_log_enabled: bool = _env_bool("LAYERED_MEMORY_ACCESS_LOG", True)
         # Whether to store the query text alongside events (privacy toggle).
-        self.access_log_query: bool = _env_bool("LAYERED_MEMORY_LOG_QUERY", True)
+        _access_log = _load_yaml_section(self.home, "access_log")
+        self.access_log_query: bool = _env_bool(
+            "LAYERED_MEMORY_LOG_QUERY", _coerce_bool(_access_log.get("log_query"), False)
+        )
         # Days of raw events to keep before auto-prune.
         _ret = os.environ.get("LAYERED_MEMORY_ACCESS_RETENTION_DAYS")
         try:

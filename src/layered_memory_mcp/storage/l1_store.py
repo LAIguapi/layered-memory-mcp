@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING
 from filelock import FileLock
 
 from .frontmatter import dump_frontmatter, parse_frontmatter
+from .knowledge_reader import read_knowledge_text
+from ..privacy import diagnostic
 
 if TYPE_CHECKING:
     from ..models import KnowledgeEntry
@@ -22,21 +24,19 @@ logger = logging.getLogger("layered_memory_mcp.storage.l1")
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB safety limit
 
 
-def read_knowledge_file(filepath: Path) -> tuple[dict | None, str]:
+def read_knowledge_file(filepath: Path, knowledge_root: Path | None = None) -> tuple[dict | None, str]:
     """Read a knowledge file, returning (frontmatter_metadata, content).
 
     Returns (None, content) for legacy files without frontmatter.
     """
-    if not filepath.exists():
-        return None, ""
-
     try:
-        raw = filepath.read_text(encoding="utf-8")
-    except Exception as e:
-        logger.warning("Cannot read %s: %s", filepath, e)
+        raw = read_knowledge_text(filepath, knowledge_root)
+        meta, content = parse_frontmatter(raw)
+    except FileNotFoundError:
         return None, ""
-
-    meta, content = parse_frontmatter(raw)
+    except Exception:
+        diagnostic(logger, "knowledge_read_failed")
+        return None, ""
     return meta, content
 
 
@@ -61,8 +61,8 @@ def write_knowledge_file(
     # Serialize
     try:
         full_text = dump_frontmatter(meta, entry.content)
-    except Exception as e:
-        return {"success": False, "error": f"Serialization failed: {e}"}
+    except Exception:
+        return {"success": False, "error": diagnostic(logger, "knowledge_serialization_failed")}
 
     # Ensure directory exists
     filepath.parent.mkdir(parents=True, exist_ok=True)
@@ -77,7 +77,7 @@ def write_knowledge_file(
             if backup and filepath.exists():
                 try:
                     bak_path = filepath.with_suffix(filepath.suffix + ".bak")
-                    bak_path.write_text(filepath.read_text(encoding="utf-8"), encoding="utf-8")
+                    bak_path.write_text(read_knowledge_text(filepath), encoding="utf-8")
                 except Exception:
                     pass  # Non-critical
 
@@ -88,9 +88,8 @@ def write_knowledge_file(
             "bytes_written": len(full_text.encode("utf-8")),
             "file_size_bytes": len(full_text.encode("utf-8")),
         }
-    except Exception as e:
-        logger.error("Write error for %s: %s", filepath, e)
-        return {"success": False, "error": str(e)}
+    except Exception:
+        return {"success": False, "error": diagnostic(logger, "knowledge_write_failed")}
     # Do not unlink the lock: another process may already have acquired the
     # same inode. All writers must continue to lock that inode.
 
@@ -112,7 +111,7 @@ class L1Store:
     def read(self, domain: str) -> tuple[dict | None, str]:
         """Read a knowledge file by domain."""
         filepath = self._resolve_path(domain)
-        return read_knowledge_file(filepath)
+        return read_knowledge_file(filepath, self.knowledge_dir)
 
     def write(self, entry: "KnowledgeEntry", backup: bool = True) -> dict:
         """Write a KnowledgeEntry to L1 storage."""

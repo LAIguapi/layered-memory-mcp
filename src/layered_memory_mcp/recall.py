@@ -19,7 +19,9 @@ import time
 from collections import Counter
 from pathlib import Path
 
-from .cache import cached_read_text, get_tokenized_cache, invalidate_all_caches
+from .cache import get_tokenized_cache, invalidate_all_caches
+from .storage.knowledge_reader import read_knowledge_text
+from .privacy import diagnostic
 
 logger = logging.getLogger("layered_memory_mcp.recall")
 
@@ -354,6 +356,18 @@ def scan_knowledge_dirs(knowledge_dirs: list[str]) -> dict[str, str]:
     return merged
 
 
+def _read_scanned_knowledge(filepath: str, knowledge_dir: str | list[str]) -> str:
+    roots = knowledge_dir if isinstance(knowledge_dir, list) else [knowledge_dir]
+    target = Path(filepath).absolute()
+    for root in roots:
+        try:
+            target.relative_to(Path(root).absolute())
+        except ValueError:
+            continue
+        return read_knowledge_text(target, Path(root))
+    raise ValueError("knowledge_path_outside_root")
+
+
 # ---------------------------------------------------------------------------
 # Main recall with search modes  (Feature 2: semantic search)
 # ---------------------------------------------------------------------------
@@ -398,16 +412,15 @@ def recall(
             path = Path(filepath)
             file_size = path.stat().st_size
             if file_size > MAX_KNOWLEDGE_FILE_SIZE:
-                logger.warning("Skipping oversized file %s (%d bytes)", rel_path, file_size)
+                diagnostic(logger, "knowledge_file_too_large")
                 continue
-            # Use cached read for reduced disk I/O
-            content = cached_read_text(str(path), encoding="utf-8")
+            content = _read_scanned_knowledge(str(path), knowledge_dir)
             if content is None:
                 continue
             wc = len(content.split())
             file_contents[rel_path] = (content, wc)
-        except Exception as e:
-            logger.debug("Cannot read knowledge file %s: %s", rel_path, e)
+        except Exception:
+            diagnostic(logger, "knowledge_recall_read_failed", level=logging.DEBUG)
             continue
 
     # Compute avg_dl from in-memory contents if BM25 or hybrid mode
@@ -557,9 +570,9 @@ def generate_l0_index(knowledge_dir: str | list[str]) -> str:
             path = Path(filepath)
             # Skip oversized files to prevent OOM
             if path.stat().st_size > MAX_KNOWLEDGE_FILE_SIZE:
-                logger.warning("Skipping oversized file in L0 generation: %s", rel_path)
+                diagnostic(logger, "knowledge_file_too_large")
                 continue
-            content = path.read_text(encoding="utf-8")
+            content = _read_scanned_knowledge(str(path), knowledge_dir)
         except Exception:
             continue
 
@@ -657,7 +670,7 @@ def find_similar_knowledge(
 
     for rel_path, filepath in files.items():
         try:
-            existing = Path(filepath).read_text(encoding="utf-8")
+            existing = _read_scanned_knowledge(filepath, knowledge_dir)
             # Truncate existing content to match threshold
             existing_lower = existing.lower()[:_COMPARE_MAX_CHARS]
         except Exception:
@@ -746,7 +759,7 @@ def knowledge_health(knowledge_dir: str | list[str]) -> dict:
 
         # Read content for deeper analysis
         try:
-            content = path.read_text(encoding="utf-8")
+            content = _read_scanned_knowledge(str(path), knowledge_dir)
         except Exception:
             file_reports.append({"file": rel_path, "health": "unreadable", "score": 0})
             continue

@@ -66,21 +66,27 @@ class TestPathIsolation:
 class TestHostWriteGuard:
     """The backstop fixture must convert a host write into a loud failure."""
 
-    def test_writing_to_host_memory_raises(self):
+    def test_writing_to_host_memory_raises(self, tmp_path, _guard_host_paths):
+        target = tmp_path / "protected-memory.md"
+        _guard_host_paths.append(str(target))
         with pytest.raises(AssertionError, match="TEST ISOLATION VIOLATION"):
-            with open(_REAL_MEMORY, "a", encoding="utf-8") as fh:
+            with open(target, "a", encoding="utf-8") as fh:
                 fh.write("this must never land\n")
 
-    def test_writing_to_host_knowledge_raises(self):
+    def test_writing_to_host_knowledge_raises(self, tmp_path, _guard_host_paths):
+        target = tmp_path / "protected-knowledge"
+        _guard_host_paths.append(str(target))
         with pytest.raises(AssertionError, match="TEST ISOLATION VIOLATION"):
-            with open(f"{_REAL_L1}/knowledge/pwned.md", "w", encoding="utf-8") as fh:
+            with open(target / "neutral.md", "w", encoding="utf-8") as fh:
                 fh.write("nope")
 
-    def test_path_write_text_to_host_path_raises(self):
+    def test_path_write_text_to_host_path_raises(self, tmp_path, _guard_host_paths):
         """``Path.write_text`` bypasses ``builtins.open`` — and is the idiom the
         framework actually uses for every memory/L1 write."""
+        target = tmp_path / "protected-memory.md"
+        _guard_host_paths.append(str(target))
         with pytest.raises(AssertionError, match="TEST ISOLATION VIOLATION"):
-            Path(_REAL_MEMORY).write_text("this must never land\n", encoding="utf-8")
+            target.write_text("this must never land\n", encoding="utf-8")
 
     def test_reading_host_path_is_still_allowed(self, tmp_path, monkeypatch):
         """Exercise the guard without depending on a readable real home.

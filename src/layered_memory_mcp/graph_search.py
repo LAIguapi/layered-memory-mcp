@@ -515,9 +515,10 @@ def apply_graph_recall(
 
     # The namespace half of the policy, applied to everything the traversal
     # returned before anything is read off it.
+    _, filtered_out = _seed_verdicts(report)
     report, out_of_namespace = _screen_namespaces(report, mode, policy.namespaces)
 
-    surviving, filtered_out = _seed_verdicts(report)
+    surviving, _ = _seed_verdicts(report)
     governs = mode.recall_enabled and report.status in _ANSWERED_STATUSES
 
     kept: list[Any] = []
@@ -558,9 +559,14 @@ def apply_graph_recall(
             rebuilt, unidentified = _without_sections(binding, dropped)
             excluded_sections += len(dropped)
             unmappable += unidentified
+            if governs:
+                rebuilt = _screen_payload_ids(rebuilt, surviving.get(binding.identity, set()))
             kept.append(rebuilt)
             continue
-        kept.append(binding.result)
+        if governs:
+            kept.append(_screen_payload_ids(binding.result, surviving.get(binding.identity, set())))
+        else:
+            kept.append(binding.result)
 
     block = graph_runtime.graph_recall_payload(report)
     block["excluded_results"] = excluded
@@ -716,7 +722,32 @@ def _without_sections(
     result[KEYWORD_SECTION_KEY] = kept_entries
     result["sections"] = kept_sections
     result["matched_sections"] = len(kept_sections)
+    kept_ids = {node_id for entry_id, node_ids in binding.sections.items()
+                if entry_id not in dropped for node_id in node_ids}
+    result = _screen_payload_ids(result, kept_ids, strip_mirrors=True)
     return result, unidentified
+
+
+def _screen_payload_ids(payload: Mapping[str, Any], kept_ids: set[str], *, strip_mirrors: bool = False) -> dict[str, Any]:
+    result = dict(payload)
+    if strip_mirrors:
+        if "wiki_links" in result:
+            result["wiki_links"] = []
+        for field in ("content", "text", "summary", "snippet", "excerpt", "body", "full_content", "preview"):
+            result.pop(field, None)
+    if "graph_node_ids" in result:
+        identities = result["graph_node_ids"]
+        result["graph_node_ids"] = [
+            identity.strip() for identity in identities
+            if isinstance(identity, str) and identity.strip() in kept_ids
+        ] if isinstance(identities, (list, tuple)) else []
+    if "graph_node_id" in result and (
+        not isinstance(result["graph_node_id"], str) or result["graph_node_id"].strip() not in kept_ids
+    ):
+        result.pop("graph_node_id")
+    if isinstance(result.get("metadata"), Mapping):
+        result["metadata"] = _screen_payload_ids(result["metadata"], kept_ids, strip_mirrors=strip_mirrors)
+    return result
 
 
 def _occurrence(value: Any) -> int:
@@ -753,25 +784,39 @@ def _screen_namespaces(
     IDs either. Deciding stays with the caller's ``governs`` check.
     """
     inner = getattr(report, "report", None)
-    if namespaces is None or inner is None or not inner.results:
+    if inner is None or not inner.results:
+        if namespaces is not None:
+            updates = {"warnings": [f"scope_screened_diagnostics:{len(report.warnings)}"] if report.warnings else []}
+            if inner is not None:
+                updates["report"] = inner.model_copy(update={
+                    "warnings": [f"scope_screened_diagnostics:{len(inner.warnings)}"] if inner.warnings else []})
+            return report.model_copy(update=updates), {}
         return report, {}
 
     removed: dict[str, set[str]] = {}
     results = []
+    conflict_warnings = []
     for result in inner.results:
         kept_nodes = [
             node for node in result.graph_nodes if _in_namespace(node, namespaces)
         ]
-        if len(kept_nodes) == len(result.graph_nodes):
-            results.append(result)
-            continue
         kept_ids = {node.id for node in kept_nodes}
         dropped = {node.id for node in result.graph_nodes} - kept_ids
-        removed[result.file] = dropped
+        if dropped:
+            removed[result.file] = dropped
+        warnings = result.warnings
+        if namespaces is not None or dropped:
+            warnings = ([f"scope_screened_diagnostics:{len(result.warnings)}"] if result.warnings else [])
+            if dropped:
+                warnings = sorted([*warnings, f"{_SCOPE_EXCLUDED_PREFIX}{len(dropped)}"])
+        if any(not conflict.resolved for conflict in result.conflicts):
+            warnings = sorted({*warnings, "unresolved_conflict"})
+            conflict_warnings = ["unresolved_conflict"]
         results.append(
             result.model_copy(
                 update={
                     "graph_nodes": kept_nodes,
+                    "graph_node_ids": [identity for identity in result.graph_node_ids if identity in kept_ids],
                     "graph_edges": [
                         edge
                         for edge in result.graph_edges
@@ -790,28 +835,34 @@ def _screen_namespaces(
                     "conflicts": [
                         conflict
                         for conflict in result.conflicts
-                        if kept_ids.intersection(conflict.node_ids)
+                        if set(conflict.node_ids).issubset(kept_ids)
                     ],
-                    "warnings": sorted(
-                        {
-                            *result.warnings,
-                            f"{_SCOPE_EXCLUDED_PREFIX}{len(dropped)}",
-                        }
-                    ),
+                    "warnings": warnings,
                 }
             )
         )
 
     if not removed:
-        return report, {}
+        inner_warnings = inner.warnings
+        outer_warnings = report.warnings
+        if namespaces is not None:
+            inner_warnings = [f"scope_screened_diagnostics:{len(inner.warnings)}"] if inner.warnings else []
+            outer_warnings = [f"scope_screened_diagnostics:{len(report.warnings)}"] if report.warnings else []
+        outer = {
+            "report": inner.model_copy(update={
+                "results": results, "warnings": sorted({*inner_warnings, *conflict_warnings})}),
+            "warnings": sorted({*outer_warnings, *conflict_warnings}),
+        }
+        return report.model_copy(update=outer), {}
 
     screened = inner.model_copy(
         update={
             "results": results,
             "warnings": sorted(
                 {
-                    *inner.warnings,
+                    f"scope_screened_diagnostics:{len(inner.warnings)}",
                     f"{_SCOPE_EXCLUDED_PREFIX}{sum(len(ids) for ids in removed.values())}",
+                    *conflict_warnings,
                 }
             ),
         }
@@ -825,7 +876,7 @@ def _screen_namespaces(
                 "graph_authoritative": bool(
                     mode.recall_enabled and screened.graph_assisted
                 ),
-                "warnings": sorted({*report.warnings, *screened.warnings}),
+                "warnings": sorted({f"scope_screened_diagnostics:{len(report.warnings)}", *screened.warnings}),
             }
         ),
         removed,

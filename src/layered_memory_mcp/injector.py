@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 from filelock import FileLock
 
 from .heading import heading_skeleton
+from .privacy import diagnostic
 from .memory_changelog import hash_text, record as record_memory_change
 from .recall import find_similar_knowledge, invalidate_scan_cache, knowledge_health, scan_knowledge_files
 
@@ -2573,9 +2574,8 @@ def sync_to_vector_store(
         vector_store.add(entry)
         logger.debug("Synced to vector store: domain=%s", domain)
         return {"success": True, "action": "vector_synced", "domain": domain}
-    except Exception as e:
-        logger.warning("Vector store sync failed (non-critical): %s", e)
-        return {"success": False, "error": str(e)}
+    except Exception:
+        return {"success": False, "error": diagnostic(logger, "vector_sync_failed")}
     finally:
         if vector_store is not None:
             vector_store.close()
@@ -2597,18 +2597,17 @@ def remove_from_vector_store(
         if not db_path.exists():
             return {"success": True, "action": "none", "reason": "No vector store"}
 
-        with sqlite3.connect(db_path) as conn:
+        with sqlite3.connect(db_path.absolute().as_uri() + "?mode=rw", uri=True) as conn:
             cursor = conn.execute(
                 "DELETE FROM vectors WHERE domain = ?", (domain,)
             )
             deleted = cursor.rowcount
             conn.commit()
 
-        logger.info("Removed %d vector entries for domain=%s", deleted, domain)
+        logger.info("vector_entries_removed:%d", deleted)
         return {"success": True, "action": "vector_removed", "domain": domain, "removed": deleted}
-    except Exception as e:
-        logger.warning("Vector store removal failed (non-critical): %s", e)
-        return {"success": False, "error": str(e)}
+    except Exception:
+        return {"success": False, "error": diagnostic(logger, "vector_removal_failed")}
 
 
 def reindex_vector_store(

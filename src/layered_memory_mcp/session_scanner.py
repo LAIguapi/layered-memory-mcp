@@ -14,6 +14,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
 
+from .privacy import diagnostic
+
 logger = logging.getLogger("layered_memory_mcp.scanner")
 
 # Keywords that mark a message as carrying a conclusion/decision rather than
@@ -82,8 +84,8 @@ def find_recent_sessions(sessions_dir: str, days: int = 7) -> list:
                     "mtime": mtime.isoformat(),
                     "size": stat.st_size,
                 })
-        except Exception as e:
-            logger.debug("Skipping jsonl file %s: %s", f, e)
+        except Exception:
+            diagnostic(logger, "session_stat_failed", level=logging.DEBUG)
             continue
 
     # Scan JSON files (exclude obvious non-session files)
@@ -101,8 +103,8 @@ def find_recent_sessions(sessions_dir: str, days: int = 7) -> list:
                     "mtime": mtime.isoformat(),
                     "size": stat.st_size,
                 })
-        except Exception as e:
-            logger.debug("Skipping json file %s: %s", f, e)
+        except Exception:
+            diagnostic(logger, "session_stat_failed", level=logging.DEBUG)
             continue
 
     return sorted(sessions, key=lambda x: x["mtime"], reverse=True)
@@ -127,7 +129,7 @@ def _parse_messages_from_entry(entry: dict) -> list[dict]:
     return []
 
 
-def _detect_and_parse_file(filepath: str) -> list[dict]:
+def _detect_and_parse_file(filepath: str, metadata: list | None = None) -> list[dict]:
     """Parse a session file, auto-detecting format (JSON vs JSONL).
 
     Returns a list of message dicts: [{"role": "...", "content": "..."}, ...]
@@ -135,13 +137,15 @@ def _detect_and_parse_file(filepath: str) -> list[dict]:
     path = Path(filepath)
     try:
         raw = path.read_text(encoding="utf-8")
-    except Exception as e:
-        logger.warning("Cannot read file %s: %s", filepath, e)
+    except Exception:
+        diagnostic(logger, "session_read_failed")
         return []
 
     # Try JSON (whole-file parse) first — handles Hermes .json sessions
     try:
         data = json.loads(raw)
+        if metadata is not None:
+            metadata.extend([data] if isinstance(data, dict) else data if isinstance(data, list) else [])
         if isinstance(data, dict):
             messages = _parse_messages_from_entry(data)
             if messages:
@@ -167,6 +171,8 @@ def _detect_and_parse_file(filepath: str) -> list[dict]:
         try:
             entry = json.loads(line)
             if isinstance(entry, dict):
+                if metadata is not None:
+                    metadata.append(entry)
                 msgs = _parse_messages_from_entry(entry)
                 messages.extend(msgs)
         except json.JSONDecodeError:
@@ -175,7 +181,7 @@ def _detect_and_parse_file(filepath: str) -> list[dict]:
     return messages
 
 
-def extract_session_summary(filepath: str, max_messages: int = 50) -> dict:
+def extract_session_summary(filepath: str, max_messages: int = 50, *, messages: list | None = None) -> dict:
     """Extract summary from a session file (auto-detects JSON/JSONL format).
 
     Uses a "head + tail" sampling strategy to capture both opening context
@@ -200,7 +206,8 @@ def extract_session_summary(filepath: str, max_messages: int = 50) -> dict:
         "key_decisions": [],
     }
 
-    messages = _detect_and_parse_file(filepath)
+    if messages is None:
+        messages = _detect_and_parse_file(filepath)
 
     # Strategy: head + tail sampling for long sessions
     if len(messages) > max_messages:
@@ -292,12 +299,12 @@ def _summarize_db_session(conn: sqlite3.Connection, row, max_messages: int = 50)
 
     try:
         rows = conn.execute(
-            "SELECT role, content, tool_calls FROM messages "
+            "SELECT * FROM messages "
             "WHERE session_id=? ORDER BY id",
             (session_id,),
         ).fetchall()
-    except sqlite3.Error as exc:  # a partially-written session must not kill the scan
-        logger.warning("state.db: cannot read messages for %s: %s", session_id, exc)
+    except sqlite3.Error:
+        diagnostic(logger, "session_messages_read_failed")
         rows = []
 
     if len(rows) > max_messages:
@@ -331,7 +338,7 @@ def _summarize_db_session(conn: sqlite3.Connection, row, max_messages: int = 50)
                     seen_decisions.add(decision[:80])
                     summary["key_decisions"].append(decision)
 
-        raw_calls = msg["tool_calls"]
+        raw_calls = msg["tool_calls"] if "tool_calls" in msg.keys() else None
         if raw_calls:
             try:
                 calls = json.loads(raw_calls) if isinstance(raw_calls, str) else raw_calls
@@ -347,6 +354,54 @@ def _summarize_db_session(conn: sqlite3.Connection, row, max_messages: int = 50)
     return summary
 
 
+def _exclusion_policy(exclude_markers, exclude_sources):
+    markers = [str(marker).lower() for marker in (exclude_markers or []) if str(marker).strip()]
+    sources = {str(source).strip().lower() for source in (
+        exclude_sources if exclude_sources is not None else DEFAULT_EXCLUDED_SESSION_SOURCES
+    ) if str(source).strip()}
+    return markers, sources
+
+
+def _decoded_session_fields(value):
+    yield value
+    if isinstance(value, dict):
+        for field in value.values():
+            yield from _decoded_session_fields(field)
+    elif isinstance(value, list):
+        for field in value:
+            yield from _decoded_session_fields(field)
+    elif isinstance(value, str) and value.lstrip().startswith(("{", "[")):
+        try:
+            decoded = json.loads(value)
+        except (ValueError, TypeError):
+            return
+        yield from _decoded_session_fields(decoded)
+
+
+def _session_exclusion(metadata, messages, markers, sources):
+    matched = set()
+    for value in _decoded_session_fields([metadata, messages]):
+        if isinstance(value, dict) and str(value.get("source") or "").strip().lower() in sources:
+            return "source", None
+        if isinstance(value, str):
+            lowered = value.lower()
+            matched.update(marker for marker in markers if marker in lowered)
+    for marker in markers:
+        if marker in matched:
+            return "marker", marker
+    return None, None
+
+
+def _count_exclusion(stats, reason, marker):
+    if reason == "source":
+        stats["skipped_sources"] += 1
+    else:
+        stats["excluded_sessions"] += 1
+        if marker is not None:
+            counts = stats.setdefault("excluded_by_marker", {})
+            counts[marker] = counts.get(marker, 0) + 1
+
+
 def read_state_db_sessions(
     db_path: str | Path | None = None,
     days: int = 3,
@@ -354,6 +409,7 @@ def read_state_db_sessions(
     exclude_markers: Iterable[str] | None = None,
     exclude_sources: Iterable[str] | None = None,
     max_messages: int = 50,
+    _excluded_session_ids: set | None = None,
 ) -> dict:
     """Read recent sessions straight out of Hermes' ``state.db``.
 
@@ -378,10 +434,7 @@ def read_state_db_sessions(
     Returns the same envelope as :func:`scan_sessions`.
     """
     path = Path(db_path).expanduser() if db_path else default_hermes_db()
-    markers = [str(m).lower() for m in (exclude_markers or []) if str(m).strip()]
-    sources = {str(s).strip().lower() for s in (
-        exclude_sources if exclude_sources is not None else DEFAULT_EXCLUDED_SESSION_SOURCES
-    ) if str(s).strip()}
+    markers, sources = _exclusion_policy(exclude_markers, exclude_sources)
 
     output: dict = {
         "generated_at": datetime.now(tz=timezone.utc).isoformat(),
@@ -400,77 +453,61 @@ def read_state_db_sessions(
     }
 
     if path is None or not path.is_file():
-        output["error"] = (
-            "state db not found: "
-            + (str(path) if path else "no live-session database for this agent")
-        )
+        output["error"] = "state db not found"
         return output
 
     cutoff = time.time() - days * 86400
     try:
         # Read-only URI: never touch a live agent's DB with a writable handle.
         conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-    except sqlite3.Error as exc:
-        output["error"] = f"cannot open state db: {exc}"
+    except sqlite3.Error:
+        output["error"] = diagnostic(logger, "session_db_open_failed")
         return output
 
     try:
         conn.row_factory = sqlite3.Row
         try:
             rows = conn.execute(
-                "SELECT id, title, source, started_at, last_activity_at, message_count "
-                "FROM sessions WHERE COALESCE(last_activity_at, started_at) >= ? "
+                "SELECT * FROM sessions WHERE COALESCE(last_activity_at, started_at) >= ? "
                 "ORDER BY COALESCE(last_activity_at, started_at) DESC",
                 (cutoff,),
             ).fetchall()
-        except sqlite3.Error as exc:
-            output["error"] = f"state db schema not recognised: {exc}"
+        except sqlite3.Error:
+            output["error"] = diagnostic(logger, "session_db_schema_invalid")
             return output
 
         output["stats"]["rows_in_window"] = len(rows)
+        output["total_sessions"] = len(rows)
 
         for row in rows:
-            if (row["source"] or "").strip().lower() in sources:
-                output["stats"]["skipped_sources"] += 1
+            reason, marker = _state_session_exclusion(conn, row, markers, sources)
+            if reason:
+                _count_exclusion(output["stats"], reason, marker)
+                if _excluded_session_ids is not None:
+                    _excluded_session_ids.add(str(row["id"]))
                 continue
-
-            # Marker check runs against the DB, not against the (sampled and
-            # truncated) summary: a marker buried in a long message would sail
-            # through an excerpt-based check, which is exactly the kind of
-            # silent under-filtering a privacy control must not have.
-            if markers:
-                title_lower = (row["title"] or "").lower()
-                hit = next((m for m in markers if m in title_lower), None)
-                if hit is None:
-                    hit = _session_hits_marker(conn, row["id"], markers)
-                if hit:
-                    output["stats"]["excluded_sessions"] += 1
-                    by_marker = output["stats"]["excluded_by_marker"]
-                    by_marker[hit] = by_marker.get(hit, 0) + 1
-                    continue
-
+            if len(output["sessions"]) >= max_sessions:
+                continue
             summary = _summarize_db_session(conn, row, max_messages=max_messages)
             output["sessions"].append(summary)
-            if len(output["sessions"]) >= max_sessions:
-                break
 
         output["stats"]["scanned"] = len(output["sessions"])
-        output["total_sessions"] = len(output["sessions"])
+        return output
+    except Exception:
+        output["sessions"] = []
+        output["stats"]["scanned"] = 0
+        output["error"] = diagnostic(logger, "session_db_read_failed")
         return output
     finally:
         conn.close()
 
 
-def _session_hits_marker(conn: sqlite3.Connection, session_id: str, markers: list[str]) -> str | None:
-    """Return the first marker present anywhere in the session, else None."""
-    for marker in markers:
-        row = conn.execute(
-            "SELECT 1 FROM messages WHERE session_id=? AND content LIKE ? LIMIT 1",
-            (session_id, f"%{marker}%"),
-        ).fetchone()
-        if row:
-            return marker
-    return None
+def _state_session_exclusion(conn, session, markers, sources):
+    reason, marker = _session_exclusion([dict(session)], [], markers, sources)
+    if reason is not None or not (markers or sources):
+        return reason, marker
+    rows = conn.execute("SELECT * FROM messages WHERE session_id=?", (session["id"],)).fetchall()
+    return _session_exclusion([], [dict(row) for row in rows], markers, sources)
 
 
 def search_state_db_sessions(
@@ -481,6 +518,8 @@ def search_state_db_sessions(
     exclude_markers: Iterable[str] | None = None,
     exclude_sources: Iterable[str] | None = None,
     per_session_limit: int = 3,
+    *,
+    _excluded_session_ids: set[str] | None = None,
 ) -> dict:
     """Keyword search across live sessions in Hermes' ``state.db``.
 
@@ -488,10 +527,7 @@ def search_state_db_sessions(
     operator-configured markers excluded (and counted) rather than exported.
     """
     path = Path(db_path).expanduser() if db_path else default_hermes_db()
-    markers = [str(m).lower() for m in (exclude_markers or []) if str(m).strip()]
-    sources = {str(s).strip().lower() for s in (
-        exclude_sources if exclude_sources is not None else DEFAULT_EXCLUDED_SESSION_SOURCES
-    ) if str(s).strip()}
+    markers, sources = _exclusion_policy(exclude_markers, exclude_sources)
 
     out: dict = {
         "success": True,
@@ -505,18 +541,19 @@ def search_state_db_sessions(
     }
     if path is None or not path.is_file():
         out["success"] = False
-        out["error"] = (
-            "state db not found: "
-            + (str(path) if path else "no live-session database for this agent")
-        )
+        out["error"] = "state db not found"
         return out
 
     cutoff = time.time() - days * 86400
-    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except Exception:
+        out.update(success=False, error=diagnostic(logger, "session_db_open_failed"))
+        return out
     try:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            "SELECT id, title, source, started_at, last_activity_at FROM sessions "
+            "SELECT * FROM sessions "
             "WHERE COALESCE(last_activity_at, started_at) >= ? "
             "ORDER BY COALESCE(last_activity_at, started_at) DESC",
             (cutoff,),
@@ -525,14 +562,15 @@ def search_state_db_sessions(
         out["total_sessions"] = len(rows)
 
         for row in rows:
-            if (row["source"] or "").strip().lower() in sources:
-                out["stats"]["skipped_sources"] += 1
-                continue
-            if markers and (row["title"] and any(m in row["title"].lower() for m in markers)
-                            or _session_hits_marker(conn, row["id"], markers)):
-                out["stats"]["excluded_sessions"] += 1
+            reason, marker = _state_session_exclusion(conn, row, markers, sources)
+            if reason:
+                _count_exclusion(out["stats"], reason, marker)
+                if _excluded_session_ids is not None:
+                    _excluded_session_ids.add(str(row["id"]))
                 continue
 
+            if len(out["matches"]) >= max_results:
+                continue
             hits = conn.execute(
                 "SELECT role, content FROM messages WHERE session_id=? AND content LIKE ? "
                 "ORDER BY id LIMIT ?",
@@ -556,10 +594,11 @@ def search_state_db_sessions(
                 "matched_user_messages": user_hits[:per_session_limit],
                 "matched_assistant_topics": assistant_hits[:per_session_limit],
             })
-            if len(out["matches"]) >= max_results:
-                break
 
         out["matched_sessions"] = len(out["matches"])
+        return out
+    except Exception:
+        out.update(success=False, error=diagnostic(logger, "session_db_search_failed"), matches=[], matched_sessions=0)
         return out
     finally:
         conn.close()
@@ -573,6 +612,8 @@ def scan_sessions(
     exclude_markers: Iterable[str] | None = None,
     exclude_sources: Iterable[str] | None = None,
     prefer_state_db: bool = True,
+    *,
+    excluded_session_ids: Iterable[str] | None = None,
 ) -> dict:
     """Scan recent sessions and return summaries.
 
@@ -591,6 +632,8 @@ def scan_sessions(
             "stats": dict
         }
     """
+    blocked_ids: set[str] = set(excluded_session_ids or ())
+    markers, sources = _exclusion_policy(exclude_markers, exclude_sources)
     if prefer_state_db:
         db = Path(hermes_db_path).expanduser() if hermes_db_path else default_hermes_db()
         if db is not None and db.is_file():
@@ -600,13 +643,11 @@ def scan_sessions(
                 max_sessions=max_sessions,
                 exclude_markers=exclude_markers,
                 exclude_sources=exclude_sources,
+                _excluded_session_ids=blocked_ids,
             )
-            if result["sessions"]:
+            if result["sessions"] or result.get("error"):
                 return result
-            logger.info(
-                "state.db gave no usable sessions (stats=%s); falling back to %s",
-                result.get("stats"), sessions_dir,
-            )
+            logger.info("session_db_empty_or_filtered_fallback")
 
     if not sessions_dir:
         return {
@@ -626,11 +667,25 @@ def scan_sessions(
         "source": "session_dir",
         "total_sessions": len(sessions),
         "sessions": [],
-        "stats": {"scanned": 0},
+        "stats": {"scanned": 0, "excluded_sessions": 0, "skipped_sources": 0},
     }
 
-    for s in sessions[:max_sessions]:
-        summary = extract_session_summary(s["path"])
+    for s in sessions:
+        metadata = []
+        messages = _detect_and_parse_file(s["path"], metadata)
+        reason, marker = _session_exclusion(metadata, messages, markers, sources)
+        identities = {Path(s["path"]).stem}
+        for record in _decoded_session_fields(metadata):
+            if isinstance(record, dict):
+                identities.update(str(record[key]) for key in ("id", "session_id") if key in record)
+        if reason is None and identities.intersection(blocked_ids):
+            reason = "blocked_session"
+        if reason:
+            _count_exclusion(output["stats"], reason, marker)
+            continue
+        if len(output["sessions"]) >= max_sessions:
+            continue
+        summary = extract_session_summary(s["path"], messages=messages)
         summary["mtime"] = s["mtime"]
         summary["size"] = s["size"]
         output["sessions"].append(summary)

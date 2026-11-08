@@ -479,7 +479,7 @@ def test_maintenance_projects_changes_from_same_tick_compaction(cfg, monkeypatch
 @pytest.mark.usefixtures("legacy_graph_mode")  # whole-file writers; see module docstring
 @pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ["create", "update"])
-async def test_mcp_file_writes_surface_vector_failure(cfg, monkeypatch, operation):
+async def test_mcp_file_writes_surface_vector_failure(cfg, monkeypatch, operation, caplog):
     from layered_memory_mcp import server
 
     monkeypatch.setattr(server, "_config", cfg)
@@ -496,7 +496,8 @@ async def test_mcp_file_writes_surface_vector_failure(cfg, monkeypatch, operatio
     result = json.loads(await tool("example.md", "## Pool\nsize=24\n"))
     assert result["success"] is True  # The source file write did succeed.
     assert result["vector_sync_ok"] is False
-    assert "model unavailable" in result["vector_sync_error"]
+    assert result["vector_sync_error"] == "vector_sync_failed"
+    assert "model unavailable" not in json.dumps(result) + caplog.text
     assert rows(cfg) == before
 
 

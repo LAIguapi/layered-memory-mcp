@@ -53,7 +53,7 @@ def test_append_many_times_stays_single(tmp_path):
     assert text.count(line) == 1, f"bloat! line appears {text.count(line)} times"
 
 
-def test_vector_store_exact_dedup(tmp_path):
+def test_vector_store_exact_dedup(tmp_path, synthetic_embeddings):
     """VectorStore.add must not insert a verbatim (domain,text) duplicate."""
     from layered_memory_mcp.storage.vector_store import VectorStore
     from layered_memory_mcp.models import (

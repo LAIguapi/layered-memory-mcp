@@ -15,6 +15,9 @@ import time
 from collections import OrderedDict
 from pathlib import Path
 
+from .privacy import diagnostic
+from .storage.knowledge_reader import read_knowledge_text
+
 logger = logging.getLogger("layered_memory_mcp.cache")
 
 # ---------------------------------------------------------------------------
@@ -218,7 +221,7 @@ def invalidate_all_caches(path: str | None = None) -> None:
     """
     get_content_cache().invalidate(path)
     get_tokenized_cache().invalidate(path)
-    logger.debug("Invalidated caches for %s", path or "(all)")
+    logger.debug("knowledge_caches_invalidated")
 
 
 # ---------------------------------------------------------------------------
@@ -226,7 +229,10 @@ def invalidate_all_caches(path: str | None = None) -> None:
 # ---------------------------------------------------------------------------
 
 def cached_read_text(filepath: str, encoding: str = "utf-8") -> str | None:
-    """Read file text with caching.
+    """Securely read current text and refresh the generic content cache.
+
+    Mtime-only cache hits cannot establish a read boundary. Always delegate
+    opening and validation to the central reader before returning content.
 
     Args:
         filepath: Absolute path to file.
@@ -236,17 +242,11 @@ def cached_read_text(filepath: str, encoding: str = "utf-8") -> str | None:
         File content, or None if read fails.
     """
     cache = get_content_cache()
-
-    # Try cache first
-    cached = cache.get(filepath)
-    if cached is not None:
-        return cached
-
-    # Cache miss → read from disk
     try:
-        content = Path(filepath).read_text(encoding=encoding, errors="replace")
+        content = read_knowledge_text(Path(filepath), encoding=encoding, errors="replace")
         cache.put(filepath, content)
         return content
-    except Exception as e:
-        logger.debug("Failed to read %s: %s", filepath, e)
+    except Exception:
+        cache.invalidate(filepath)
+        diagnostic(logger, "knowledge_cached_read_failed", level=logging.DEBUG)
         return None

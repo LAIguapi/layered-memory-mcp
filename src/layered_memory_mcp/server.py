@@ -34,6 +34,8 @@ from pathlib import Path
 from fastmcp import FastMCP
 
 from .config import MemoryConfig
+from .privacy import diagnostic, private_tool, public_pointer_report
+from .storage.knowledge_reader import read_knowledge_text
 from . import __version__
 from .recall import recall, scan_knowledge_files, score_relevance, knowledge_health
 from .session_scanner import (
@@ -159,11 +161,11 @@ def _get_access_log() -> AccessLogStore | None:
             _access_log_store = AccessLogStore(
                 data_dir / "access_log.db",
                 retention_days=getattr(config, "access_log_retention_days", 90),
-                log_query=getattr(config, "access_log_query", True),
+                log_query=getattr(config, "access_log_query", False),
             )
         return _access_log_store
-    except Exception as exc:
-        logger.debug("access_log unavailable: %s", exc)
+    except Exception:
+        diagnostic(logger, "access_log_unavailable", level=logging.DEBUG)
         return None
 
 
@@ -173,8 +175,8 @@ def _record_access(events: list[dict]) -> None:
         store = _get_access_log()
         if store is not None and events:
             store.record_batch(events)
-    except Exception as exc:
-        logger.debug("record_access failed: %s", exc)
+    except Exception:
+        diagnostic(logger, "access_log_record_failed", level=logging.DEBUG)
 
 
 def _domain_from_file(filename: str) -> str:
@@ -228,8 +230,8 @@ def _record_file_mutation(
                 "after_bytes": len(after_text.encode("utf-8")) if after_text else 0,
             },
         )
-    except Exception as exc:  # noqa: BLE001 — provenance never breaks a write
-        logger.warning("memory changelog record failed (non-critical): %s", exc)
+    except Exception:
+        diagnostic(logger, "memory_changelog_record_failed")
         return None
 
 
@@ -276,8 +278,7 @@ def _get_config() -> MemoryConfig:
     global _config
     if _config is None:
         _config = MemoryConfig()
-        logger.info("Initialized config: home=%s, knowledge=%s",
-                     _config.home, _config.knowledge_dir)
+        logger.info("memory_config_initialized")
     return _config
 
 
@@ -1013,11 +1014,11 @@ def _validate_knowledge_path(config: MemoryConfig, filename: str) -> tuple[Path 
       - (None, error_message) on validation failure
     """
     if not filename.endswith(".md"):
-        return None, f"Invalid extension: filename must end with .md, got {filename!r}"
+        return None, "Invalid extension: filename must end with .md"
     if len(filename) > 255:
         return None, f"Filename too long ({len(filename)} chars, max 255)"
     if "/" in filename or "\\" in filename or ".." in filename:
-        return None, f"Path traversal not allowed: {filename!r}"
+        return None, "Path traversal not allowed"
 
     # Check all knowledge directories (namespace first, then shared)
     for kdir in config.knowledge_dirs:
@@ -1034,7 +1035,7 @@ def _validate_knowledge_path(config: MemoryConfig, filename: str) -> tuple[Path 
     try:
         filepath.resolve().relative_to(config.knowledge_dir.resolve())
     except ValueError:
-        return None, f"Path traversal blocked: {filename!r}"
+        return None, "Path traversal blocked"
     return filepath, None
 
 
@@ -1085,6 +1086,7 @@ async def get_memory_status() -> str:
 
 
 @mcp.resource("knowledge://files")
+@private_tool("knowledge_listing_failed")
 async def list_knowledge_files() -> str:
     """List all L1 knowledge files with metadata."""
     config = _get_config()
@@ -1096,16 +1098,15 @@ async def list_knowledge_files() -> str:
             try:
                 stat = Path(path).stat()
                 # Read first line as title hint
-                first_line = ""
-                with open(path, "r", encoding="utf-8") as f:
-                    first_line = f.readline().strip().removeprefix("# ").strip()
+                content = read_knowledge_text(Path(path), Path(path).parent)
+                first_line = (content.splitlines() or [""])[0].strip().removeprefix("# ").strip()
                 file_list.append({
                     "file": name,
                     "size_bytes": stat.st_size,
                     "title_hint": first_line[:100],
                 })
-            except OSError as e:
-                logger.debug("Cannot read %s: %s", name, e)
+            except Exception:
+                diagnostic(logger, "knowledge_listing_read_failed", level=logging.DEBUG)
                 file_list.append({"file": name, "error": "cannot read"})
         return files, file_list
 
@@ -1123,6 +1124,7 @@ async def list_knowledge_files() -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
+@private_tool("knowledge_recall_failed")
 async def recall_knowledge(
     keyword: str,
     top_n: int = 5,
@@ -1169,8 +1171,8 @@ async def recall_knowledge(
                 if r.get("file")
             ]
             await asyncio.to_thread(_record_access, events)
-    except Exception as exc:
-        logger.debug("recall telemetry skipped: %s", exc)
+    except Exception:
+        diagnostic(logger, "recall_telemetry_failed", level=logging.DEBUG)
 
     # v0.6.0: Lightweight staleness check (stdio-safe)
     from .l0_manager import quick_l0_consistency_check
@@ -1199,6 +1201,7 @@ async def recall_knowledge(
 
 
 @mcp.tool()
+@private_tool("session_scan_failed")
 async def scan_recent_sessions(
     days: int = 3,
     max_sessions: int = 10,
@@ -1222,11 +1225,10 @@ async def scan_recent_sessions(
     if not db_available and not dir_available:
         # The DB location comes from the environment adapter; "none" means the
         # resolved adapter has no live-session database at all.
-        db_shown = str(config.hermes_db_path) if config.hermes_db_path else "none"
         return json.dumps({
             "success": False,
             "error": "No session source available: neither the agent's live "
-                     f"session database ({db_shown}) nor a session directory "
+                     "session database nor a session directory "
                      "exists. Set LAYERED_MEMORY_HERMES_DB or "
                      "LAYERED_MEMORY_SESSIONS_DIR.",
         })
@@ -1246,6 +1248,7 @@ async def scan_recent_sessions(
 
 
 @mcp.tool()
+@private_tool("knowledge_read_failed")
 async def get_knowledge_file(filename: str) -> str:
     """Read a specific L1 knowledge file by filename.
 
@@ -1261,26 +1264,25 @@ async def get_knowledge_file(filename: str) -> str:
         return json.dumps({"success": False, "error": err or "Invalid filename"})
 
     if not filepath.exists() or not filepath.is_file():
-        return json.dumps({"success": False, "error": f"File not found: {filename}"})
+        return json.dumps({"success": False, "error": "File not found"})
 
     try:
-        content = await asyncio.to_thread(filepath.read_text, "utf-8")
+        content = await asyncio.to_thread(read_knowledge_text, filepath, filepath.parent)
         # v2.6.0: best-effort get_file telemetry
         try:
             await asyncio.to_thread(
                 _record_access,
                 [{"domain": _domain_from_file(filename), "access_type": "get_file"}],
             )
-        except Exception as exc:
-            logger.debug("get_file telemetry skipped: %s", exc)
+        except Exception:
+            diagnostic(logger, "get_file_telemetry_failed", level=logging.DEBUG)
         return json.dumps({
             "success": True,
             "file": filename,
             "content": content,
         }, ensure_ascii=False)
-    except Exception as e:
-        logger.error("Failed to read %s: %s", filename, e)
-        return json.dumps({"success": False, "error": str(e)})
+    except Exception:
+        return json.dumps({"success": False, "error": diagnostic(logger, "knowledge_read_failed")})
 
 
 @mcp.tool()
@@ -1361,6 +1363,7 @@ async def audit_rot_tool() -> str:
 
 
 @mcp.tool()
+@private_tool("session_search_failed")
 async def search_sessions_by_keyword(
     keyword: str,
     days: int = 7,
@@ -1386,6 +1389,7 @@ async def search_sessions_by_keyword(
         return json.dumps({"success": False, "error": "No session source available (state.db or session directory)"})
 
     # Live sessions live in state.db; the file directory is the legacy fallback.
+    excluded_ids: set[str] = set()
     if db_available:
         result = await asyncio.to_thread(
             search_state_db_sessions,
@@ -1395,11 +1399,17 @@ async def search_sessions_by_keyword(
             max_results,
             config.session_exclude_markers,
             config.session_exclude_sources,
+            _excluded_session_ids=excluded_ids,
         )
-        if result.get("matches") or not dir_available:
+        if result.get("matches") or result.get("error") or not dir_available:
             return json.dumps(result, ensure_ascii=False, indent=2)
 
-    sessions = await asyncio.to_thread(find_recent_sessions, str(config.sessions_dir), days)
+    screened = await asyncio.to_thread(
+        scan_sessions, str(config.sessions_dir), days, max_results * 3,
+        config.hermes_db_path, config.session_exclude_markers, config.session_exclude_sources,
+        prefer_state_db=False, excluded_session_ids=excluded_ids,
+    )
+    sessions = screened["sessions"]
 
     # Limit scan scope: no point reading all sessions when we only need max_results
     scan_limit = max_results * 3
@@ -1408,7 +1418,7 @@ async def search_sessions_by_keyword(
     matches: list[dict] = []
 
     async def _check_session(s: dict) -> dict | None:
-        summary = await asyncio.to_thread(extract_session_summary, s["path"])
+        summary = s
         keyword_lower = keyword.lower()
         matched_msgs = [m for m in summary.get("user_messages", []) if keyword_lower in m.lower()]
         matched_topics = [t for t in summary.get("assistant_topics", []) if keyword_lower in t.lower()]
@@ -1452,6 +1462,7 @@ async def search_sessions_by_keyword(
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
+@private_tool("knowledge_create_failed")
 async def create_knowledge_file(filename: str, content: str) -> str:
     """Create a new L1 knowledge file. Auto-syncs L0 index after write.
 
@@ -1473,11 +1484,11 @@ async def create_knowledge_file(filename: str, content: str) -> str:
         return json.dumps({"success": False, "error": err or "Invalid filename"})
 
     if filepath.exists():
-        return json.dumps({"success": False, "error": f"File already exists: {filename}. Use update_knowledge_file instead."})
+        return json.dumps({"success": False, "error": "File already exists. Use update_knowledge_file instead."})
 
     try:
         await asyncio.to_thread(filepath.write_text, content, "utf-8")
-        logger.info("Created knowledge file: %s (%d bytes)", filename, len(content.encode("utf-8")))
+        logger.info("knowledge_file_created")
 
         # MEMORY_CHANGELOG: recorded before the derived L0/vector sync below, so
         # the L1 mutation precedes the index entries it causes.
@@ -1524,9 +1535,8 @@ async def create_knowledge_file(filename: str, content: str) -> str:
                 dual_write = await asyncio.to_thread(
                     _ensure_l0_pointer_in_memory, l0_pointer, config
                 )
-            except Exception as e:  # noqa: BLE001 — maintenance is non-critical
-                logger.warning("create dual-write failed (non-critical): %s", e)
-                dual_write = {"action": "error", "error": str(e)}
+            except Exception:
+                dual_write = {"action": "error", "error": diagnostic(logger, "knowledge_pointer_write_failed")}
 
         result = {
             "success": True,
@@ -1537,22 +1547,22 @@ async def create_knowledge_file(filename: str, content: str) -> str:
             "vector_sync_ok": bool(vector_result.get("success")),
         }
         if not result["vector_sync_ok"]:
-            result["vector_sync_error"] = vector_result.get("error")
+            result["vector_sync_error"] = "vector_sync_failed"
         if sync_report:
             result["l0_sync"] = sync_report
         if dual_write:
-            result["dual_write"] = dual_write
+            result["dual_write"] = public_pointer_report(dual_write)
         # v3.4.7: advisory lifecycle checks on what was just written.
         result["governance"] = await asyncio.to_thread(
             post_write_governance, config, domain, filepath, content, "create"
         )
         return json.dumps(result, ensure_ascii=False)
-    except Exception as e:
-        logger.error("Failed to create %s: %s", filename, e)
-        return json.dumps({"success": False, "error": str(e)})
+    except Exception:
+        return json.dumps({"success": False, "error": diagnostic(logger, "knowledge_create_failed")})
 
 
 @mcp.tool()
+@private_tool("knowledge_update_failed")
 async def update_knowledge_file(filename: str, content: str) -> str:
     """Update (overwrite) an existing L1 knowledge file. Auto-syncs L0 index after write.
 
@@ -1573,14 +1583,14 @@ async def update_knowledge_file(filename: str, content: str) -> str:
         return json.dumps({"success": False, "error": err or "Invalid filename"})
 
     if not filepath.exists():
-        return json.dumps({"success": False, "error": f"File not found: {filename}. Use create_knowledge_file for new files."})
+        return json.dumps({"success": False, "error": "File not found. Use create_knowledge_file for new files."})
 
     try:
         old_size = filepath.stat().st_size
         # Read once and reuse: the backup below and the MEMORY_CHANGELOG
         # before_hash both need the outgoing text.
         try:
-            old_text = await asyncio.to_thread(filepath.read_text, "utf-8")
+            old_text = await asyncio.to_thread(read_knowledge_text, filepath, filepath.parent)
         except OSError:
             old_text = None
         # v0.6.0: back up before overwriting. v3.4.7: under
@@ -1591,7 +1601,7 @@ async def update_knowledge_file(filename: str, content: str) -> str:
         )
         await asyncio.to_thread(filepath.write_text, content, "utf-8")
         new_size = len(content.encode("utf-8"))
-        logger.info("Updated knowledge file: %s (%d → %d bytes)", filename, old_size, new_size)
+        logger.info("knowledge_file_updated")
 
         # MEMORY_CHANGELOG. An overwrite with byte-identical content records
         # nothing — the file's mtime moved, its meaning did not.
@@ -1643,9 +1653,8 @@ async def update_knowledge_file(filename: str, content: str) -> str:
                 dual_write = await asyncio.to_thread(
                     _ensure_l0_pointer_in_memory, l0_pointer, config
                 )
-            except Exception as e:  # noqa: BLE001 — maintenance is non-critical
-                logger.warning("update dual-write failed (non-critical): %s", e)
-                dual_write = {"action": "error", "error": str(e)}
+            except Exception:
+                dual_write = {"action": "error", "error": diagnostic(logger, "knowledge_pointer_write_failed")}
 
         result = {
             "success": True,
@@ -1657,23 +1666,23 @@ async def update_knowledge_file(filename: str, content: str) -> str:
             "vector_sync_ok": bool(vector_result.get("success")),
         }
         if not result["vector_sync_ok"]:
-            result["vector_sync_error"] = vector_result.get("error")
+            result["vector_sync_error"] = "vector_sync_failed"
         if sync_report:
             result["l0_sync"] = sync_report
         if dual_write:
-            result["dual_write"] = dual_write
+            result["dual_write"] = public_pointer_report(dual_write)
         result["backup"] = backup
         # v3.4.7: advisory lifecycle checks on what was just written.
         result["governance"] = await asyncio.to_thread(
             post_write_governance, config, domain, filepath, content, "update"
         )
         return json.dumps(result, ensure_ascii=False)
-    except Exception as e:
-        logger.error("Failed to update %s: %s", filename, e)
-        return json.dumps({"success": False, "error": str(e)})
+    except Exception:
+        return json.dumps({"success": False, "error": diagnostic(logger, "knowledge_update_failed")})
 
 
 @mcp.tool()
+@private_tool("knowledge_delete_failed")
 async def delete_knowledge_file(filename: str) -> str:
     """Delete an L1 knowledge file. Auto-removes from L0 index after delete.
 
@@ -1693,16 +1702,20 @@ async def delete_knowledge_file(filename: str) -> str:
         return json.dumps({"success": False, "error": err or "Invalid filename"})
 
     if not filepath.exists():
-        return json.dumps({"success": False, "error": f"File not found: {filename}"})
+        return json.dumps({"success": False, "error": "File not found"})
 
+    steps = {"file": "pending", "index": "pending", "vector": "pending", "backup": "absent", "pointer": "not_requested"}
+    file_deleted = False
     try:
         old_size = filepath.stat().st_size
         try:
-            old_text = await asyncio.to_thread(filepath.read_text, "utf-8")
+            old_text = await asyncio.to_thread(read_knowledge_text, filepath, filepath.parent)
         except OSError:
             old_text = None
         await asyncio.to_thread(filepath.unlink)
-        logger.info("Deleted knowledge file: %s (%d bytes)", filename, old_size)
+        file_deleted = True
+        steps["file"] = "deleted"
+        logger.info("knowledge_file_deleted")
 
         # MEMORY_CHANGELOG: what the knowledge base used to say, and that it no
         # longer says it. The content itself lives on in data/backups/knowledge.
@@ -1723,21 +1736,31 @@ async def delete_knowledge_file(filename: str) -> str:
         try:
             if bak_path.exists():
                 await asyncio.to_thread(bak_path.unlink)
-                logger.debug("Cleaned up .bak for deleted file: %s", filename)
+                steps["backup"] = "deleted"
         except Exception:
-            pass  # Non-critical — .bak cleanup failure shouldn't block deletion
+            steps["backup"] = "failed"
+            diagnostic(logger, "knowledge_adjacent_backup_cleanup_failed")
 
         # v0.5.0: auto-sync L0 index (removes deleted file from L0)
-        sync_report = await asyncio.to_thread(auto_sync_if_enabled, config)
+        try:
+            sync_report = await asyncio.to_thread(auto_sync_if_enabled, config)
+            steps["index"] = "skipped" if sync_report is None else (
+                "completed" if sync_report.get("success") else "failed")
+        except Exception:
+            sync_report = None
+            steps["index"] = "failed"
+            diagnostic(logger, "knowledge_index_cleanup_failed")
 
         # v2.2.1: remove from vector store
         domain = filename.removesuffix(".md")
-        await asyncio.to_thread(
-            remove_from_vector_store,
-            data_dir=config.home / "data",
-            vector_db_path=config.vector_db_path,
-            domain=domain,
-        )
+        try:
+            vector_cleanup = await asyncio.to_thread(
+                remove_from_vector_store, data_dir=config.home / "data",
+                vector_db_path=config.vector_db_path, domain=domain)
+            steps["vector"] = "completed" if vector_cleanup.get("success") else "failed"
+        except Exception:
+            steps["vector"] = "failed"
+            diagnostic(logger, "knowledge_vector_cleanup_failed")
 
         # v2.9.3: reap the dangling L0 pointer from agent memory. Deletes
         # previously left a stale "[L0] <domain>: … → knowledge/<file>" entry
@@ -1751,25 +1774,36 @@ async def delete_knowledge_file(filename: str) -> str:
                 pointer_cleanup = await asyncio.to_thread(
                     _remove_l0_pointer_from_memory, domain, config
                 )
-            except Exception as e:  # noqa: BLE001 — maintenance is non-critical
-                logger.warning("delete pointer cleanup failed (non-critical): %s", e)
-                pointer_cleanup = {"action": "error", "error": str(e)}
+                if pointer_cleanup.get("action") in ("removed", "absent"):
+                    steps["pointer"] = "completed"
+                elif pointer_cleanup.get("action") == "skipped" and pointer_cleanup.get("reason") == "memory path not resolvable":
+                    steps["pointer"] = "not_present"
+                else:
+                    steps["pointer"] = "incomplete"
+                pointer_cleanup = {"action": pointer_cleanup.get("action", "incomplete")}
+            except Exception:
+                steps["pointer"] = "failed"
+                pointer_cleanup = {"action": "error", "error": diagnostic(logger, "knowledge_pointer_cleanup_failed")}
 
+        cleanup_pending = any(state in ("failed", "pending", "incomplete") for state in steps.values())
         result = {
-            "success": True,
-            "action": "deleted",
+            "success": not cleanup_pending,
+            "action": "delete_incomplete" if cleanup_pending else "deleted",
+            "file_deleted": file_deleted,
+            "cleanup_pending": cleanup_pending,
+            "steps": steps,
             "file": filename,
             "deleted_size_bytes": old_size,
-            "l0_synced": sync_report is not None,
+            "l0_synced": steps["index"] == "completed",
         }
         if pointer_cleanup:
             result["pointer_cleanup"] = pointer_cleanup
-        if sync_report:
+        if sync_report and steps["index"] == "completed":
             result["l0_sync"] = sync_report
         return json.dumps(result)
-    except Exception as e:
-        logger.error("Failed to delete %s: %s", filename, e)
-        return json.dumps({"success": False, "error": str(e)})
+    except Exception:
+        return json.dumps({"success": False, "error": diagnostic(logger, "knowledge_delete_failed"),
+                           "file_deleted": file_deleted, "cleanup_pending": file_deleted, "steps": steps})
 
 
 # ---------------------------------------------------------------------------
@@ -2898,6 +2932,7 @@ async def extract_session_knowledge(
 
 
 @mcp.tool()
+@private_tool("semantic_recall_failed")
 async def search_semantic(
     query: str,
     top_n: int = 5,
@@ -2938,8 +2973,8 @@ async def search_semantic(
             if r.get("domain")
         ]
         await asyncio.to_thread(_record_access, events)
-    except Exception as exc:
-        logger.debug("semantic telemetry skipped: %s", exc)
+    except Exception:
+        diagnostic(logger, "semantic_telemetry_failed", level=logging.DEBUG)
 
     payload = {
         "success": True,
@@ -3054,7 +3089,7 @@ async def approve_knowledge(
             if meta and meta.get("id") == entry_id:
                 from .storage.frontmatter import parse_frontmatter, dump_frontmatter
                 entry = KnowledgeEntry.from_markdown(
-                    stores["l1"]._resolve_path(domain).read_text(),
+                    read_knowledge_text(stores["l1"]._resolve_path(domain), stores["l1"].knowledge_dir),
                     domain=domain,
                 )
                 entry.review_status = __import__("layered_memory_mcp.models", fromlist=["ReviewStatus"]).ReviewStatus.APPROVED

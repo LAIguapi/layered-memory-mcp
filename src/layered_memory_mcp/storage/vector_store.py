@@ -30,6 +30,8 @@ from typing import TYPE_CHECKING, Mapping
 
 import numpy as np
 
+from ..privacy import diagnostic
+
 if TYPE_CHECKING:
     from ..models import KnowledgeEntry
 
@@ -55,11 +57,20 @@ EMBED_BATCH_SIZE = 16
 
 # Module-level singleton embedder (heavy to construct; share across stores).
 _embedder = None
+_embedder_local_only = False
 _embedder_lock = threading.Lock()
+
+
+def offline_mode() -> bool:
+    """Any supported offline switch wins over online bootstrap configuration."""
+    return any(os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+               for name in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "LAYERED_MEMORY_OFFLINE"))
 
 
 def _load_via_proxy(proxy_url: str):
     """Load TextEmbedding with proxy env temporarily exported, then restore."""
+    if offline_mode():
+        raise RuntimeError("model_cache_miss_offline: provision the model cache before retrying")
     from fastembed import TextEmbedding
 
     saved = {k: os.environ.get(k) for k in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY")}
@@ -86,33 +97,41 @@ def _get_embedder():
       3. Proxy download through the explicitly configured
          LAYERED_MEMORY_HF_PROXY, when set.
     """
-    global _embedder
-    if _embedder is not None:
+    global _embedder, _embedder_local_only
+    offline = offline_mode()
+    if _embedder is not None and (not offline or _embedder_local_only):
         return _embedder
     with _embedder_lock:
-        if _embedder is not None:
+        offline = offline_mode()
+        if _embedder is not None and (not offline or _embedder_local_only):
             return _embedder
         from fastembed import TextEmbedding
 
-        Path(MODEL_CACHE_DIR).mkdir(parents=True, exist_ok=True)
+        if not offline:
+            try:
+                Path(MODEL_CACHE_DIR).mkdir(parents=True, exist_ok=True)
+            except Exception:
+                raise RuntimeError("model_cache_unwritable: configure an accessible cache directory") from None
 
         # Attempt 1: offline (model already cached) — the normal hot path.
         try:
-            _embedder = TextEmbedding(MODEL_NAME, cache_dir=MODEL_CACHE_DIR)
+            _embedder = TextEmbedding(MODEL_NAME, cache_dir=MODEL_CACHE_DIR, local_files_only=True)
+            _embedder_local_only = True
             logger.info("Loaded embedding model %s (offline cache)", MODEL_NAME)
             return _embedder
-        except Exception as offline_err:
-            logger.warning(
-                "Offline model load failed (%s); attempting download", offline_err
-            )
+        except Exception:
+            if offline or offline_mode():
+                raise RuntimeError("model_cache_miss_offline: provision the model cache before retrying") from None
+            diagnostic(logger, "model_local_cache_unavailable")
 
         # Attempt 2: direct download from HuggingFace.
         try:
             _embedder = TextEmbedding(MODEL_NAME, cache_dir=MODEL_CACHE_DIR)
+            _embedder_local_only = False
             logger.info("Downloaded + loaded embedding model %s (direct)", MODEL_NAME)
             return _embedder
-        except Exception as direct_err:
-            logger.warning("Direct download failed (%s); trying proxy", direct_err)
+        except Exception:
+            diagnostic(logger, "model_online_bootstrap_failed")
 
         # Attempt 3: proxy download only when explicitly configured. Never probe
         # local ports: a library must not guess the operator's network topology.
@@ -123,7 +142,11 @@ def _get_embedder():
                 "unreachable and no proxy was configured. Set "
                 "LAYERED_MEMORY_HF_PROXY to a working HTTP proxy and retry."
             )
-        _embedder = _load_via_proxy(proxy_url)
+        try:
+            _embedder = _load_via_proxy(proxy_url)
+        except Exception:
+            raise RuntimeError("model_bootstrap_failed: configure a local cache or online connection") from None
+        _embedder_local_only = False
         return _embedder
 
 
@@ -687,8 +710,8 @@ class VectorStore:
         try:
             _get_embedder()
             return True
-        except Exception as err:  # noqa: BLE001 - surface as a soft failure
-            logger.warning("Embedding model warmup failed: %s", err)
+        except Exception:
+            diagnostic(logger, "model_warmup_failed")
             return False
 
     def stats(self) -> dict:

@@ -22,6 +22,9 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .privacy import diagnostic
+from .storage.knowledge_reader import read_knowledge_text
+
 if TYPE_CHECKING:
     from .config import MemoryConfig
 
@@ -65,11 +68,10 @@ def backup_knowledge_file(
         if content is None:
             if not Path(filepath).exists():
                 return {"skipped": "source does not exist"}
-            content = Path(filepath).read_text(encoding="utf-8")
+            content = read_knowledge_text(Path(filepath))
         dest = knowledge_backup_path(config, filepath)
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(content, encoding="utf-8")
         return {"path": str(dest), "bytes": len(content.encode("utf-8"))}
-    except Exception as e:  # noqa: BLE001 — backups are non-critical
-        logger.warning("Knowledge backup failed for %s: %s", filepath, e)
-        return {"error": str(e)}
+    except Exception:
+        return {"error": diagnostic(logger, "knowledge_backup_failed")}
