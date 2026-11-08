@@ -509,7 +509,7 @@ class L0RouteAdapter:
         content = self.index_file.read_text(encoding="utf-8")
         query_tokens = {
             token.casefold()
-            for token in str(query).split()
+            for token in self._tokens(str(query))
             if token.strip()
         }
         if not query_tokens:
@@ -524,6 +524,27 @@ class L0RouteAdapter:
                 routes.append({"line": line, "score": matched / len(query_tokens)})
         routes.sort(key=lambda route: (-route["score"], route["line"]))
         return routes
+
+    @staticmethod
+    def _tokens(text: str) -> list[str]:
+        """Return whitespace words plus adjacent CJK bigrams.
+
+        L0 entries are compact keyword lines rather than prose.  Keeping ASCII
+        words intact preserves the original router behavior, while CJK bigrams
+        let a query such as ``向量检索`` match an entry that mentions ``向量``
+        and ``检索`` without requiring whitespace that Chinese text normally
+        does not contain.
+        """
+        import re
+
+        tokens: list[str] = []
+        for part in text.split():
+            cjk_runs = re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff]+", part)
+            ascii_parts = re.findall(r"[^\u3400-\u4dbf\u4e00-\u9fff]+", part)
+            tokens.extend(item for item in ascii_parts if item.strip())
+            for run in cjk_runs:
+                tokens.extend(run[index : index + 2] for index in range(len(run) - 1))
+        return tokens
 
 
 class L1StoreHydrator:

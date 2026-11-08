@@ -1,6 +1,6 @@
-"""v3.6.2 — the declared version, pinned where a release actually reads it.
+"""v3.6.3 — the declared version, pinned where a release actually reads it.
 
-Why this file exists: the unified retrieval compatibility fix ships as 3.6.2, and this repo
+Why this file exists: the unified retrieval compatibility fix ships as 3.6.3, and this repo
 carries the version in more than one place (``pyproject.toml``, the package's
 own import-time fallback, and the write-guard plugin manifest it deploys). A
 bump that moves only one of them produces a package that reports a version it
@@ -20,7 +20,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 
 #: The target of this batch.
-EXPECTED_VERSION = "3.6.2"
+EXPECTED_VERSION = "3.6.3"
 
 
 def _match(path: Path, pattern: str) -> str:

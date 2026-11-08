@@ -1,6 +1,6 @@
 [project]
 name = "layered-memory-mcp"
-version = "3.6.2"
+version = "3.6.3"
 description = "Layered Memory MCP Server — Durable common-core memory for AI agents: L0 index, L1 knowledge, TODO and provenance, with deterministic persistence routing"
 readme = "README.md"
 license = "MIT"

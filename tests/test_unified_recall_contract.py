@@ -217,6 +217,33 @@ def test_production_l0_adapter_empty_route_is_soft(tmp_path):
     assert result["trace"]["stages"]["route"]["reason"] == "empty_route"
 
 
+def test_production_l0_adapter_routes_contiguous_cjk_query(tmp_path):
+    index = tmp_path / "L0.md"
+    index.write_text(
+        "[L0] retrieval: 向量语义与关键词检索 → knowledge/retrieval.md\n"
+        "[L0] deployment: 服务运行与部署维护 → knowledge/deployment.md\n",
+        encoding="utf-8",
+    )
+
+    routes = L0RouteAdapter(index).route("向量检索")
+
+    assert routes
+    assert routes[0]["line"].startswith("[L0] retrieval:")
+
+
+def test_production_l0_adapter_mixed_query_keeps_ascii_behavior(tmp_path):
+    index = tmp_path / "L0.md"
+    index.write_text(
+        "[L0] layered-memory: layered-memory — md, config → knowledge/layered-memory.md\n",
+        encoding="utf-8",
+    )
+
+    routes = L0RouteAdapter(index).route("layered memory")
+
+    assert routes
+    assert routes[0]["score"] == 1.0
+
+
 def test_production_builder_wires_l0_router(tmp_path):
     engine = build_unified_engine(
         SimpleNamespace(l0_index_file=tmp_path / "L0.md"),
