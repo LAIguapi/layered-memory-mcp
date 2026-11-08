@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.7.0] - 2026-11-09
+
+### Added
+
+- Opt-in whole-group semantic rewrite over the existing journal and projection
+  pipeline: read-only `inspect_semantic_surfaces` (no telemetry, no database or
+  lock creation) and `apply_semantic_rewrite`, with `SectionRef`,
+  `RewriteTarget`, `RewritePreconditions` and `SemanticRewriteRequest`.
+- Snapshot preconditions on journal head position, replayed node hashes,
+  on-disk binding body hashes and the exact entry set of the group's own old
+  bindings; entry sets compare as sets, so order and duplicates are immaterial.
+- One group is one decision: a single journal append, one complete
+  final-document replacement per affected domain, and all-or-nothing rejection
+  before any append or publication.
+
+### Changed
+
+- `graph_projection.publish_l1` renders through `render_surface_document`,
+  resolving every occurrence against the original block list so retiring
+  several sections no longer shifts the indices still to be written.
+- Library-level rewrite entrances refuse legacy and shadow modes before any
+  directory, database or publication-lock work.
+
+### Security
+
+- Rewrites refuse REST-owned frontmatter entry files, drifted bodies and
+  occupied surfaces, append nothing on refusal, and never repair a drifted
+  document in place.
+
 ## [3.6.4] - 2026-11-08
 
 ### Security

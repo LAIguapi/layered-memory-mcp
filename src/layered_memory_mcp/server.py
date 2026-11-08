@@ -273,9 +273,11 @@ mcp = FastMCP("layered-memory", version=__version__)
 _config: MemoryConfig | None = None
 
 
-def _get_config() -> MemoryConfig:
+def _get_config(*, readonly: bool = False) -> MemoryConfig:
     """Get or create config singleton."""
     global _config
+    if _config is None and readonly:
+        return MemoryConfig(create_directories=False)
     if _config is None:
         _config = MemoryConfig()
         logger.info("memory_config_initialized")
@@ -4110,6 +4112,72 @@ async def graph_memory_status() -> str:
 
     result = await asyncio.to_thread(runtime_status, _get_config(), store=_graph_store)
     return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+@private_tool("graph_inspection_failed")
+async def inspect_semantic_surfaces(domain: str, include_body: bool = False) -> str:
+    """Read exact graph bindings in one explicit domain, without telemetry.
+
+    Bodies are omitted unless explicitly requested. Uses read-only journal
+    replay; never creates a database, directory, schema or publication lock.
+    """
+    from .graph_rewrite import inspect_semantic_surfaces as inspect
+
+    config = _get_config(readonly=True)
+    try:
+        _path, error = _validate_knowledge_path(config, domain + ".md")
+    except (TypeError, ValueError, OSError):
+        error = "invalid_domain"
+    if error:
+        return json.dumps({"success": False, "error": "invalid_domain"})
+    result = await asyncio.to_thread(inspect, config, domain,
+                                     include_body=include_body, store=_graph_store)
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+@private_tool("graph_rewrite_failed")
+async def apply_semantic_rewrite(semantic_rewrite_request: dict | None = None) -> str:
+    """Commit one explicit whole-group rewrite, only in graph write modes.
+
+    Accepts the SemanticRewriteRequest JSON shape (up to 100 targets / 1 MiB).
+    Preconditions share the publication lock with the append, not an OS-level
+    guard against external Markdown edits. A committed pending response is
+    durable: retry exactly the same request to resume its projections.
+    """
+    from .graph_application import GRAPH_COMMIT_COMMITTED, commit_payload
+    from .graph_rewrite import SemanticRewriteRequest, commit_semantic_rewrite
+
+    config = _get_config()
+    if not config.graph_write_enabled:
+        return json.dumps({"success": False, "error": "graph_rewrite_requires_write_mode",
+                           "graph_mode": config.graph_mode})
+    try:
+        if not isinstance(semantic_rewrite_request, dict):
+            raise TypeError("request_not_an_object")
+        if len(json.dumps(semantic_rewrite_request).encode("utf-8")) > 1024 * 1024:
+            raise ValueError("request_too_large")
+        request = SemanticRewriteRequest.model_validate(semantic_rewrite_request)
+        if len(request.targets) > 100:
+            raise ValueError("too_many_targets")
+        for target in request.targets:
+            _path, error = _validate_knowledge_path(config, target.surface.domain + ".md")
+            if error:
+                raise ValueError("invalid_domain")
+    except (TypeError, ValueError, OSError) as exc:
+        return json.dumps({
+            "success": False, "error": "invalid_semantic_rewrite_request",
+            "semantic_rewrite_request_errors": _semantic_write_error_labels(
+                exc, "semantic_rewrite_request"),
+        }, ensure_ascii=False)
+    commit = await asyncio.to_thread(commit_semantic_rewrite, config, request, store=_graph_store)
+    payload = {"success": commit.committed, "graph": commit_payload(commit)}
+    if not commit.committed:
+        payload["error"] = commit.status
+    elif commit.status != GRAPH_COMMIT_COMMITTED:
+        payload["warning"] = "Committed durably; projections pending. Retry the identical request."
+    return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()

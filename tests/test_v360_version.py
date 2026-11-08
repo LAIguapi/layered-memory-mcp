@@ -1,11 +1,11 @@
-"""v3.6.4 — the declared version, pinned where a release actually reads it.
+"""v3.7.0 — the declared version, pinned where a release actually reads it.
 
-Why this file exists: the privacy repair ships as 3.6.4, and this repo
-carries the version in more than one place (``pyproject.toml``, the package's
-own import-time fallback, and the write-guard plugin manifest it deploys). A
-bump that moves only one of them produces a package that reports a version it
-is not — and, for the plugin, a deployed guard that the installer then refuses
-as stale. So the version is asserted as *one* fact with several spellings.
+Why this file exists: a release ships a version the repo carries in more than
+one place (``pyproject.toml``, the package's own import-time fallback, and the
+write-guard plugin manifest it deploys). A bump that moves only one of them
+produces a package that reports a version it is not — and, for the plugin, a
+deployed guard that the installer then refuses as stale. So the version is
+asserted as *one* fact with several spellings.
 
 Nothing here reads the installed distribution metadata: a test that asserted
 ``importlib.metadata.version`` would pass or fail on how the dev environment
@@ -20,7 +20,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 
 #: The target of this batch.
-EXPECTED_VERSION = "3.6.4"
+EXPECTED_VERSION = "3.7.0"
 
 
 def _match(path: Path, pattern: str) -> str:
@@ -64,6 +64,6 @@ def test_no_source_file_still_declares_the_previous_version():
             REPO / "src" / "layered_memory_mcp" / "write_guard" / "__init__.py",
             REPO / "src" / "layered_memory_mcp" / "write_guard" / "plugin" / "plugin.yaml",
         ]
-        if "3.5.1" in path.read_text(encoding="utf-8")
+        if "3.6.4" in path.read_text(encoding="utf-8")
     ]
     assert stale == []

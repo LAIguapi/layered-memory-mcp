@@ -84,6 +84,7 @@ __all__ = [
     "publish_todo",
     "publish_vector",
     "read_section_body",
+    "render_surface_document",
     "replace_document",
     "surface_plans",
     "surface_refusal",
@@ -433,6 +434,42 @@ def surface_plans(
     return plans
 
 
+def render_surface_document(
+    raw: str, plans: Sequence[SurfacePlan],
+) -> tuple[str | None, L1ProjectionReport]:
+    """Render one domain's final state without I/O or registry mutations.
+
+    Resolve occurrences against the original blocks before removing anything;
+    retiring one duplicate must not change which block a sibling plan names.
+    ``None`` means no managed body changed, preserving the original bytes.
+    """
+    preamble, blocks = _parse_document(raw)
+    report = L1ProjectionReport()
+    updates: dict[int, tuple[str, str] | None] = {}
+    additions: list[SurfacePlan] = []
+    for plan in plans:
+        index = _locate(blocks, plan.section, plan.occurrence)
+        if plan.action == "retire":
+            if index is not None:
+                updates[index] = None
+                report.retired.append(plan.entry_id)
+        elif index is None:
+            additions.append(plan)
+            report.published.append(plan.entry_id)
+        elif _block_body(blocks[index][1]) != plan.body.strip():
+            updates[index] = (plan.section, _render_block(plan.section, plan.body))
+            report.published.append(plan.entry_id)
+        else:
+            report.unchanged.append(plan.entry_id)
+    if not updates and not additions:
+        return None, report
+    final_blocks = [updates.get(index, block) for index, block in enumerate(blocks)
+                    if updates.get(index, block) is not None]
+    final_blocks.extend((plan.section, _render_block(plan.section, plan.body))
+                        for plan in sorted(additions, key=lambda item: item.occurrence))
+    return _write_document(preamble, final_blocks), report
+
+
 def publish_l1(
     config: Any,
     journal: MemoryEventJournal,
@@ -496,34 +533,15 @@ def publish_l1(
     for domain in sorted(by_domain):
         path = domain_path(config, domain)
         raw = path.read_text(encoding="utf-8") if path.exists() else ""
-        preamble, blocks = _parse_document(raw)
-        changed = False
+        rendered, changes = render_surface_document(raw, by_domain[domain])
+        report.published.extend(changes.published)
+        report.retired.extend(changes.retired)
+        report.unchanged.extend(changes.unchanged)
 
-        for plan in by_domain[domain]:
-            index = _locate(blocks, plan.section, plan.occurrence)
-            if plan.action == "retire":
-                if index is not None:
-                    blocks.pop(index)
-                    changed = True
-                    report.retired.append(plan.entry_id)
-                continue
-
-            rendered = _render_block(plan.section, plan.body)
-            if index is None:
-                blocks.append((plan.section, rendered))
-                changed = True
-                report.published.append(plan.entry_id)
-            elif _block_body(blocks[index][1]) != plan.body.strip():
-                blocks[index] = (plan.section, rendered)
-                changed = True
-                report.published.append(plan.entry_id)
-            else:
-                report.unchanged.append(plan.entry_id)
-
-        if changed:
+        if rendered is not None:
             for plan in by_domain[domain]:
                 journal.record_surface_intent(_plan_intent(plan, position))
-            replace_document(path, _write_document(preamble, blocks))
+            replace_document(path, rendered)
 
         for plan in by_domain[domain]:
             if plan.action == "retire":

@@ -518,7 +518,11 @@ def _coerce_str_list(value: object) -> list[str]:
 
 
 class MemoryConfig:
-    """Runtime configuration for the memory server."""
+    """Runtime configuration for the memory server.
+
+    ``create_directories=False`` resolves the same settings without creating
+    the home or knowledge directories, for strictly read-only entrances.
+    """
 
     def __init__(
         self,
@@ -600,6 +604,7 @@ class MemoryConfig:
         # resolution and validation rules as graph_db_path, declared separately.
         graph_journal_path: str | None = None,
         graph_active_pointer: str | Path | None = None,
+        create_directories: bool = True,
     ):
         self.home = Path(home) if home else default_home()
 
@@ -1278,10 +1283,11 @@ class MemoryConfig:
             self._bind_graph_generation(explicit_knowledge=bool(knowledge_dir))
         
         # Ensure directories exist
-        self.home.mkdir(parents=True, exist_ok=True)
-        self.knowledge_dir.mkdir(parents=True, exist_ok=True)
-        if self._shared_knowledge_dir:
-            self._shared_knowledge_dir.mkdir(parents=True, exist_ok=True)
+        if create_directories:
+            self.home.mkdir(parents=True, exist_ok=True)
+            self.knowledge_dir.mkdir(parents=True, exist_ok=True)
+            if self._shared_knowledge_dir:
+                self._shared_knowledge_dir.mkdir(parents=True, exist_ok=True)
 
     def _bind_graph_generation(self, *, explicit_knowledge: bool) -> None:
         """Validate the explicit authority before creating any service directories.

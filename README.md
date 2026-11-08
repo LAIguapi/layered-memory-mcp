@@ -67,6 +67,122 @@ The L0 index, the vector store and the search index are **derived** from the L1 
 
 > **Design Note:** The hybrid search ranking is inspired by [Semble](https://github.com/MinishLab/semble), a fast code search library for agents. We adapted their RRF (Reciprocal Rank Fusion) approach — with multi-signal boosting and query-aware alpha detection — for markdown knowledge retrieval.
 
+## Explicit Graph Rewrites (Opt-In)
+
+For a whole-group section rewrite, use the explicit MCP tools
+`inspect_semantic_surfaces(domain, include_body=False)` and
+`apply_semantic_rewrite(semantic_rewrite_request)`. These are additive: no
+default, migration, reindex, generation switch or batch-inject behavior changes.
+MCP rewrites require `graph` / `graph_write` mode; inspection is read-only in
+every mode, including a cold service with no initialized databases.
+
+The matching Python contract lives in `layered_memory_mcp.graph_rewrite`:
+
+```python
+from datetime import datetime, timezone
+from layered_memory_mcp.graph_models import Derivation, DerivationMethod, GraphNode, NodeKind
+from layered_memory_mcp.graph_rewrite import (
+    SectionRef, RewriteTarget, RewritePreconditions, SemanticRewriteRequest,
+    inspect_semantic_surfaces, commit_semantic_rewrite,
+)
+
+snapshot = inspect_semantic_surfaces(config, "ops")
+```
+
+Inspection requires one explicit primary domain and returns `success`, `domain`,
+`head_position`, and `surfaces`. Each surface contains `entry_id`, `domain`,
+`section`, zero-based `occurrence`, `node_id`, node `status`, `scope`, on-disk
+`body_sha256`, registry `binding_body_sha256`, and `node_sha256`. Only
+`include_body=True` adds `body`. Retired registry rows and foreign configured
+namespaces are excluded; an inspection failure returns only `success=False`
+and an `error` code. It creates no directory, database, schema, lock or access
+telemetry. It does not repair or publish pending projections. Reads concurrent
+with publication can observe a changing view; obtain a new snapshot after a
+refusal rather than guessing missing bindings. Domain-file symlink aliases are
+refused. WAL-format journals return `graph_inspection_unsupported_journal_mode`
+without opening SQLite, because even a read-only SQLite WAL connection can
+create sidecars. The framework's ordinary rollback-mode journal is supported;
+inspection never changes its journal mode to make it readable.
+
+An N-old → 1-new request can be built from the discovered identities:
+
+```python
+decision_time = datetime.now(timezone.utc)
+replacement = GraphNode(
+    id="claim_combined_schedule", kind=NodeKind.CLAIM,
+    label="Combined schedule", content="Alpha and Beta refresh hourly.",
+    recorded_at=decision_time,
+    derivation=Derivation(method=DerivationMethod.USER_EXPLICIT),
+)
+request = SemanticRewriteRequest(
+    targets=[RewriteTarget(
+        old_node_ids=[row["node_id"] for row in snapshot["surfaces"]],
+        node=replacement,
+        surface=SectionRef(domain="ops", section="Combined schedule", occurrence=0),
+    )],
+    occurred_at=decision_time,
+    request_key="combine_schedule_decision",
+)
+```
+
+For N-old → K-new, pass multiple `RewriteTarget` objects in the same `targets`
+list. Each target has its own nonempty `old_node_ids`, a complete `GraphNode`,
+and `SectionRef`. Old IDs must be disjoint across targets, new IDs must be
+fresh, and final readable surfaces must have one owner and representable
+occurrences. New nodes must be current and within their validity window;
+TASK/TODO nodes have no H2 binding and are not rewrite targets. An operation
+that would silently renumber a surviving bound
+duplicate heading is refused; replace the entire duplicate group instead.
+The framework never infers a split, scope, derivation or replacement body.
+
+Optional snapshot preconditions protect the entire decision:
+
+```python
+request.preconditions = RewritePreconditions(
+    expected_head_position=snapshot["head_position"],
+    expected_node_hashes={row["node_id"]: row["node_sha256"] for row in snapshot["surfaces"]},
+    expected_body_hashes={row["entry_id"]: row["binding_body_sha256"] for row in snapshot["surfaces"]},
+    expected_entry_ids=[row["entry_id"] for row in snapshot["surfaces"]],
+)
+commit = commit_semantic_rewrite(config, request)
+```
+
+The canonical node hash is SHA-256 of UTF-8 `node.to_json()` on the
+journal-replayed node: `json.dumps(node.model_dump(mode="json"), sort_keys=True,
+ensure_ascii=False)`, with default JSON separators and all fields, including
+null/default fields. `GraphNode.version` alone is **not** a CAS token.
+
+Preconditions are validated inside the same publication lock as the append.
+They compare against the framework's own journal and surface registry. They
+are not an OS-level guard against external processes that edit the Markdown
+files without taking this lock.
+
+Every target is validated before one journal append; invalid groups append no
+events and publish no body. L1 renders the final state with at most one file
+replacement per changed domain. Publication is **not** a cross-store transaction
+or a cross-file atomic rename: a projection failure returns `committed=True`
+and `projections_pending`. Retry the identical request (including its original
+preconditions and timestamp) to converge without reapplying its stale CAS;
+changing it under the same request identity is a conflict. Old nodes/events
+remain history. `SemanticCommit.node_id` and `entry_id` identify the first
+target; `event_ids` and `superseded_ids` describe the whole group.
+
+New refusal statuses are `graph_rewrite_rejected_empty`,
+`graph_rewrite_rejected_preconditions` (head/node/body mismatch), and
+`graph_rewrite_rejected_entry_set` (old entry-set mismatch). Other refusals use
+the existing graph-application statuses. Preconditions may be omitted or
+partial; this does not disable lifecycle, scope, ownership or drift validation.
+MCP accepts up to 100 targets and a 1 MiB JSON request and uses the model's
+`to_dict()` shape; validation errors expose field/type labels, not bodies or
+backend exception text. The Python seam accepts an explicit configured authority
+like `commit_semantic_write`, and both it and the MCP wrapper refuse legacy and
+shadow modes before any directory, database or lock work.
+
+Not provided: shared-old-node 1 → many splits, group undo/rollback, REST rewrite
+routes, automatic adoption of unmanaged/frontmatter surfaces, or external-process
+file locking. `batch_inject_knowledge_tool` remains a sequence of independent
+single-node commits, not an atomic group.
+
 ## Quick Start
 
 ### Install
