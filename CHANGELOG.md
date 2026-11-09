@@ -5,10 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [3.7.0] - 2026-11-09
+## [3.8.0] - 2026-11-09
 
 ### Added
 
+- Managed Markdown preambles with dedicated `mdpre1_` identities, journaled
+  bindings and publication intents, drift/adoption refusal, CAS preconditions,
+  replay and read-only surface inspection. A domain-only `PreambleRef` targets
+  the title and orientation independently of H2 sections.
+- Fan-out and combined fan-in/fan-out group rewrites: each new/old pair retains
+  its lineage edge, while each distinct old node transitions exactly once.
+  Duplicate old IDs within a single target remain invalid.
+- Preamble bodies normalize CRLF/CR to LF and strip boundary whitespace for
+  hashes and comparisons. Rendering separates sections with two LF characters
+  and ends non-empty documents with one LF, keeping round trips stable.
 - Opt-in whole-group semantic rewrite over the existing journal and projection
   pipeline: read-only `inspect_semantic_surfaces` (no telemetry, no database or
   lock creation) and `apply_semantic_rewrite`, with `SectionRef`,

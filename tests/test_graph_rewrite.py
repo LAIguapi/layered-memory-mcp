@@ -118,6 +118,294 @@ def full_preconditions(api, config):
     )
 
 
+def test_fan_out_three_sections_has_one_transition_and_truthful_lineage(config):
+    from layered_memory_mcp.graph_fixture_store import InMemoryGraphStore
+    from layered_memory_mcp.graph_models import MemoryEventKind, RelationType
+
+    _commit_a(config)
+    api = rewrite_api()
+    request = request_for(api, preconditions=full_preconditions(api, config))
+    request.targets = [api.RewriteTarget(
+        old_node_ids=["claim_index_nightly"],
+        node=_node(f"claim_split_{index}", f"Neutral split {index}."),
+        surface=api.SectionRef(domain="retrieval", section=f"Split {index}"),
+    ) for index in range(3)]
+    result = api.commit_semantic_rewrite(config, request)
+    assert result.ok
+    assert result.superseded_ids == ["claim_index_nightly"]
+    events = journal_state(config)[1]
+    assert sum(event.kind == MemoryEventKind.SUPERSEDE for event in events) == 1
+    replay = InMemoryGraphStore()
+    report = replay.rebuild(events)
+    assert report.ok
+    assert not any("ignored_transition" in warning and "claim_index_nightly" in warning
+                   for warning in report.warnings)
+    nodes, edges = graph_application._materialize(replay)
+    assert nodes["claim_index_nightly"].status == NodeStatus.SUPERSEDED
+    assert sum(edge.relation_type == RelationType.SUPERSEDES for edge in edges.values()) == 3
+    raw = (Path(config.knowledge_dir) / "retrieval.md").read_text()
+    for index in range(3):
+        assert graph_projection.read_section_body(raw, f"Split {index}") == f"Neutral split {index}."
+
+
+def test_duplicate_old_id_in_one_target_is_a_caller_error(config):
+    _commit_a(config)
+    api = rewrite_api()
+    request = request_for(api)
+    request.targets[0].old_node_ids *= 2
+    before = journal_state(config), payload_state(Path(config.home))
+    result = api.commit_semantic_rewrite(config, request)
+    assert result.status == graph_application.GRAPH_COMMIT_REJECTED_INVALID
+    assert result.errors == ["duplicate_old_node_id_in_target"]
+    assert (journal_state(config), payload_state(Path(config.home))) == before
+
+
+def test_fan_out_and_fan_in_share_one_distinct_transition_set(config, monkeypatch):
+    from layered_memory_mcp.graph_fixture_store import InMemoryGraphStore
+    from layered_memory_mcp.graph_models import MemoryEventKind, RelationType
+
+    _commit_a(config)
+    assert seed_second(config).ok
+    api = rewrite_api()
+    request = group_request(api)
+    request.targets[1].old_node_ids.append("claim_index_nightly")
+    request.preconditions = full_preconditions(api, config)
+    appends = []
+    original = MemoryEventJournal.append
+
+    def counted_append(self, *args, **kwargs):
+        appends.append(args[0])
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(MemoryEventJournal, "append", counted_append)
+    first = api.commit_semantic_rewrite(config, request)
+    assert first.ok
+    assert first.superseded_ids == ["claim_cache", "claim_index_nightly"]
+    events = journal_state(config)
+    retry = api.commit_semantic_rewrite(config, request)
+    assert retry.ok and retry.duplicate
+    assert journal_state(config) == events
+    assert len(appends) == 1
+    request.targets[1].node.content = "Neutral changed payload."
+    conflict = api.commit_semantic_rewrite(config, request)
+    assert conflict.status == graph_application.GRAPH_COMMIT_REJECTED_REQUEST
+    assert journal_state(config) == events
+    assert len(appends) == 1
+    transitions = [event.target_id for event in events[1]
+                   if event.kind == MemoryEventKind.SUPERSEDE]
+    assert sorted(transitions) == first.superseded_ids
+    replay = InMemoryGraphStore()
+    assert replay.rebuild(events[1]).warnings == []
+    nodes, edges = graph_application._materialize(replay)
+    assert all(nodes[node_id].status == NodeStatus.SUPERSEDED for node_id in transitions)
+    assert {(edge.source_id, edge.target_id) for edge in edges.values()
+            if edge.relation_type == RelationType.SUPERSEDES} == {
+        ("claim_hourly", "claim_index_nightly"), ("claim_cache_new", "claim_cache"),
+        ("claim_cache_new", "claim_index_nightly"),
+    }
+
+
+def publish_preamble(config):
+    body = "# Neutral old title\n\nNeutral old orientation."
+    result = graph_application.commit_semantic_write(
+        config, SemanticWriteRequest(node=_node("claim_preamble", body), occurred_at=T0),
+        graph_projection.ProjectionBinding(
+            domain="retrieval", section="", occurrence=0, body=body,
+            kind=graph_projection.PROJECTION_PREAMBLE_SURFACE_KIND,
+        ),
+    )
+    assert result.ok
+    return result
+
+
+def preamble_request(api):
+    request = request_for(api, request_key="rewrite_preamble")
+    request.targets = [api.RewriteTarget(
+        old_node_ids=["claim_preamble"],
+        node=_node("claim_preamble_new", "# Neutral new title\n\nNeutral new orientation."),
+        surface=api.PreambleRef(domain="retrieval"),
+    )]
+    return request
+
+
+def test_rewrite_surface_reference_discrimination_is_explicit():
+    from pydantic import ValidationError
+
+    api = rewrite_api()
+    payload = request_for(api).to_dict()
+    target = payload["targets"][0]
+    assert isinstance(api.SemanticRewriteRequest.model_validate(payload).targets[0].surface, api.SectionRef)
+    target["surface"] = {"domain": "retrieval"}
+    assert isinstance(api.SemanticRewriteRequest.model_validate(payload).targets[0].surface, api.PreambleRef)
+    target["surface"]["occurrence"] = 0
+    with pytest.raises(ValidationError):
+        api.SemanticRewriteRequest.model_validate(payload)
+
+
+def test_preamble_published_updated_with_cas_then_retired(config):
+    _commit_a(config)
+    published = publish_preamble(config)
+    api = rewrite_api()
+    path = Path(config.knowledge_dir) / "retrieval.md"
+    assert path.read_text().startswith("# Neutral old title\n\nNeutral old orientation.\n\n## ")
+    view = api.inspect_semantic_surfaces(config, "retrieval")
+    row = next(row for row in view["surfaces"] if row["node_id"] == "claim_preamble")
+    request = preamble_request(api)
+    request.preconditions = api.RewritePreconditions(
+        expected_entry_ids=[published.entry_id],
+        expected_body_hashes={published.entry_id: row["body_sha256"]},
+        expected_node_hashes={"claim_preamble": row["node_sha256"]},
+        expected_head_position=view["head_position"],
+    )
+    assert api.commit_semantic_rewrite(config, request).ok
+    assert path.read_text().startswith("# Neutral new title\n\nNeutral new orientation.\n\n## ")
+    assert "Neutral old" not in path.read_text()
+    retirement = request_for(api, request_key="retire_preamble")
+    retirement.targets[0].old_node_ids = ["claim_preamble_new"]
+    retirement.targets[0].node = _node("claim_orientation", "Neutral section orientation.")
+    retirement.targets[0].surface = api.SectionRef(domain="retrieval", section="Orientation")
+    assert api.commit_semantic_rewrite(config, retirement).ok
+    assert graph_projection.read_preamble(path.read_text()) == ""
+    assert graph_projection.read_section_body(path.read_text(), "Orientation") == "Neutral section orientation."
+    with journal_readonly_session(config, require=True) as assembly:
+        record = assembly.journal.surface(published.entry_id)
+        assert record.status == "retired"
+        assert record.kind == graph_projection.PROJECTION_PREAMBLE_SURFACE_KIND
+        assert record.section == "" and record.occurrence == 0
+        assert assembly.journal.surface_intent(published.entry_id) is None
+    assert api.commit_semantic_rewrite(config, retirement).duplicate
+
+
+def test_fan_out_still_refuses_external_edits_atomically(config):
+    _commit_a(config)
+    api = rewrite_api()
+    request = request_for(api)
+    request.targets.append(api.RewriteTarget(
+        old_node_ids=["claim_index_nightly"], node=_node("claim_split_other", "Neutral other result."),
+        surface=api.SectionRef(domain="retrieval", section="Other result"),
+    ))
+    path = Path(config.knowledge_dir) / "retrieval.md"
+    path.write_text("## Index maintenance\n\nNeutral external edit.\n")
+    before = journal_state(config), payload_state(Path(config.home))
+    result = api.commit_semantic_rewrite(config, request)
+    assert result.status == graph_application.GRAPH_COMMIT_REJECTED_DRIFT
+    assert (journal_state(config), payload_state(Path(config.home))) == before
+
+
+@pytest.mark.parametrize("fault", ["drift", "unadopted", "body_cas", "same_surface"])
+def test_preamble_guard_rejections_are_atomic(config, fault):
+    _commit_a(config)
+    api = rewrite_api()
+    path = Path(config.knowledge_dir) / "retrieval.md"
+    if fault == "unadopted":
+        path.write_text("# Neutral unmanaged title\n\n" + path.read_text())
+        request = request_for(api)
+        request.targets[0].surface = api.PreambleRef(domain="retrieval")
+    else:
+        published = publish_preamble(config)
+        request = preamble_request(api)
+        if fault == "drift":
+            path.write_text(path.read_text().replace("Neutral old title", "Neutral external title"))
+        elif fault == "body_cas":
+            request.preconditions = api.RewritePreconditions(
+                expected_body_hashes={published.entry_id: "0" * 64},
+            )
+        elif fault == "same_surface":
+            request.targets.append(api.RewriteTarget(
+                old_node_ids=["claim_index_nightly"], node=_node("claim_title_other", "Neutral other title."),
+                surface=api.PreambleRef(domain="retrieval"),
+            ))
+    before = journal_state(config), payload_state(Path(config.home))
+    result = api.commit_semantic_rewrite(config, request)
+    expected = {
+        "drift": graph_application.GRAPH_COMMIT_REJECTED_DRIFT,
+        "unadopted": graph_application.GRAPH_COMMIT_REJECTED_DRIFT,
+        "body_cas": "graph_rewrite_rejected_preconditions",
+        "same_surface": graph_application.GRAPH_COMMIT_REJECTED_SURFACE,
+    }
+    assert result.status == expected[fault]
+    if fault == "unadopted":
+        assert any(error.startswith("surface_not_adopted:") for error in result.errors)
+    assert (journal_state(config), payload_state(Path(config.home))) == before
+
+
+def test_whole_document_restructure_is_one_atomic_group_and_replays(config, monkeypatch):
+    from layered_memory_mcp.graph_fixture_store import InMemoryGraphStore
+
+    _commit_a(config)
+    publish_preamble(config)
+    api = rewrite_api()
+    request = preamble_request(api)
+    for index in range(3):
+        request.targets.append(api.RewriteTarget(
+            old_node_ids=["claim_index_nightly"],
+            node=_node(f"claim_part_{index}", f"Neutral reorganized part {index}."),
+            surface=api.SectionRef(domain="retrieval", section=f"Part {index}"),
+        ))
+    request.preconditions = full_preconditions(api, config)
+    appends = []
+    replacements = []
+    original_append = MemoryEventJournal.append
+    original_replace = graph_projection.replace_document
+
+    def append(self, *args, **kwargs):
+        appends.append(args[0])
+        return original_append(self, *args, **kwargs)
+
+    def replace(path, content):
+        replacements.append(path)
+        return original_replace(path, content)
+
+    monkeypatch.setattr(MemoryEventJournal, "append", append)
+    monkeypatch.setattr(graph_projection, "replace_document", replace)
+    result = api.commit_semantic_rewrite(config, request)
+    assert result.ok
+    path = Path(config.knowledge_dir) / "retrieval.md"
+    assert appends == [result.request_id]
+    assert replacements == [path]
+    raw = path.read_text()
+    assert raw.startswith("# Neutral new title\n\nNeutral new orientation.\n\n")
+    assert "Index maintenance" not in raw
+    for index in range(3):
+        assert graph_projection.read_section_body(raw, f"Part {index}") == f"Neutral reorganized part {index}."
+    assert raw.count("## ") == 3
+    before = tree_state(Path(config.home))
+    view = api.inspect_semantic_surfaces(config, "retrieval", include_body=True)
+    assert tree_state(Path(config.home)) == before
+    assert len(view["surfaces"]) == 4
+    for row in view["surfaces"]:
+        assert row["body_sha256"] == row["binding_body_sha256"]
+        assert row["node_sha256"]
+        assert row["surface_kind"] == (
+            graph_projection.PROJECTION_PREAMBLE_SURFACE_KIND if row["section"] == ""
+            else graph_projection.PROJECTION_SURFACE_KIND
+        )
+    events = journal_state(config)[1]
+    replay = InMemoryGraphStore()
+    assert replay.rebuild(events).warnings == []
+    nodes, _edges = graph_application._materialize(replay)
+    assert graph_projection.render_surface_document("", graph_projection.surface_plans(events, nodes))[0] == raw
+
+
+def test_registered_rewrite_tool_accepts_domain_only_preamble_ref(config, monkeypatch):
+    _commit_a(config)
+    publish_preamble(config)
+    monkeypatch.setattr(server, "_config", config)
+    monkeypatch.setattr(server, "_graph_store", None)
+    api = rewrite_api()
+    payload = preamble_request(api).to_dict()
+    assert payload["targets"][0]["surface"] == {"domain": "retrieval"}
+    tool = next(tool for tool in asyncio.run(server.mcp._list_tools())
+                if tool.name == "apply_semantic_rewrite")
+    result = call_tool(tool.fn(semantic_rewrite_request=payload))
+    assert result["success"]
+    payload["targets"][0]["surface"]["domain"] = "../foreign"
+    before = tree_state(Path(config.home))
+    refused = call_tool(tool.fn(semantic_rewrite_request=payload))
+    assert refused["error"] == "invalid_semantic_rewrite_request"
+    assert tree_state(Path(config.home)) == before
+
+
 def test_n_to_one_keeps_history_and_removes_every_old_section(config):
     _commit_a(config)
     assert seed_second(config).ok
@@ -177,7 +465,7 @@ def test_any_invalid_target_has_zero_events_or_projection_changes(config, fault)
     if fault == "unknown":
         target.old_node_ids = ["missing"]
     elif fault == "duplicate_old":
-        target.old_node_ids = request.targets[0].old_node_ids
+        target.old_node_ids *= 2
     elif fault == "duplicate_new":
         target.node = request.targets[0].node
     elif fault == "same_surface":

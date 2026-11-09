@@ -4142,6 +4142,7 @@ async def apply_semantic_rewrite(semantic_rewrite_request: dict | None = None) -
     """Commit one explicit whole-group rewrite, only in graph write modes.
 
     Accepts the SemanticRewriteRequest JSON shape (up to 100 targets / 1 MiB).
+    Each surface is a section reference, or a domain-only preamble reference.
     Preconditions share the publication lock with the append, not an OS-level
     guard against external Markdown edits. A committed pending response is
     durable: retry exactly the same request to resume its projections.

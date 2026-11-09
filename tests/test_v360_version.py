@@ -1,4 +1,4 @@
-"""v3.7.0 — the declared version, pinned where a release actually reads it.
+"""v3.8.0 — the declared version, pinned where a release actually reads it.
 
 Why this file exists: a release ships a version the repo carries in more than
 one place (``pyproject.toml``, the package's own import-time fallback, and the
@@ -20,7 +20,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 
 #: The target of this batch.
-EXPECTED_VERSION = "3.7.0"
+EXPECTED_VERSION = "3.8.0"
 
 
 def _match(path: Path, pattern: str) -> str:

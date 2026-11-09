@@ -23,7 +23,8 @@ from .graph_journal import (
     canonical_request_hash,
 )
 from .graph_models import (
-    GraphModel, GraphNode, GraphScope, NodeKind, RelationType, Timestamp, clean_identifier,
+    GraphModel, GraphNode, GraphScope, MemoryEventKind, NodeKind, RelationType, Timestamp,
+    clean_identifier,
 )
 from .graph_runtime_assembly import (
     journal_readonly_session,
@@ -39,7 +40,7 @@ from .graph_write import (
 )
 
 __all__ = [
-    "SectionRef", "RewriteTarget", "RewritePreconditions", "SemanticRewriteRequest",
+    "SectionRef", "PreambleRef", "RewriteTarget", "RewritePreconditions", "SemanticRewriteRequest",
     "canonical_node_sha256", "commit_semantic_rewrite", "inspect_semantic_surfaces",
 ]
 
@@ -50,10 +51,23 @@ class SectionRef(GraphModel):
     occurrence: int = Field(default=0, ge=0, strict=True)
 
 
+class PreambleRef(GraphModel):
+    domain: str
+
+
 class RewriteTarget(GraphModel):
     old_node_ids: list[str] = Field(min_length=1)
     node: GraphNode
-    surface: SectionRef
+    surface: SectionRef | PreambleRef
+
+    @field_validator("surface", mode="before")
+    @classmethod
+    def _surface_ref(cls, value: Any) -> SectionRef | PreambleRef:
+        if isinstance(value, (SectionRef, PreambleRef)):
+            return value
+        if isinstance(value, dict) and "section" in value:
+            return SectionRef.model_validate(value)
+        return PreambleRef.model_validate(value)
 
 
 class RewritePreconditions(GraphModel):
@@ -150,11 +164,12 @@ def inspect_semantic_surfaces(
                 node = nodes.get(record.node_id)
                 if node is None or not _scope_allowed(config, node):
                     continue
-                body = projection.read_section_body(raw, record.section, record.occurrence)
+                body = projection._read_surface_body(raw, record)
                 if body is None:
                     return {"success": False, "error": application.GRAPH_COMMIT_REJECTED_DRIFT}
                 row = {
                     "entry_id": record.entry_id, "domain": record.domain,
+                    "surface_kind": record.kind,
                     "section": record.section, "occurrence": record.occurrence,
                     "node_id": node.id, "status": node.status.value,
                     "scope": node.scope.to_dict(),
@@ -220,6 +235,12 @@ def commit_semantic_rewrite(
             application.GRAPH_COMMIT_REJECTED_INVALID, request_id=identity,
             errors=["empty_old_node_ids"],
         )
+    if any(len(target.old_node_ids) != len(set(target.old_node_ids))
+           for target in request.targets):
+        return application._rejected(
+            application.GRAPH_COMMIT_REJECTED_INVALID, request_id=identity,
+            errors=["duplicate_old_node_id_in_target"],
+        )
     missing = resolve_journal_database_path(config) is None or (
         store is None and resolve_graph_database_path(config) is None
     )
@@ -229,11 +250,18 @@ def commit_semantic_rewrite(
         bindings = []
         writes = []
         bound_events = []
+        transitioned_ids = set()
         for index, target in enumerate(request.targets):
             _domain_path(config, target.surface.domain)
-            binding = projection.ProjectionBinding(
-                **target.surface.to_dict(), body=target.node.content,
-            )
+            if isinstance(target.surface, PreambleRef):
+                binding = projection.ProjectionBinding(
+                    domain=target.surface.domain, section="", occurrence=0,
+                    kind=projection.PROJECTION_PREAMBLE_SURFACE_KIND, body=target.node.content,
+                )
+            else:
+                binding = projection.ProjectionBinding(
+                    **target.surface.to_dict(), body=target.node.content,
+                )
             binding.entry_id
             write = SemanticWriteRequest(
                 node=target.node, occurred_at=request.occurred_at,
@@ -246,9 +274,14 @@ def commit_semantic_rewrite(
             )
             plan = plan_semantic_write(write)
             events = application._bind_events(plan.events, target.node.id, binding)
-            bound_events.extend(event.model_copy(update={
-                "metadata": {**event.metadata, "semantic_rewrite_sha256": fingerprint},
-            }) for event in events)
+            for event in events:
+                if event.kind == MemoryEventKind.SUPERSEDE:
+                    if event.target_id in transitioned_ids:
+                        continue
+                    transitioned_ids.add(event.target_id)
+                bound_events.append(event.model_copy(update={
+                    "metadata": {**event.metadata, "semantic_rewrite_sha256": fingerprint},
+                }))
             bindings.append(binding)
             writes.append(write)
     except Exception as exc:
@@ -282,8 +315,10 @@ def _layout_errors(config, events, candidate):
         rendered, _report = projection.render_surface_document(raw, plans)
         final = raw if rendered is None else rendered
         for plan in plans:
-            body = projection.read_section_body(final, plan.section, plan.occurrence)
-            expected = plan.body.strip() if plan.action == "publish" else None
+            body = projection._read_surface_body(final, plan)
+            expected = plan.normalized_body if plan.action == "publish" else (
+                "" if plan.kind == projection.PROJECTION_PREAMBLE_SURFACE_KIND else None
+            )
             if body != expected:
                 errors.append(f"binding_layout_mismatch:{plan.entry_id}")
     return errors
@@ -312,7 +347,7 @@ def _commit_group(config, request, journal, store, identity, writes, bindings, b
     if status is not None:
         return application._rejected(status, request_id=identity)
     new_ids = [target.node.id for target in request.targets]
-    if (len(old_list) != len(old_ids) or len(new_ids) != len(set(new_ids))
+    if (len(new_ids) != len(set(new_ids))
             or any(node_id in nodes for node_id in new_ids)):
         return application._rejected(application.GRAPH_COMMIT_REJECTED_INVALID, request_id=identity)
     if len({binding.entry_id for binding in bindings}) != len(bindings):
@@ -338,7 +373,7 @@ def _commit_group(config, request, journal, store, identity, writes, bindings, b
             record = journal.surface(old.entry_id)
             raw = path.read_text(encoding="utf-8") if path.exists() else ""
             if (record is not None and record.status != "retired"
-                    and projection.read_section_body(raw, old.section, old.occurrence) is None):
+                    and (not path.exists() or projection._read_surface_body(raw, old) is None)):
                 return application._rejected(application.GRAPH_COMMIT_REJECTED_DRIFT,
                                              request_id=identity)
         conflict = application._surface_conflict(events, nodes, binding, write.node.id, old_ids)

@@ -69,6 +69,10 @@ PROJECTION_IDENTITY_VERSION = 1
 #: collide even if a future one serializes the same three fields.
 PROJECTION_IDENTITY_SCHEME = f"{PROJECTION_ID_PREFIX}.v{PROJECTION_IDENTITY_VERSION}"
 
+PREAMBLE_ID_PREFIX = "mdpre"
+PREAMBLE_IDENTITY_VERSION = 1
+PREAMBLE_IDENTITY_SCHEME = f"{PREAMBLE_ID_PREFIX}.v{PREAMBLE_IDENTITY_VERSION}"
+
 #: Field separator for the canonical payload. ASCII unit separator, matching
 #: :func:`~layered_memory_mcp.graph_models.make_node_id`. Every field is
 #: additionally length-prefixed, so a separator *inside* a heading is still
@@ -186,6 +190,28 @@ def markdown_section_entry_id(domain: Any, section: Any, occurrence: Any = 0) ->
     )
 
 
+def markdown_preamble_identity_payload(domain: Any) -> str:
+    """Canonical scheme token and byte-length-prefixed exact domain.
+
+    Uses the section rule's separator and refusal discipline, but a distinct
+    scheme so a preamble can never be interpreted as a section identity.
+    """
+    return _FIELD_SEPARATOR.join([
+        PREAMBLE_IDENTITY_SCHEME,
+        _length_prefixed(_require_label(domain, "domain")),
+    ])
+
+
+def markdown_preamble_entry_id(domain: Any) -> str:
+    """The stable, versioned entry ID for one domain's Markdown preamble."""
+    payload = markdown_preamble_identity_payload(domain)
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return (
+        f"{PREAMBLE_ID_PREFIX}{PREAMBLE_IDENTITY_VERSION}"
+        f"_{digest[:_ID_DIGEST_LENGTH]}"
+    )
+
+
 def markdown_section_entry_ids(
     domain: Any, sections: Sequence[Any] | Iterable[Any]
 ) -> list[str]:
@@ -216,6 +242,11 @@ def markdown_section_entry_ids(
 
 
 __all__ = [
+    "PREAMBLE_ID_PREFIX",
+    "PREAMBLE_IDENTITY_VERSION",
+    "PREAMBLE_IDENTITY_SCHEME",
+    "markdown_preamble_identity_payload",
+    "markdown_preamble_entry_id",
     "PROJECTION_ID_PREFIX",
     "PROJECTION_IDENTITY_BLANK",
     "PROJECTION_IDENTITY_MULTILINE",

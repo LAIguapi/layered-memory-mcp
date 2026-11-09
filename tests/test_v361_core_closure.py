@@ -88,6 +88,228 @@ T0 = datetime(2026, 5, 1, 9, 0, 0, tzinfo=timezone.utc)
 EXPLICIT = Derivation(method=DerivationMethod.USER_EXPLICIT)
 
 DOMAIN = "retrieval"
+
+
+def test_preamble_binding_is_a_first_class_surface():
+    binding = graph_projection.parse_binding({"projection": {
+        "surface": "l1_markdown_section", "kind": "l1_markdown_preamble",
+        "domain": "retrieval", "section": "", "occurrence": 0,
+    }})
+    assert binding is not None
+    assert getattr(binding, "kind", None) == "l1_markdown_preamble"
+    plan = graph_projection.SurfacePlan(
+        entry_id=binding.entry_id, domain="retrieval", section="", occurrence=0,
+        kind=binding.kind, node_id="claim_preamble", body="# Neutral title\n\nNeutral note.",
+    )
+    rendered, report = graph_projection.render_surface_document("", [plan])
+    assert rendered == "# Neutral title\n\nNeutral note.\n"
+    assert report.published == [binding.entry_id]
+    assert graph_projection.render_surface_document(rendered, [plan])[0] is None
+
+
+def test_old_binding_metadata_defaults_to_section_and_unknown_kind_is_no_binding():
+    from layered_memory_mcp.graph_entry_identity import markdown_section_entry_id
+
+    metadata = {"projection": {
+        "surface": "l1_markdown_section", "domain": "retrieval", "section": "Neutral section",
+    }}
+    binding = graph_projection.parse_binding(metadata)
+    assert binding.kind == graph_projection.PROJECTION_SURFACE_KIND
+    assert binding.entry_id == markdown_section_entry_id("retrieval", "Neutral section")
+    metadata["projection"]["kind"] = "unknown"
+    assert graph_projection.parse_binding(metadata) is None
+    metadata["projection"]["kind"] = graph_projection.PROJECTION_PREAMBLE_SURFACE_KIND
+    assert graph_projection.parse_binding(metadata) is None
+    metadata["projection"]["section"] = ""
+    metadata["projection"]["occurrence"] = 1
+    assert graph_projection.parse_binding(metadata) is None
+
+
+@pytest.mark.parametrize("section,occurrence", [("Neutral section", 0), ("", 1)])
+def test_preamble_binding_and_plan_refuse_section_coordinates(section, occurrence):
+    from pydantic import ValidationError
+
+    common = dict(domain="retrieval", section=section, occurrence=occurrence,
+                  kind=graph_projection.PROJECTION_PREAMBLE_SURFACE_KIND, body="Neutral note.")
+    with pytest.raises(ValidationError):
+        graph_projection.ProjectionBinding(**common)
+    with pytest.raises(ValidationError):
+        graph_projection.SurfacePlan(**common, entry_id="claim_surface", node_id="claim_preamble")
+
+
+def test_preamble_identity_is_disjoint_and_uses_exact_length_prefixed_domain():
+    from layered_memory_mcp import graph_entry_identity as identity
+
+    assert identity.PREAMBLE_ID_PREFIX == "mdpre"
+    assert identity.PREAMBLE_IDENTITY_VERSION == 1
+    assert identity.PREAMBLE_IDENTITY_SCHEME == "mdpre.v1"
+    assert identity.markdown_preamble_identity_payload("retrieval") == "mdpre.v1\x1f9:retrieval"
+    for domain in ("retrieval", " retrieval ", "retrieval\x1f:9", "retrieval_é"):
+        entry_id = identity.markdown_preamble_entry_id(domain)
+        assert entry_id.startswith("mdpre1_") and len(entry_id) == 39
+        assert entry_id == identity.markdown_preamble_entry_id(domain)
+        for section in ("Neutral title", "retrieval", "mdpre.v1"):
+            assert entry_id != identity.markdown_section_entry_id(domain, section)
+    assert identity.markdown_preamble_entry_id("retrieval") != identity.markdown_preamble_entry_id(" retrieval ")
+
+
+@pytest.mark.parametrize("domain,label", [
+    (None, "projection_identity_not_a_string"), (True, "projection_identity_not_a_string"),
+    (7, "projection_identity_not_a_string"), ("", "projection_identity_blank"),
+    (" \t", "projection_identity_blank"), ("retrieval\n", "projection_identity_multiline"),
+    ("retrieval\r", "projection_identity_multiline"),
+])
+def test_preamble_identity_reuses_bounded_refusals(domain, label):
+    from layered_memory_mcp import graph_entry_identity as identity
+
+    for operation in (identity.markdown_preamble_identity_payload, identity.markdown_preamble_entry_id):
+        with pytest.raises(identity.ProjectionIdentityError) as caught:
+            operation(domain)
+        assert str(caught.value) == f"{label}:domain"
+
+
+def test_preamble_normalization_is_shared_by_rendering_metadata_and_registry(graph_config):
+    from layered_memory_mcp.graph_application import commit_semantic_write
+
+    body = " \r\n# Neutral title\r\n\r\nNeutral note. \r\n\t"
+    canonical = "# Neutral title\n\nNeutral note."
+    binding = graph_projection.ProjectionBinding(
+        domain="retrieval", section="", body=body,
+        kind=graph_projection.PROJECTION_PREAMBLE_SURFACE_KIND,
+    )
+    assert binding.normalized_body == canonical
+    metadata = graph_projection.binding_metadata(binding)
+    assert metadata["body_sha256"] == body_sha256(canonical)
+    assert "Neutral" not in json.dumps(metadata)
+    request = SemanticWriteRequest.model_validate(_decision("claim_preamble", body))
+    assert commit_semantic_write(graph_config, request, binding).ok
+    assert _document(graph_config) == canonical + "\n"
+    with MemoryEventJournal.open_readonly(graph_config.graph_journal_path) as journal:
+        record = journal.surface(binding.entry_id)
+        assert record.kind == binding.kind
+        assert record.body_sha256 == body_sha256(canonical)
+        assert graph_projection.surface_refusal(graph_config, journal, binding) is None
+        plans = graph_projection.surface_plans(journal.read_events(), {request.node.id: request.node})
+        assert graph_projection.render_surface_document(_document(graph_config), plans)[0] is None
+        rendered, _report = graph_projection.render_surface_document(
+            _document(graph_config), [*plans, graph_projection.SurfacePlan(
+                entry_id="claim_section_surface", domain="retrieval", section="Neutral section",
+                node_id="claim_section", body="Neutral body.",
+            )],
+        )
+        assert graph_projection.read_preamble(rendered).strip() == canonical
+        assert graph_projection.read_section_body(rendered, "Neutral section") == "Neutral body."
+
+
+def test_two_preamble_plans_for_one_domain_are_a_surface_conflict():
+    binding = graph_projection.ProjectionBinding(
+        domain="retrieval", section="", body="Neutral title.",
+        kind=graph_projection.PROJECTION_PREAMBLE_SURFACE_KIND,
+    )
+    plan = graph_projection.SurfacePlan(
+        **binding.to_dict(), entry_id=binding.entry_id, node_id="claim_preamble",
+    )
+    with pytest.raises(graph_projection.ProjectionError, match="surface_owned_by:"):
+        graph_projection.render_surface_document("", [plan, plan])
+
+
+def test_preamble_frontmatter_is_unsupported(graph_config):
+    binding = graph_projection.ProjectionBinding(
+        domain="retrieval", section="", body="Neutral note.",
+        kind=graph_projection.PROJECTION_PREAMBLE_SURFACE_KIND,
+    )
+    path = Path(graph_config.knowledge_dir) / "retrieval.md"
+    path.write_text("---\nid: claim_entry\nsection: Neutral section\n---\nNeutral body.\n")
+    with MemoryEventJournal(graph_config.graph_journal_path) as journal:
+        assert graph_projection.surface_refusal(graph_config, journal, binding) == (
+            f"surface_unsupported:{binding.entry_id}"
+        )
+
+
+def test_missing_published_preamble_and_external_resurrection_are_drift(graph_config):
+    from layered_memory_mcp.graph_journal import SurfaceRecord
+
+    body = "# Neutral title\n\nNeutral orientation."
+    binding = graph_projection.ProjectionBinding(
+        domain="retrieval", section="", body=body,
+        kind=graph_projection.PROJECTION_PREAMBLE_SURFACE_KIND,
+    )
+    path = Path(graph_config.knowledge_dir) / "retrieval.md"
+    with MemoryEventJournal(graph_config.graph_journal_path) as journal:
+        journal.record_surface(SurfaceRecord(
+            entry_id=binding.entry_id, domain=binding.domain, section="", occurrence=0,
+            kind=binding.kind, node_id="claim_preamble", body_sha256=body_sha256(body),
+        ))
+        assert graph_projection.surface_refusal(graph_config, journal, binding) == (
+            f"surface_drift:{binding.entry_id}"
+        )
+        journal.retire_surface(binding.entry_id)
+        assert graph_projection.surface_refusal(graph_config, journal, binding) is None
+        path.write_text(body + "\n")
+        assert graph_projection.surface_refusal(graph_config, journal, binding) == (
+            f"surface_drift:{binding.entry_id}"
+        )
+
+
+@pytest.mark.parametrize("after_replace", [False, True])
+@pytest.mark.parametrize("already_published", [False, True])
+def test_preamble_unfinished_publication_recovers_without_adoption_or_drift(
+    graph_config, after_replace, already_published,
+):
+    from layered_memory_mcp.graph_application import commit_semantic_write
+
+    body = "# Neutral new title\n\nNeutral new orientation."
+    binding = graph_projection.ProjectionBinding(
+        domain="retrieval", section="", body=body,
+        kind=graph_projection.PROJECTION_PREAMBLE_SURFACE_KIND,
+    )
+    if already_published:
+        previous_body = "# Neutral old title\n\nNeutral old orientation."
+        previous = SemanticWriteRequest.model_validate(_decision("claim_preamble", previous_body))
+        assert commit_semantic_write(
+            graph_config, previous, binding.model_copy(update={"body": previous_body}),
+        ).ok
+    request = SemanticWriteRequest.model_validate(_decision(
+        "claim_preamble_new", body, supersedes="claim_preamble" if already_published else None,
+    ))
+    with _crashing_publication(after_replace=after_replace):
+        first = commit_semantic_write(graph_config, request, binding)
+    assert first.committed and first.projections_pending
+    with MemoryEventJournal.open_readonly(graph_config.graph_journal_path) as journal:
+        intent = journal.surface_intent(binding.entry_id)
+        assert intent.kind == binding.kind
+        assert intent.section == "" and intent.occurrence == 0
+        assert intent.body_sha256 == body_sha256(body)
+        assert graph_projection.surface_refusal(graph_config, journal, binding) is None
+    before = _journal_events(graph_config)
+    retry = commit_semantic_write(graph_config, request, binding)
+    assert retry.ok and retry.duplicate
+    assert _journal_events(graph_config) == before
+    assert _document(graph_config) == body + "\n"
+    assert _intents(graph_config) == {}
+
+
+def test_older_registry_without_kind_is_read_only_compatible_then_upgrades(tmp_path):
+    from layered_memory_mcp.graph_journal import SurfaceRecord
+
+    path = tmp_path / "journal.db"
+    with MemoryEventJournal(path) as journal:
+        journal.record_surface(SurfaceRecord(
+            entry_id="claim_surface", domain="retrieval", section="Neutral section",
+            node_id="claim_section", body_sha256=body_sha256("Neutral body."),
+        ))
+    with sqlite3.connect(path) as connection:
+        connection.execute("ALTER TABLE projection_surfaces DROP COLUMN kind")
+        connection.execute("ALTER TABLE projection_surface_intents DROP COLUMN kind")
+    before = path.read_bytes(), path.stat().st_mtime_ns, tmp_path.stat().st_mtime_ns
+    with MemoryEventJournal.open_readonly(path) as journal:
+        assert journal.surface("claim_surface").kind == graph_projection.PROJECTION_SURFACE_KIND
+        assert journal.surfaces()[0].kind == graph_projection.PROJECTION_SURFACE_KIND
+        assert journal.surface_intents() == []
+    assert (path.read_bytes(), path.stat().st_mtime_ns, tmp_path.stat().st_mtime_ns) == before
+    with MemoryEventJournal(path) as journal:
+        assert journal.surface("claim_surface").kind == graph_projection.PROJECTION_SURFACE_KIND
+        journal.record_surface(journal.surface("claim_surface"))
 SECTION = "Index maintenance"
 BODY = "The retrieval index is rebuilt nightly at 02:00 UTC."
 BODY_V2 = "The retrieval index is rebuilt nightly at 03:00 UTC."

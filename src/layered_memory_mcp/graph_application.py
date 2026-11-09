@@ -418,7 +418,8 @@ def commit_semantic_write(
                 errors=[f"binding_identity_invalid:{exc}"],
             )
 
-        if request.node.content.strip() != binding.normalized_body:
+        node_binding = binding.model_copy(update={"body": request.node.content})
+        if node_binding.normalized_body != binding.normalized_body:
             return _rejected(
                 GRAPH_COMMIT_REJECTED_BINDING,
                 request_id=identity,
@@ -1288,6 +1289,7 @@ def _drift_errors(
                 domain=plan.domain,
                 section=plan.section,
                 occurrence=plan.occurrence,
+                kind=plan.kind,
                 body=plan.body,
             ),
         )

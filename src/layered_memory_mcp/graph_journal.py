@@ -236,6 +236,7 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         body_sha256 TEXT NOT NULL,
         status      TEXT NOT NULL,
         position    INTEGER NOT NULL,
+        kind        TEXT NOT NULL DEFAULT 'l1_markdown_section',
         updated_at  TEXT NOT NULL
     )
     """,
@@ -249,6 +250,7 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         body_sha256 TEXT NOT NULL,
         action      TEXT NOT NULL,
         position    INTEGER NOT NULL,
+        kind        TEXT NOT NULL DEFAULT 'l1_markdown_section',
         updated_at  TEXT NOT NULL
     )
     """,
@@ -380,6 +382,7 @@ class SurfaceRecord(GraphModel):
     body_sha256: str
     status: str = "published"
     position: int = Field(default=0, ge=0)
+    kind: str = "l1_markdown_section"
 
 
 class SurfaceIntent(GraphModel):
@@ -408,6 +411,7 @@ class SurfaceIntent(GraphModel):
     body_sha256: str = ""
     action: str = SURFACE_INTENT_PUBLISH
     position: int = Field(default=0, ge=0)
+    kind: str = "l1_markdown_section"
 
 
 class JournalHealth(GraphModel):
@@ -681,6 +685,12 @@ class MemoryEventJournal:
                     f"process speaks {JOURNAL_SCHEMA_VERSION}; refusing to read "
                     "it rather than guessing at the layout."
                 )
+            for table in ("projection_surfaces", "projection_surface_intents"):
+                if self._surface_kind_column(connection, table) != "kind":
+                    connection.execute(
+                        f"ALTER TABLE {table} ADD COLUMN kind TEXT NOT NULL "
+                        "DEFAULT 'l1_markdown_section'"
+                    )
             for key, value in (
                 (_META_SCHEMA_VERSION, str(JOURNAL_SCHEMA_VERSION)),
                 (_META_CREATED_AT, _now()),
@@ -1083,8 +1093,8 @@ class MemoryEventJournal:
                 """
                 INSERT INTO projection_surfaces
                     (entry_id, domain, section, occurrence, node_id, body_sha256,
-                     status, position, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     status, position, kind, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(entry_id) DO UPDATE SET
                     domain = excluded.domain,
                     section = excluded.section,
@@ -1093,6 +1103,7 @@ class MemoryEventJournal:
                     body_sha256 = excluded.body_sha256,
                     status = excluded.status,
                     position = excluded.position,
+                    kind = excluded.kind,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -1104,6 +1115,7 @@ class MemoryEventJournal:
                     record.body_sha256,
                     record.status,
                     int(record.position),
+                    record.kind,
                     _now(),
                 ),
             )
@@ -1123,10 +1135,11 @@ class MemoryEventJournal:
 
     def surface(self, entry_id: str) -> SurfaceRecord | None:
         connection = self._require_connection()
+        kind = self._surface_kind_column(connection, "projection_surfaces")
         row = connection.execute(
-            """
+            f"""
             SELECT entry_id, domain, section, occurrence, node_id, body_sha256,
-                   status, position
+                   status, position, {kind}
             FROM projection_surfaces WHERE entry_id = ?
             """,
             (entry_id,),
@@ -1135,9 +1148,10 @@ class MemoryEventJournal:
 
     def surfaces(self, *, include_retired: bool = True) -> list[SurfaceRecord]:
         connection = self._require_connection()
-        query = """
+        kind = self._surface_kind_column(connection, "projection_surfaces")
+        query = f"""
             SELECT entry_id, domain, section, occurrence, node_id, body_sha256,
-                   status, position
+                   status, position, {kind}
             FROM projection_surfaces
         """
         if not include_retired:
@@ -1159,8 +1173,8 @@ class MemoryEventJournal:
                 """
                 INSERT INTO projection_surface_intents
                     (entry_id, domain, section, occurrence, node_id, body_sha256,
-                     action, position, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     action, position, kind, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(entry_id) DO UPDATE SET
                     domain = excluded.domain,
                     section = excluded.section,
@@ -1169,6 +1183,7 @@ class MemoryEventJournal:
                     body_sha256 = excluded.body_sha256,
                     action = excluded.action,
                     position = excluded.position,
+                    kind = excluded.kind,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -1180,6 +1195,7 @@ class MemoryEventJournal:
                     intent.body_sha256,
                     intent.action,
                     int(intent.position),
+                    intent.kind,
                     _now(),
                 ),
             )
@@ -1204,10 +1220,11 @@ class MemoryEventJournal:
         connection = self._require_connection()
         if not self._has_table(connection, "projection_surface_intents"):
             return None
+        kind = self._surface_kind_column(connection, "projection_surface_intents")
         row = connection.execute(
-            """
+            f"""
             SELECT entry_id, domain, section, occurrence, node_id, body_sha256,
-                   action, position
+                   action, position, {kind}
             FROM projection_surface_intents WHERE entry_id = ?
             """,
             (entry_id,),
@@ -1219,16 +1236,22 @@ class MemoryEventJournal:
         connection = self._require_connection()
         if not self._has_table(connection, "projection_surface_intents"):
             return []
+        kind = self._surface_kind_column(connection, "projection_surface_intents")
         return [
             _intent_from_row(row)
             for row in connection.execute(
-                """
+                f"""
                 SELECT entry_id, domain, section, occurrence, node_id, body_sha256,
-                       action, position
+                       action, position, {kind}
                 FROM projection_surface_intents ORDER BY entry_id
                 """
             ).fetchall()
         ]
+
+    @staticmethod
+    def _surface_kind_column(connection: sqlite3.Connection, table: str) -> str:
+        columns = connection.execute(f"PRAGMA table_info({table})").fetchall()
+        return "kind" if any(row[1] == "kind" for row in columns) else "'l1_markdown_section'"
 
     @staticmethod
     def _has_table(connection: sqlite3.Connection, name: str) -> bool:
@@ -1306,6 +1329,7 @@ def _intent_from_row(row: Sequence[Any]) -> SurfaceIntent:
         body_sha256=str(row[5]),
         action=str(row[6]),
         position=int(row[7]),
+        kind=str(row[8]),
     )
 
 
@@ -1319,4 +1343,5 @@ def _surface_from_row(row: Sequence[Any]) -> SurfaceRecord:
         body_sha256=str(row[5]),
         status=str(row[6]),
         position=int(row[7]),
+        kind=str(row[8]),
     )

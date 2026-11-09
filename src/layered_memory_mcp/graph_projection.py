@@ -19,8 +19,8 @@ journal, which is why a failed publication is recoverable rather than lost.
 WHAT IT IS NOT
 --------------
 - NOT an owner of unrelated content. The L1 publisher touches exactly the
-  sections a managed node is bound to. Every other section, the preamble and
-  every other file are preserved.
+  surfaces a managed node is bound to. Every unmanaged section, preamble and
+  file is preserved.
 - NOT an adopter. A section that exists on disk and is not in the surface
   registry is refused (``surface_not_adopted``), and a registered section whose
   on-disk body no longer matches what was published is refused
@@ -50,9 +50,9 @@ import re
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
-from .graph_entry_identity import markdown_section_entry_id
+from .graph_entry_identity import markdown_preamble_entry_id, markdown_section_entry_id
 from .graph_journal import (
     SURFACE_INTENT_PUBLISH,
     SURFACE_INTENT_RETIRE,
@@ -66,6 +66,7 @@ from .graph_models import GraphModel, GraphNode, MemoryEvent
 __all__ = [
     "PROJECTION_METADATA_KEY",
     "PROJECTION_SURFACE_KIND",
+    "PROJECTION_PREAMBLE_SURFACE_KIND",
     "PUBLISH_TEMP_SUFFIX",
     "SURFACE_DRIFT",
     "SURFACE_NOT_ADOPTED",
@@ -84,6 +85,7 @@ __all__ = [
     "publish_todo",
     "publish_vector",
     "read_section_body",
+    "read_preamble",
     "render_surface_document",
     "replace_document",
     "surface_plans",
@@ -99,6 +101,7 @@ PROJECTION_METADATA_KEY = "projection"
 #: an ordinary-Markdown L1 domain file. Named in the payload so a later surface
 #: kind is a new value rather than a silent reinterpretation of this one.
 PROJECTION_SURFACE_KIND = "l1_markdown_section"
+PROJECTION_PREAMBLE_SURFACE_KIND = "l1_markdown_preamble"
 
 #: Refusal labels. Bounded tokens: ``<reason>:<entry id>``, never a body.
 SURFACE_DRIFT = "surface_drift"
@@ -144,14 +147,27 @@ class ProjectionBinding(GraphModel):
     section: str
     occurrence: int = Field(default=0, ge=0)
     body: str
+    kind: str = PROJECTION_SURFACE_KIND
+
+    @model_validator(mode="after")
+    def _surface_shape(self) -> ProjectionBinding:
+        _validate_surface_shape(self.kind, self.section, self.occurrence)
+        if (self.kind == PROJECTION_PREAMBLE_SURFACE_KIND
+                and _HEADING_SPLIT.search(self.normalized_body)):
+            raise ValueError("binding_layout_mismatch")
+        return self
 
     @property
     def entry_id(self) -> str:
         """The versioned projection identity — also the vector row's own ``id``."""
+        if self.kind == PROJECTION_PREAMBLE_SURFACE_KIND:
+            return markdown_preamble_entry_id(self.domain)
         return markdown_section_entry_id(self.domain, self.section, self.occurrence)
 
     @property
     def normalized_body(self) -> str:
+        if self.kind == PROJECTION_PREAMBLE_SURFACE_KIND:
+            return _normalize_preamble(self.body)
         return self.body.strip()
 
 
@@ -167,6 +183,28 @@ class SurfacePlan(GraphModel):
     #: ``publish`` renders the section; ``retire`` removes it. A retired surface
     #: is removed from the *rendering* only — the node and its events remain.
     action: str = "publish"
+    kind: str = PROJECTION_SURFACE_KIND
+
+    @model_validator(mode="after")
+    def _surface_shape(self) -> SurfacePlan:
+        _validate_surface_shape(self.kind, self.section, self.occurrence)
+        if (self.kind == PROJECTION_PREAMBLE_SURFACE_KIND
+                and _HEADING_SPLIT.search(self.normalized_body)):
+            raise ValueError("binding_layout_mismatch")
+        return self
+
+    @property
+    def normalized_body(self) -> str:
+        if self.kind == PROJECTION_PREAMBLE_SURFACE_KIND:
+            return _normalize_preamble(self.body)
+        return self.body.strip()
+
+
+def _validate_surface_shape(kind: str, section: str, occurrence: int) -> None:
+    if kind not in (PROJECTION_SURFACE_KIND, PROJECTION_PREAMBLE_SURFACE_KIND):
+        raise ValueError(SURFACE_UNSUPPORTED)
+    if kind == PROJECTION_PREAMBLE_SURFACE_KIND and (section != "" or occurrence != 0):
+        raise ValueError("binding_layout_mismatch")
 
 
 class L1ProjectionReport(GraphModel):
@@ -187,6 +225,7 @@ def binding_metadata(binding: ProjectionBinding) -> dict[str, Any]:
     """The serializable binding an event carries, so replay can rebuild L1."""
     return {
         "surface": PROJECTION_SURFACE_KIND,
+        "kind": binding.kind,
         "domain": binding.domain,
         "section": binding.section,
         "occurrence": binding.occurrence,
@@ -209,6 +248,9 @@ def parse_binding(metadata: Any) -> ProjectionBinding | None:
         return None
     if raw.get("surface") != PROJECTION_SURFACE_KIND:
         return None
+    kind = raw.get("kind", PROJECTION_SURFACE_KIND)
+    if kind not in (PROJECTION_SURFACE_KIND, PROJECTION_PREAMBLE_SURFACE_KIND):
+        return None
     domain = raw.get("domain")
     section = raw.get("section")
     if not isinstance(domain, str) or not isinstance(section, str):
@@ -216,8 +258,10 @@ def parse_binding(metadata: Any) -> ProjectionBinding | None:
     occurrence = raw.get("occurrence", 0)
     if isinstance(occurrence, bool) or not isinstance(occurrence, int) or occurrence < 0:
         return None
+    if kind == PROJECTION_PREAMBLE_SURFACE_KIND and (section != "" or occurrence != 0):
+        return None
     return ProjectionBinding(
-        domain=domain, section=section, occurrence=occurrence, body=""
+        domain=domain, section=section, occurrence=occurrence, body="", kind=kind,
     )
 
 
@@ -306,6 +350,28 @@ def read_section_body(raw: str, section: str, occurrence: int = 0) -> str | None
     return None if index is None else _block_body(blocks[index][1])
 
 
+def read_preamble(raw: str) -> str:
+    """Return the LF-normalized text preceding the first H2 heading.
+
+    Managed preamble bodies canonically normalize CRLF/CR to LF and strip
+    boundary whitespace, preserving all interior text. Rendering adds two LF
+    separators before sections; the document ends with one LF. Hashes and
+    comparisons use that same canonical body, not the layout separators, so
+    section insertion/removal cannot create preamble drift on a round trip.
+    """
+    return _parse_document(raw)[0]
+
+
+def _normalize_preamble(body: str) -> str:
+    return body.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
+def _read_surface_body(raw: str, surface: Any) -> str | None:
+    if surface.kind == PROJECTION_PREAMBLE_SURFACE_KIND:
+        return _normalize_preamble(read_preamble(raw))
+    return read_section_body(raw, surface.section, surface.occurrence)
+
+
 def _write_document(preamble: str, blocks: Sequence[tuple[str, str]]) -> str:
     text = preamble + "".join(block for _label, block in blocks)
     return text.rstrip("\n") + "\n" if text.strip() else ""
@@ -352,20 +418,27 @@ def surface_refusal(
     protects a human's edit, and it is not relaxed here.
     """
     path = domain_path(config, binding.domain)
-    if not path.exists():
+    if not path.exists() and binding.kind != PROJECTION_PREAMBLE_SURFACE_KIND:
         return None
-    raw = path.read_text(encoding="utf-8")
+    raw = path.read_text(encoding="utf-8") if path.exists() else ""
     if has_frontmatter_entry(raw):
         return f"{SURFACE_UNSUPPORTED}:{binding.entry_id}"
 
-    current = read_section_body(raw, binding.section, binding.occurrence)
+    current = _read_surface_body(raw, binding)
     if current is None:
         return None
     on_disk = body_sha256(current)
     record = journal.surface(binding.entry_id)
-    if record is not None and on_disk == record.body_sha256:
+    if (binding.kind == PROJECTION_PREAMBLE_SURFACE_KIND
+            and not current and record is not None and record.status == "retired"):
+        return None
+    if (record is not None and on_disk == record.body_sha256
+            and (binding.kind != PROJECTION_PREAMBLE_SURFACE_KIND or record.status != "retired")):
         return None
     intent = journal.surface_intent(binding.entry_id)
+    if (binding.kind == PROJECTION_PREAMBLE_SURFACE_KIND and not current
+            and intent is not None and intent.action == SURFACE_INTENT_RETIRE):
+        return None
     if (
         intent is not None
         and intent.action == SURFACE_INTENT_PUBLISH
@@ -373,6 +446,8 @@ def surface_refusal(
     ):
         return None
     if record is None:
+        if binding.kind == PROJECTION_PREAMBLE_SURFACE_KIND and not current:
+            return None
         return f"{SURFACE_NOT_ADOPTED}:{binding.entry_id}"
     return f"{SURFACE_DRIFT}:{binding.entry_id}"
 
@@ -426,6 +501,7 @@ def surface_plans(
                 domain=binding.domain,
                 section=binding.section,
                 occurrence=binding.occurrence,
+                kind=binding.kind,
                 node_id=node_id,
                 body=nodes[node_id].content if current and node_id in nodes else "",
                 action="publish" if current else "retire",
@@ -447,7 +523,24 @@ def render_surface_document(
     report = L1ProjectionReport()
     updates: dict[int, tuple[str, str] | None] = {}
     additions: list[SurfacePlan] = []
+    preamble_changed = False
+    preamble_domains: set[str] = set()
     for plan in plans:
+        if plan.kind == PROJECTION_PREAMBLE_SURFACE_KIND:
+            if plan.domain in preamble_domains:
+                raise ProjectionError(f"surface_owned_by:{plan.node_id}")
+            preamble_domains.add(plan.domain)
+            desired = plan.normalized_body if plan.action != "retire" else ""
+            if _normalize_preamble(preamble) == desired:
+                report.unchanged.append(plan.entry_id)
+            else:
+                preamble_changed = True
+                if plan.action == "retire":
+                    report.retired.append(plan.entry_id)
+                else:
+                    report.published.append(plan.entry_id)
+            preamble = desired + "\n\n" if desired else ""
+            continue
         index = _locate(blocks, plan.section, plan.occurrence)
         if plan.action == "retire":
             if index is not None:
@@ -461,7 +554,7 @@ def render_surface_document(
             report.published.append(plan.entry_id)
         else:
             report.unchanged.append(plan.entry_id)
-    if not updates and not additions:
+    if not updates and not additions and not preamble_changed:
         return None, report
     final_blocks = [updates.get(index, block) for index, block in enumerate(blocks)
                     if updates.get(index, block) is not None]
@@ -517,6 +610,7 @@ def publish_l1(
             domain=plan.domain,
             section=plan.section,
             occurrence=plan.occurrence,
+            kind=plan.kind,
             body=plan.body,
         )
         refusal = surface_refusal(config, journal, binding)
@@ -553,8 +647,9 @@ def publish_l1(
                         domain=plan.domain,
                         section=plan.section,
                         occurrence=plan.occurrence,
+                        kind=plan.kind,
                         node_id=plan.node_id,
-                        body_sha256=body_sha256(plan.body.strip()),
+                        body_sha256=body_sha256(plan.normalized_body),
                         position=position,
                     )
                 )
@@ -577,8 +672,9 @@ def _plan_intent(plan: SurfacePlan, position: int) -> SurfaceIntent:
         domain=plan.domain,
         section=plan.section,
         occurrence=plan.occurrence,
+        kind=plan.kind,
         node_id=plan.node_id,
-        body_sha256="" if retire else body_sha256(plan.body.strip()),
+        body_sha256="" if retire else body_sha256(plan.normalized_body),
         action=SURFACE_INTENT_RETIRE if retire else SURFACE_INTENT_PUBLISH,
         position=position,
     )
