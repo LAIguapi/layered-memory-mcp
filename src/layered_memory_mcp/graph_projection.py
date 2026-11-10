@@ -46,9 +46,8 @@ file it belongs in.
 from __future__ import annotations
 
 import os
-import re
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from pydantic import Field, model_validator
 
@@ -62,8 +61,18 @@ from .graph_journal import (
     body_sha256,
 )
 from .graph_models import GraphModel, GraphNode, MemoryEvent
+from .markdown_sections import (
+    MarkdownLayoutError,
+    block_body,
+    canonical_body,
+    render_section,
+    scan_document,
+)
 
 __all__ = [
+    "LAYOUT_ERROR_LIMIT",
+    "LAYOUT_MISMATCH",
+    "LAYOUT_OCCURRENCE_MISMATCH",
     "PROJECTION_METADATA_KEY",
     "PROJECTION_SURFACE_KIND",
     "PROJECTION_PREAMBLE_SURFACE_KIND",
@@ -72,13 +81,16 @@ __all__ = [
     "SURFACE_NOT_ADOPTED",
     "SURFACE_UNSUPPORTED",
     "L1ProjectionReport",
+    "MarkdownLayoutError",
     "ProjectionBinding",
     "ProjectionError",
     "SurfacePlan",
     "binding_metadata",
     "bindings_from_events",
     "domain_path",
+    "layout_errors",
     "parse_binding",
+    "plan_layout_errors",
     "publish_graph",
     "publish_l0",
     "publish_l1",
@@ -115,8 +127,21 @@ SURFACE_UNSUPPORTED = "surface_unsupported"
 #: a killed process would leave a scannable fragment behind.
 PUBLISH_TEMP_SUFFIX = ".publish.tmp"
 
-_HEADING_SPLIT = re.compile(r"(?m)^(?=##[ \t])")
-_HEADING_LABEL = re.compile(r"^##[ \t]+(.*?)[ \t]*$")
+#: Bounded label for "this publication could not be read back the way it was
+#: written". The round-trip guard's own refusal, carried as
+#: ``<label>:<entry id>`` exactly like every other surface refusal.
+LAYOUT_MISMATCH = "binding_layout_mismatch"
+
+#: Bounded label for the one reader disagreement this framework refuses rather
+#: than resolves: the projection addresses a section by its position among
+#: *every* same-label H2 and the vector/keyword readers count only bodyful
+#: ones, so a bodyless duplicate heading in front of a managed surface would
+#: publish a body under one identity and index it under another.
+LAYOUT_OCCURRENCE_MISMATCH = "binding_occurrence_mismatch"
+
+#: How many layout labels one refusal reports. A refusal is a bounded report,
+#: not a document listing (§15).
+LAYOUT_ERROR_LIMIT = 20
 
 
 class ProjectionError(RuntimeError):
@@ -153,8 +178,8 @@ class ProjectionBinding(GraphModel):
     def _surface_shape(self) -> ProjectionBinding:
         _validate_surface_shape(self.kind, self.section, self.occurrence)
         if (self.kind == PROJECTION_PREAMBLE_SURFACE_KIND
-                and _HEADING_SPLIT.search(self.normalized_body)):
-            raise ValueError("binding_layout_mismatch")
+                and _preamble_carries_section(self.normalized_body)):
+            raise ValueError(LAYOUT_MISMATCH)
         return self
 
     @property
@@ -166,9 +191,14 @@ class ProjectionBinding(GraphModel):
 
     @property
     def normalized_body(self) -> str:
-        if self.kind == PROJECTION_PREAMBLE_SURFACE_KIND:
-            return _normalize_preamble(self.body)
-        return self.body.strip()
+        """The canonical published body: LF line endings, boundary-stripped.
+
+        One rule for both surface kinds. A section body used to skip the line
+        ending normalization the file reader always applied, so a CRLF body was
+        hashed in one form and read back in another — a surface that drifted
+        from itself the moment it was published.
+        """
+        return canonical_body(self.body)
 
 
 class SurfacePlan(GraphModel):
@@ -189,15 +219,20 @@ class SurfacePlan(GraphModel):
     def _surface_shape(self) -> SurfacePlan:
         _validate_surface_shape(self.kind, self.section, self.occurrence)
         if (self.kind == PROJECTION_PREAMBLE_SURFACE_KIND
-                and _HEADING_SPLIT.search(self.normalized_body)):
-            raise ValueError("binding_layout_mismatch")
+                and _preamble_carries_section(self.normalized_body)):
+            raise ValueError(LAYOUT_MISMATCH)
         return self
 
     @property
     def normalized_body(self) -> str:
-        if self.kind == PROJECTION_PREAMBLE_SURFACE_KIND:
-            return _normalize_preamble(self.body)
-        return self.body.strip()
+        """The canonical published body: LF line endings, boundary-stripped.
+
+        One rule for both surface kinds. A section body used to skip the line
+        ending normalization the file reader always applied, so a CRLF body was
+        hashed in one form and read back in another — a surface that drifted
+        from itself the moment it was published.
+        """
+        return canonical_body(self.body)
 
 
 def _validate_surface_shape(kind: str, section: str, occurrence: int) -> None:
@@ -304,28 +339,28 @@ def _parse_document(raw: str) -> tuple[str, list[tuple[str, str]]]:
     """``(preamble, [(label, block text)])`` for one Markdown document.
 
     The block text is kept verbatim, which is what lets an untouched section
-    survive a publication byte-for-byte.
+    survive a publication byte-for-byte. Boundaries come from the one shared
+    scanner (:mod:`~layered_memory_mcp.markdown_sections`), so a fenced ``##``
+    line is code and a managed body keeps its authored headings.
+
+    The *structural* reader, so it never raises: a document whose managed
+    delimiters are malformed is split the way it was split before the envelope
+    existed, which keeps a layout-only caller (the migration's two-reader
+    preflight, the renderer's preservation of unmanaged blocks) working on a
+    file somebody has edited into an ambiguous state. The readers that *compare
+    a body* — :func:`read_section_body`, :func:`read_preamble` and therefore
+    every drift check and the round-trip guard — are strict and refuse it.
     """
-    normalized = raw.replace("\r\n", "\n").replace("\r", "\n")
-    parts = _HEADING_SPLIT.split(normalized)
-    if not parts:
-        return "", []
-    preamble = parts[0]
-    blocks: list[tuple[str, str]] = []
-    for part in parts[1:]:
-        heading, _, _rest = part.partition("\n")
-        match = _HEADING_LABEL.match(heading)
-        blocks.append((match.group(1).strip() if match else "", part))
-    return preamble, blocks
+    document = scan_document(raw, strict=False)
+    return document.preamble, [(block.label, block.text) for block in document.blocks]
 
 
 def _block_body(block: str) -> str:
-    _heading, _, rest = block.partition("\n")
-    return rest.strip()
+    return block_body(block)
 
 
 def _render_block(section: str, body: str) -> str:
-    return f"## {section}\n\n{body.strip()}\n\n"
+    return render_section(section, body)
 
 
 def _locate(blocks: Sequence[tuple[str, str]], section: str, occurrence: int) -> int | None:
@@ -339,15 +374,42 @@ def _locate(blocks: Sequence[tuple[str, str]], section: str, occurrence: int) ->
     return None
 
 
+def _bodyful_occurrence(
+    blocks: Sequence[tuple[str, str]], index: int
+) -> int | None:
+    """``index``'s position among *bodyful* same-label blocks, or ``None``.
+
+    The vector and keyword readers' occurrence rule, asked of a block the
+    projection's own rule already located. ``None`` means this block has no
+    body at all, so those readers mint no identity for it.
+    """
+    label = blocks[index][0]
+    seen = 0
+    for position, (block_label, text) in enumerate(blocks):
+        if block_label != label or not _block_body(text):
+            continue
+        if position == index:
+            return seen
+        seen += 1
+    return None
+
+
 def read_section_body(raw: str, section: str, occurrence: int = 0) -> str | None:
     """The current body of one H2 section, or ``None`` when it is absent.
 
     The canonical reader the drift fingerprint is taken from, and the same
-    occurrence rule the identity projector uses.
+    occurrence rule the identity projector uses. Strict: a document whose
+    managed delimiters are malformed has no single body to compare against, and
+    answering with one of the readings would be the fingerprint agreeing with
+    itself by accident.
+
+    Raises:
+        MarkdownLayoutError: The document has no unambiguous layout.
     """
-    _preamble, blocks = _parse_document(raw)
+    document = scan_document(raw)
+    blocks = [(block.label, block.text) for block in document.blocks]
     index = _locate(blocks, section, occurrence)
-    return None if index is None else _block_body(blocks[index][1])
+    return None if index is None else document.blocks[index].body
 
 
 def read_preamble(raw: str) -> str:
@@ -358,15 +420,41 @@ def read_preamble(raw: str) -> str:
     separators before sections; the document ends with one LF. Hashes and
     comparisons use that same canonical body, not the layout separators, so
     section insertion/removal cannot create preamble drift on a round trip.
+
+    Strict for the same reason :func:`read_section_body` is: this is the body a
+    managed preamble's fingerprint is taken from.
+
+    Raises:
+        MarkdownLayoutError: The document has no unambiguous layout.
     """
-    return _parse_document(raw)[0]
+    return scan_document(raw).preamble
 
 
 def _normalize_preamble(body: str) -> str:
-    return body.replace("\r\n", "\n").replace("\r", "\n").strip()
+    return canonical_body(body)
+
+
+def _preamble_carries_section(body: str) -> bool:
+    """Whether a preamble body would stop being the preamble once written.
+
+    A preamble ends at the first H2, so a body containing one cannot be carried
+    there — and unlike a section there is no outer block to tie an envelope to.
+    Refused, as it always has been, but now by the shared scanner: a ``##``
+    inside a closed fence is code and no longer refuses a legitimate body.
+    """
+    try:
+        return bool(scan_document(body).blocks)
+    except MarkdownLayoutError:
+        return True
 
 
 def _read_surface_body(raw: str, surface: Any) -> str | None:
+    """The on-disk body of one surface. Raises on an unreadable document.
+
+    Deliberately not softened to ``None``: "this section is absent" and "this
+    document cannot be read unambiguously" are different answers, and a caller
+    that treated the second as the first would publish over a tampered file.
+    """
     if surface.kind == PROJECTION_PREAMBLE_SURFACE_KIND:
         return _normalize_preamble(read_preamble(raw))
     return read_section_body(raw, surface.section, surface.occurrence)
@@ -424,7 +512,13 @@ def surface_refusal(
     if has_frontmatter_entry(raw):
         return f"{SURFACE_UNSUPPORTED}:{binding.entry_id}"
 
-    current = _read_surface_body(raw, binding)
+    try:
+        current = _read_surface_body(raw, binding)
+    except MarkdownLayoutError:
+        # A document whose managed delimiters are malformed is one somebody
+        # edited into a shape this framework cannot read back. Refused as the
+        # drift it is: republishing over it would destroy whatever they meant.
+        return f"{SURFACE_DRIFT}:{binding.entry_id}"
     if current is None:
         return None
     on_disk = body_sha256(current)
@@ -549,7 +643,7 @@ def render_surface_document(
         elif index is None:
             additions.append(plan)
             report.published.append(plan.entry_id)
-        elif _block_body(blocks[index][1]) != plan.body.strip():
+        elif _block_body(blocks[index][1]) != plan.normalized_body:
             updates[index] = (plan.section, _render_block(plan.section, plan.body))
             report.published.append(plan.entry_id)
         else:
@@ -561,6 +655,102 @@ def render_surface_document(
     final_blocks.extend((plan.section, _render_block(plan.section, plan.body))
                         for plan in sorted(additions, key=lambda item: item.occurrence))
     return _write_document(preamble, final_blocks), report
+
+
+def _plan_layout_error(
+    final: str, blocks: Sequence[tuple[str, str]], plan: SurfacePlan
+) -> list[str]:
+    """Why this plan's rendered document would not read back, or nothing."""
+    try:
+        body = _read_surface_body(final, plan)
+    except MarkdownLayoutError:
+        return [f"{LAYOUT_MISMATCH}:{plan.entry_id}"]
+    expected = plan.normalized_body if plan.action == "publish" else (
+        "" if plan.kind == PROJECTION_PREAMBLE_SURFACE_KIND else None
+    )
+    if body != expected:
+        return [f"{LAYOUT_MISMATCH}:{plan.entry_id}"]
+    if (
+        plan.action != "publish"
+        or plan.kind == PROJECTION_PREAMBLE_SURFACE_KIND
+        or not plan.normalized_body
+    ):
+        return []
+    index = _locate(blocks, plan.section, plan.occurrence)
+    if index is None or _bodyful_occurrence(blocks, index) != plan.occurrence:
+        return [f"{LAYOUT_OCCURRENCE_MISMATCH}:{plan.entry_id}"]
+    return []
+
+
+def layout_errors(
+    config: Any,
+    plans: Sequence[SurfacePlan],
+    *,
+    path_for: Callable[[str], Path] | None = None,
+) -> list[str]:
+    """Render every affected domain and read every plan back. Bounded labels.
+
+    The one round-trip guard, shared by the ordinary semantic write, the group
+    rewrite and the publication/recovery path, because the question is the same
+    one in all three: *if this were published, could this framework still read
+    what it wrote?* A layout it cannot support is refused here — before any
+    durable event is appended and before any domain's bytes are replaced — so a
+    publication can never succeed into a document that then locks every surface
+    in it behind a drift refusal.
+
+    Nothing is written and no registry row is touched: the rendering is the pure
+    :func:`render_surface_document`, and the files are only read.
+
+    Args:
+        config: The configuration naming the knowledge directories.
+        plans: The surfaces this publication would write, any mix of domains.
+        path_for: An alternative domain-to-path resolver, for a caller that
+            validates the path itself (the group rewrite refuses an aliased or
+            escaping domain before it reads one).
+
+    Returns:
+        Sorted, deduplicated ``<reason>:<entry id>`` labels, capped at
+        :data:`LAYOUT_ERROR_LIMIT`. Empty means every plan round-trips.
+    """
+    resolve = path_for if path_for is not None else (
+        lambda domain: domain_path(config, domain)
+    )
+    by_domain: dict[str, list[SurfacePlan]] = {}
+    for plan in plans:
+        by_domain.setdefault(plan.domain, []).append(plan)
+    errors: list[str] = []
+    for domain in sorted(by_domain):
+        domain_plans = by_domain[domain]
+        path = resolve(domain)
+        raw = path.read_text(encoding="utf-8") if path.exists() else ""
+        try:
+            rendered, _report = render_surface_document(raw, domain_plans)
+            final = raw if rendered is None else rendered
+            _preamble, blocks = _parse_document(final)
+        except MarkdownLayoutError:
+            errors.extend(
+                f"{LAYOUT_MISMATCH}:{plan.entry_id}" for plan in domain_plans
+            )
+            continue
+        for plan in domain_plans:
+            errors.extend(_plan_layout_error(final, blocks, plan))
+    return sorted(set(errors))[:LAYOUT_ERROR_LIMIT]
+
+
+def plan_layout_errors(
+    config: Any,
+    events: Sequence[MemoryEvent],
+    nodes: Mapping[str, GraphNode],
+    *,
+    path_for: Callable[[str], Path] | None = None,
+) -> list[str]:
+    """:func:`layout_errors` for a caller holding a proposed replay.
+
+    The commit paths validate the *complete* proposed stream, so the guard sees
+    exactly the plans the publication that follows would carry — including the
+    retirements a supersession implies.
+    """
+    return layout_errors(config, surface_plans(events, nodes), path_for=path_for)
 
 
 def publish_l1(
@@ -618,6 +808,15 @@ def publish_l1(
             refusals.append(refusal)
     if refusals:
         raise ProjectionError("; ".join(sorted(set(refusals))))
+
+    # Every domain's round trip, before the first one is written. A layout
+    # error found while publishing the third domain must not leave the first
+    # two published: the commit paths already refused this layout, so reaching
+    # here means the files changed underneath, and the honest answer is a
+    # recoverable pending projection rather than a partial publication.
+    layout = layout_errors(config, plans)
+    if layout:
+        raise ProjectionError("; ".join(layout))
 
     by_domain: dict[str, list[SurfacePlan]] = {}
     for plan in plans:

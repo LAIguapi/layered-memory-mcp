@@ -596,7 +596,23 @@ def _commit(
             errors=new_errors or sorted(candidate_report.errors),
         )
 
-    # 10. Drift: a surface somebody else wrote is never overwritten.
+    # 10. Round trip: this framework must be able to read back what it is about
+    #     to write. Refused here, before the append, because a layout that
+    #     publishes and then cannot be re-read locks every surface in that
+    #     document behind a drift refusal — including ones this decision has
+    #     nothing to do with. The same helper the group rewrite and the
+    #     publisher use (§12), so the three cannot disagree.
+    layout = _layout_errors(config, [*events, *bound_events], candidate)
+    if layout:
+        return _rejected(
+            GRAPH_COMMIT_REJECTED_BINDING,
+            request_id=identity,
+            node_id=request.node.id,
+            entry_id=entry_id,
+            errors=layout,
+        )
+
+    # 11. Drift: a surface somebody else wrote is never overwritten.
     drift = _drift_errors(config, journal, candidate, [*events, *bound_events])
     if drift:
         return _rejected(
@@ -607,7 +623,7 @@ def _commit(
             errors=drift,
         )
 
-    # 11. Commit. The journal append is the authority.
+    # 12. Commit. The journal append is the authority.
     try:
         append = journal.append(
             identity, bound_events, kind=REQUEST_KIND_SEMANTIC_WRITE
@@ -769,6 +785,18 @@ def _commit_lifecycle(
             request_id=identity,
             node_id=request.target_id,
             errors=[conflict],
+        )
+
+    # A retraction retires a section and a restore republishes one, so a
+    # lifecycle decision rewrites documents exactly as a write does and is
+    # validated by the same round-trip guard, before its own append.
+    layout = _layout_errors(config, [*events, *plan.events], candidate)
+    if layout:
+        return _rejected(
+            GRAPH_COMMIT_REJECTED_BINDING,
+            request_id=identity,
+            node_id=request.target_id,
+            errors=layout,
         )
 
     drift = _drift_errors(config, journal, candidate, [*events, *plan.events])
@@ -1270,6 +1298,24 @@ def _lifecycle_errors(
         if target.scope.to_json() != scope.to_json():
             errors.append(f"supersede_target_scope_mismatch:{assertion.target_id}")
     return sorted(set(errors))
+
+
+def _layout_errors(
+    config: Any,
+    events: Sequence[MemoryEvent],
+    projection: InMemoryGraphStore,
+) -> list[str]:
+    """The shared round-trip guard, over one proposed replay.
+
+    Never raises: an unreadable or invalid Markdown layout is reported as a
+    bounded refusal. This is read/render validation, not a filesystem
+    writability check; publication still handles backend write failures.
+    """
+    nodes, _edges = _materialize(projection)
+    try:
+        return graph_projection.plan_layout_errors(config, events, nodes)
+    except (ValueError, OSError) as exc:
+        return [f"{graph_projection.LAYOUT_MISMATCH}:{type(exc).__name__}"]
 
 
 def _drift_errors(

@@ -1,4 +1,4 @@
-"""v3.8.0 — the declared version, pinned where a release actually reads it.
+"""v3.8.1 — the declared version, pinned where a release actually reads it.
 
 Why this file exists: a release ships a version the repo carries in more than
 one place (``pyproject.toml``, the package's own import-time fallback, and the
@@ -20,7 +20,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 
 #: The target of this batch.
-EXPECTED_VERSION = "3.8.0"
+EXPECTED_VERSION = "3.8.1"
 
 
 def _match(path: Path, pattern: str) -> str:
@@ -64,6 +64,6 @@ def test_no_source_file_still_declares_the_previous_version():
             REPO / "src" / "layered_memory_mcp" / "write_guard" / "__init__.py",
             REPO / "src" / "layered_memory_mcp" / "write_guard" / "plugin" / "plugin.yaml",
         ]
-        if "3.6.4" in path.read_text(encoding="utf-8")
+        if "3.8.0" in path.read_text(encoding="utf-8")
     ]
     assert stale == []

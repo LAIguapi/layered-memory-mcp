@@ -296,25 +296,24 @@ def _h2_owner_by_line(content: str) -> list[tuple[str | None, int]]:
     ``graph_search.keyword_section_seeds``): a bodyless heading mints no entry
     identity, so it must not consume an occurrence either, or every later
     section with the same label would be attributed to the wrong entry.
+
+    Block boundaries come from the one shared scanner — the same reader the
+    vector rows are projected through — so a fragment found inside a managed
+    body, including one below an authored ``##`` heading inside it, is owned by
+    the H2 that actually publishes it, and a fenced ``##`` line never becomes
+    an owner of its own. A block whose extent is ambiguous owns nothing, which
+    is the existing degradation: an unmapped row is preserved, never relabelled.
     """
-    lines = content.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-    starts = [
-        index
-        for index, line in enumerate(lines)
-        if line.startswith("## ")
-    ]
-    owners: list[tuple[str | None, int]] = [(None, 0)] * len(lines)
+    from .markdown_sections import projected_document
+
+    document = projected_document(content)
+    owners: list[tuple[str | None, int]] = [(None, 0)] * len(document.lines)
     seen: dict[str, int] = {}
-    for position, start in enumerate(starts):
-        end = starts[position + 1] if position + 1 < len(starts) else len(lines)
-        label = lines[start].lstrip("#").strip()
-        bodyful = bool("\n".join(lines[start + 1 : end]).strip())
-        if not label or not bodyful:
-            continue
-        occurrence = seen.get(label, 0)
-        seen[label] = occurrence + 1
-        for index in range(start, end):
-            owners[index] = (label, occurrence)
+    for block in document.blocks:
+        occurrence = seen.get(block.label, 0)
+        seen[block.label] = occurrence + 1
+        for index in range(block.start_line, block.end_line):
+            owners[index] = (block.label, occurrence)
     return owners
 
 

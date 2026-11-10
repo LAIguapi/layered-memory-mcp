@@ -127,8 +127,10 @@ request = SemanticRewriteRequest(
 
 For N-old → K-new, pass multiple `RewriteTarget` objects in the same `targets`
 list. Each target has its own nonempty `old_node_ids`, a complete `GraphNode`,
-and `SectionRef`. Old IDs must be disjoint across targets, new IDs must be
-fresh, and final readable surfaces must have one owner and representable
+and `SectionRef`. Old IDs may be shared across targets for fan-out; duplicates
+within one target's `old_node_ids` remain invalid. Each distinct old node is
+retired once, every new/old pair retains its lineage, new IDs must be fresh,
+and final readable surfaces must have one owner and representable
 occurrences. New nodes must be current and within their validity window;
 TASK/TODO nodes have no H2 binding and are not rewrite targets. An operation
 that would silently renumber a surviving bound
@@ -178,10 +180,60 @@ backend exception text. The Python seam accepts an explicit configured authority
 like `commit_semantic_write`, and both it and the MCP wrapper refuse legacy and
 shadow modes before any directory, database or lock work.
 
-Not provided: shared-old-node 1 → many splits, group undo/rollback, REST rewrite
-routes, automatic adoption of unmanaged/frontmatter surfaces, or external-process
-file locking. `batch_inject_knowledge_tool` remains a sequence of independent
-single-node commits, not an atomic group.
+Not provided: group undo/rollback, REST rewrite routes, automatic adoption of
+unmanaged/frontmatter surfaces, or external-process file locking.
+`batch_inject_knowledge_tool` remains a sequence of independent single-node
+commits, not an atomic group.
+
+### Markdown layout and explicit legacy repair
+
+Publication, drift checks, vector projection, keyword ownership and migration
+preflight share one H2 scanner. Closed backtick/tilde fences keep `##` examples
+as content. Bodies containing structural H2 headings or unterminated fences use
+versioned `layered-memory:managed-body` comment envelopes, preserving authored
+headings without indexing the delimiters. Bodies are LF-normalized and stripped
+at their boundaries. Malformed envelopes invalidate document-wide derived
+ownership and block ordinary publication; they are never guessed or auto-fixed.
+Bodyless duplicate headings that would shift an entry's occurrence remain
+refused.
+
+An already-published legacy body with an internal H2 may still need a physical
+format repair. This is an **explicit Python operator callable**, not a CLI,
+MCP tool or startup migration. Import from
+`layered_memory_mcp.graph_surface_repair`:
+
+- `plan_legacy_surface_repair(config, *, entry_id, node_id, domain, section,
+  occurrence, published_position, expected_head, expected_registry_sha256,
+  expected_document_sha256)` returns an immutable plan without writing.
+  Obtain the registry digest with `repair_registry_sha256(journal)` on an
+  explicitly opened read-only `MemoryEventJournal`; the document digest is
+  SHA-256 of its exact bytes. Use the exact published registry identity and
+  position, never values inferred from a heading or body search.
+- `apply_legacy_surface_repair(config, *, plan, expected_plan_sha256,
+  backup_root, maintenance_confirmed=True)` checks `expected_plan_sha256`
+  against the reviewed `plan.sha256`, revalidates source state under the normal
+  publication lock and atomically replaces only the proven legacy span.
+- `recover_legacy_surface_repair` accepts the same operator arguments to finish
+  an interrupted before/after state. `rollback_legacy_surface_repair` also
+  requires `expected_current_sha256=plan.after_sha256` and restores only the
+  document, never an old journal database.
+
+The config must name existing absolute knowledge and journal paths. Use an
+existing private `backup_root` outside every knowledge root; its plan-digest
+subdirectory holds the original document, a verified SQLite backup, intent and
+receipt. These contain private authored content and local paths: do not commit
+or publish them. Keep a maintenance barrier excluding non-cooperating editors
+through apply, recovery or rollback. Symlinks, ambiguous duplicate headings,
+unproven legacy bytes, unrelated edits and intervening journal/registry changes
+are refused rather than overwritten. Rollback can restore the old layout's
+ordinary-write refusal.
+
+Repair does not change semantic events, registry body hashes or checkpoints.
+**Vector, L0 and keyword-cache refresh is still required after repair or
+rollback** (`receipt.refresh_required`); completed semantic checkpoints do not
+prove those derived views are fresh. Refresh and verify them separately before
+resuming normal use. No automatic refresh, migration, default-mode change or
+production cutover is performed.
 
 ## Quick Start
 

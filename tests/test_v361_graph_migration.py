@@ -104,9 +104,22 @@ RETRIEVAL_IDS = {
 #: The two documents the projection producer and the canonical readable-surface
 #: reader read *differently*, in the exact shapes that were probed. Deliberately
 #: not paraphrased into prettier prose: in each one the whole point is a
-#: structural detail — an empty first occurrence of a duplicate H2 label, and a
-#: tab-separated heading — that a rewrite would quietly remove.
+#: structural detail — a bodyless occurrence of a duplicate H2 label, first and
+#: then in the middle — that a rewrite would quietly remove. Both are the one
+#: disagreement that survives the shared scanner: the canonical reader counts
+#: an occurrence per *every* same-label H2 and the projection counts only
+#: bodyful ones, so a bodyless twin shifts one reader's numbering and not the
+#: other's.
 DUPLICATE_LABEL_EMPTY_FIRST_MD = "## Same\n\n## Same\n\nkept\n"
+DUPLICATE_LABEL_EMPTY_MIDDLE_MD = "## Same\n\nalpha\n\n## Same\n\n## Same\n\nomega\n"
+
+#: Compatible since v3.8.1, and kept here under its own name because it used to
+#: be the second disagreement: the projection producer recognized only
+#: ``"## "`` while the canonical reader has always accepted a tab, so a
+#: tab-separated heading was a section to one reader and body text to the
+#: other. Both now go through ``markdown_sections``, which has one heading
+#: rule, so the two agree — pinned by
+#: ``test_a_tab_separated_heading_is_now_one_section_to_both_readers``.
 TAB_SEPARATED_HEADING_MD = "## First\n\nbody\n\n##\tSecond\n\nsecond\n"
 
 #: Compatible, and deliberately not trivially so: a bodyless trailing section
@@ -1026,15 +1039,37 @@ def test_the_two_readers_really_do_disagree_about_these_documents():
     assert read_section_body(DUPLICATE_LABEL_EMPTY_FIRST_MD, "Same", 0) == ""
     assert read_section_body(DUPLICATE_LABEL_EMPTY_FIRST_MD, "Same", 1) == "kept"
 
+    middle = _entries_for("d", DUPLICATE_LABEL_EMPTY_MIDDLE_MD)
+    assert [(item.section, item.content) for item in middle] == [
+        ("Same", "alpha"), ("Same", "omega"),
+    ]
+    assert read_section_body(DUPLICATE_LABEL_EMPTY_MIDDLE_MD, "Same", 1) == ""
+    assert read_section_body(DUPLICATE_LABEL_EMPTY_MIDDLE_MD, "Same", 2) == "omega"
+
+
+def test_a_tab_separated_heading_is_now_one_section_to_both_readers():
+    """The disagreement the shared scanner removed, pinned as agreement.
+
+    The projection producer used to recognize only ``"## "``, so a
+    tab-separated heading was body text to it and a section to the canonical
+    reader. Both read it through ``markdown_sections`` now, so there is one
+    heading rule and nothing left to disagree about — which is why this
+    document moved out of the blocked set above and into the accepted one.
+    """
+    from layered_memory_mcp.graph_migration_inventory import section_reader_findings
+    from layered_memory_mcp.graph_projection import read_section_body
+
     tabbed = _entries_for("d", TAB_SEPARATED_HEADING_MD)
-    assert [item.section for item in tabbed] == ["First"]
-    assert "Second" in tabbed[0].content
+    assert [(item.section, item.content) for item in tabbed] == [
+        ("First", "body"), ("Second", "second"),
+    ]
     assert read_section_body(TAB_SEPARATED_HEADING_MD, "First", 0) == "body"
     assert read_section_body(TAB_SEPARATED_HEADING_MD, "Second", 0) == "second"
+    assert section_reader_findings("retrieval", TAB_SEPARATED_HEADING_MD) == []
 
 
 @pytest.mark.parametrize(
-    "raw", [DUPLICATE_LABEL_EMPTY_FIRST_MD, TAB_SEPARATED_HEADING_MD]
+    "raw", [DUPLICATE_LABEL_EMPTY_FIRST_MD, DUPLICATE_LABEL_EMPTY_MIDDLE_MD]
 )
 def test_the_preflight_names_both_directions_of_a_reader_disagreement(raw):
     from layered_memory_mcp.graph_migration_inventory import section_reader_findings
@@ -1042,25 +1077,28 @@ def test_the_preflight_names_both_directions_of_a_reader_disagreement(raw):
     assert section_reader_findings("retrieval", raw) == READER_FINDINGS
 
 
-def test_the_preflight_names_a_section_the_canonical_reader_cannot_find():
-    """A projected section the canonical reader has no occurrence for at all.
+def test_a_heading_wrapped_after_the_hashes_is_a_section_to_neither_reader():
+    """``##`` with its text on the next line: preamble to both readers.
 
-    The projection accepts a heading wrapped after ``##``; the canonical reader
-    requires a space or a tab and reads the whole thing as preamble. A binding
-    built from this would point at nothing.
+    The projection producer used to accept it — its regex let ``\\s+`` cross the
+    line break — and mint an entry for a section the canonical reader reads as
+    preamble, so a binding built from this document pointed at nothing. One
+    heading rule removes the disagreement at its source: neither reader sees a
+    section, so there is no binding to build and nothing to refuse.
     """
     from layered_memory_mcp.graph_migration_inventory import section_reader_findings
-    from layered_memory_mcp.graph_projection import read_section_body
+    from layered_memory_mcp.graph_projection import read_preamble, read_section_body
 
     raw = "##\nWrapped\n\nbody\n"
-    assert [item.section for item in _entries_for("d", raw)] == ["Wrapped"]
+    assert _entries_for("d", raw) == []
     assert read_section_body(raw, "Wrapped", 0) is None
-    assert section_reader_findings("retrieval", raw) == [
-        "l1_section_reader_incompatible:retrieval:canonical_section_absent"
-    ]
+    assert read_preamble(raw) == raw
+    assert section_reader_findings("retrieval", raw) == []
 
 
-@pytest.mark.parametrize("raw", [RETRIEVAL_MD, TRAILING_EMPTY_SECTION_MD, ""])
+@pytest.mark.parametrize(
+    "raw", [RETRIEVAL_MD, TRAILING_EMPTY_SECTION_MD, TAB_SEPARATED_HEADING_MD, ""]
+)
 def test_the_preflight_accepts_documents_the_two_readers_agree_about(raw):
     from layered_memory_mcp.graph_migration_inventory import section_reader_findings
 
@@ -1068,7 +1106,7 @@ def test_the_preflight_accepts_documents_the_two_readers_agree_about(raw):
 
 
 @pytest.mark.parametrize(
-    "raw", [DUPLICATE_LABEL_EMPTY_FIRST_MD, TAB_SEPARATED_HEADING_MD]
+    "raw", [DUPLICATE_LABEL_EMPTY_FIRST_MD, DUPLICATE_LABEL_EMPTY_MIDDLE_MD]
 )
 def test_plan_blocks_a_document_the_two_readers_read_differently(
     tmp_path, destination, raw
@@ -1085,12 +1123,12 @@ def test_plan_blocks_a_document_the_two_readers_read_differently(
     assert not destination.exists()
     assert tree_state(root) == before
     serialized = json.dumps(report)
-    for body in ("kept", "second", "Same", "Second"):
+    for body in ("kept", "alpha", "omega", "Same"):
         assert body not in serialized
 
 
 @pytest.mark.parametrize(
-    "raw", [DUPLICATE_LABEL_EMPTY_FIRST_MD, TAB_SEPARATED_HEADING_MD]
+    "raw", [DUPLICATE_LABEL_EMPTY_FIRST_MD, DUPLICATE_LABEL_EMPTY_MIDDLE_MD]
 )
 def test_apply_of_an_incompatible_document_creates_no_destination(
     tmp_path, destination, raw

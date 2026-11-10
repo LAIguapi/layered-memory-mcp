@@ -798,8 +798,17 @@ def test_rewrite_retires_all_duplicate_heading_occurrences(config):
     assert "Neutral cache schedule." not in text
 
 
-@pytest.mark.parametrize("fault", ["sparse_occurrence", "heading_whitespace", "embedded_h2", "renumber_sibling"])
+@pytest.mark.parametrize("fault", ["sparse_occurrence", "heading_whitespace", "reserved_marker", "renumber_sibling"])
 def test_unrepresentable_final_bindings_are_refused_before_append(config, fault):
+    """A layout the framework could not read back is refused before the append.
+
+    ``reserved_marker`` replaced an earlier ``embedded_h2`` case: an authored
+    H2 inside a body *is* representable now — it is published inside the
+    managed envelope and read back whole, which
+    ``test_markdown_projection_consistency`` pins for this same group path — so
+    the body that genuinely has no unambiguous rendering is one claiming the
+    reserved delimiter scheme the envelope itself is written in.
+    """
     _commit_a(config)
     api = rewrite_api()
     request = request_for(api)
@@ -807,8 +816,12 @@ def test_unrepresentable_final_bindings_are_refused_before_append(config, fault)
         request.targets[0].surface.occurrence = 3
     elif fault == "heading_whitespace":
         request.targets[0].surface.section = " Padded "
-    elif fault == "embedded_h2":
-        request.targets[0].node.content = "Neutral text.\n\n## Unexpected\n\nNeutral second section."
+    elif fault == "reserved_marker":
+        from layered_memory_mcp.markdown_sections import managed_body_markers
+
+        request.targets[0].node.content = (
+            f"Neutral text.\n\n{managed_body_markers('Other')[1]}\n\nNeutral tail."
+        )
     else:
         assert seed_second(config, section="Index maintenance", occurrence=1).ok
     before = payload_state(Path(config.home))

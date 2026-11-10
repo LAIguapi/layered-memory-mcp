@@ -304,24 +304,15 @@ def commit_semantic_rewrite(
 
 
 def _layout_errors(config, events, candidate):
+    """The shared round-trip guard, resolving domains through this module's own
+    validating path rule so an aliased or escaping domain is refused before a
+    file is read. One implementation for the group rewrite, the ordinary write
+    and the publisher: see ``graph_projection.layout_errors``.
+    """
     nodes, _edges = application._materialize(candidate)
-    domains: dict[str, list[projection.SurfacePlan]] = {}
-    for plan in projection.surface_plans(events, nodes):
-        domains.setdefault(plan.domain, []).append(plan)
-    errors = []
-    for domain, plans in domains.items():
-        path = _domain_path(config, domain)
-        raw = path.read_text(encoding="utf-8") if path.exists() else ""
-        rendered, _report = projection.render_surface_document(raw, plans)
-        final = raw if rendered is None else rendered
-        for plan in plans:
-            body = projection._read_surface_body(final, plan)
-            expected = plan.normalized_body if plan.action == "publish" else (
-                "" if plan.kind == projection.PROJECTION_PREAMBLE_SURFACE_KIND else None
-            )
-            if body != expected:
-                errors.append(f"binding_layout_mismatch:{plan.entry_id}")
-    return errors
+    return projection.plan_layout_errors(
+        config, events, nodes, path_for=lambda domain: _domain_path(config, domain),
+    )
 
 
 def _commit_group(config, request, journal, store, identity, writes, bindings, bound_events):
@@ -372,8 +363,14 @@ def _commit_group(config, request, journal, store, identity, writes, bindings, b
                                              request_id=identity)
             record = journal.surface(old.entry_id)
             raw = path.read_text(encoding="utf-8") if path.exists() else ""
-            if (record is not None and record.status != "retired"
-                    and (not path.exists() or projection._read_surface_body(raw, old) is None)):
+            try:
+                # An unreadable layout is not an absent section, but for a
+                # surface this group claims to replace both mean the same
+                # thing: the body it says it is superseding is not there.
+                present = path.exists() and projection._read_surface_body(raw, old) is not None
+            except projection.MarkdownLayoutError:
+                present = False
+            if record is not None and record.status != "retired" and not present:
                 return application._rejected(application.GRAPH_COMMIT_REJECTED_DRIFT,
                                              request_id=identity)
         conflict = application._surface_conflict(events, nodes, binding, write.node.id, old_ids)

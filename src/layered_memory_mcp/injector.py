@@ -2434,14 +2434,28 @@ def _summarize_for_l0(content: str, max_chars: int = 80) -> str:
 
 
 def _bodyful_sections(raw: str) -> list[tuple[str, str]]:
-    """Canonical H2 body projection shared by sync and consistency checks."""
-    norm = raw.replace("\r\n", "\n").replace("\r", "\n")
-    sections = []
-    for part in re.split(r"\n(?=## )", norm):
-        match = re.match(r"^##\s+(.+?)\n(.*)", part.strip(), re.DOTALL)
-        if match and match.group(2).strip():
-            sections.append((match.group(1).strip(), match.group(2).strip()))
-    return sections
+    """Canonical H2 body projection shared by sync and consistency checks.
+
+    Boundaries come from the one shared scanner
+    (:mod:`~layered_memory_mcp.markdown_sections`), which is what makes a row's
+    identity agree with the surface registry's: a ``##`` line inside a closed
+    fence is code rather than a section of its own, and a managed body keeps
+    its authored headings — the whole body projects to the one entry the
+    publication hashed, with the envelope delimiters excluded from the indexed
+    content.
+
+    Never raises, and fail-closed: a block whose extent is ambiguous because a
+    managed delimiter was tampered with is *omitted* rather than projected
+    under one of the possible readings, so no row is ever minted whose identity
+    or indexed content came from delimiter bytes. The other sections of the
+    same document still project, and the publication path refuses that document
+    by name (``graph_projection.read_section_body`` is strict).
+    """
+    from .markdown_sections import projected_document
+
+    return [
+        (block.label, block.body) for block in projected_document(raw).blocks
+    ]
 
 
 def _vector_entries(domain: str, raw: str) -> list:

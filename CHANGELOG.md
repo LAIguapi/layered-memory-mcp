@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.8.1] - 2026-11-10
+
+### Fixed
+
+- Share one H2 scanner across graph publication, drift checks, vector projection,
+  keyword ownership and migration preflight. Closed code fences keep their H2
+  examples as content; tab-separated headings use the same rule in every reader.
+- Preserve authored inner H2 headings and unterminated fences inside versioned
+  managed-body envelopes when a plain section cannot round-trip. Envelope markers
+  are layout, not indexed content; bodies use LF-normalized, boundary-stripped
+  hashes. Malformed envelopes fail closed for document-wide derived ownership.
+- Validate the complete proposed Markdown layout before semantic write,
+  lifecycle or group-rewrite append, and preflight all domains before L1
+  publication. Refuse unrepresentable occurrences and bodyless-duplicate identity
+  disagreements without silently renumbering sections or weakening drift checks.
+
+### Added
+
+- Explicit Python operator callables in `graph_surface_repair` to plan, apply,
+  recover and conditionally roll back an exactly proven legacy H2 rendering.
+  Planning is read-only; mutation requires exact identity/hash preconditions,
+  a maintenance window and private out-of-tree backups with durable evidence.
+  Repair changes only the document representation, never journal events,
+  registry body hashes or semantic checkpoints. Vector, L0 and keyword-cache
+  refresh remains required after repair or rollback; no CLI, startup migration,
+  automatic refresh, default-mode change or production cutover is introduced.
+
 ## [3.8.0] - 2026-11-09
 
 ### Added
